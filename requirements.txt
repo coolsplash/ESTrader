@@ -1,0 +1,7 @@
+# Requirements for screenshot_uploader.py
+pillow
+requests
+schedule
+pywin32
+configparser
+pystray

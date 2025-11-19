@@ -14,6 +14,9 @@ from pystray import MenuItem as item
 from PIL import Image
 import json # Added for JSON parsing
 import logging
+import win32ui
+import win32con
+from ctypes import windll
 
 def get_window_by_partial_title(partial_title):
     """Find a window handle by partial, case-insensitive title match."""
@@ -28,33 +31,66 @@ def get_window_by_partial_title(partial_title):
         return results[0]  # Return the first match
     return None
 
-def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_folder=None):
-    """Capture the full screen or a specific window (by partial title), apply offsets, save to folder, and return as base64-encoded string."""
+def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_folder=None, enable_save_screenshots=False):
+    """Capture the full screen or a specific window (by partial title) without activating it, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string."""
     logging.info("Capturing screenshot.")
     if window_title:
         hwnd = get_window_by_partial_title(window_title)
         if not hwnd:
             logging.error(f"No window found matching partial title '{window_title}'.")
             raise ValueError(f"No window found matching partial title '{window_title}'.")
-        rect = win32gui.GetWindowRect(hwnd)
-        left, top, right, bottom = rect
-        # Apply offsets
-        top += top_offset
-        bottom -= bottom_offset
-        if top >= bottom:
-            logging.error("Offsets result in invalid bounding box.")
-            raise ValueError("Offsets result in invalid bounding box.")
-        bbox = (left, top, right, bottom)
-    else:
-        bbox = None  # Full screen (offsets not applied for full screen)
+        logging.info(f"Window found: HWND={hwnd}, Title={win32gui.GetWindowText(hwnd)}")
 
-    screenshot = ImageGrab.grab(bbox=bbox)
+        # Get window dimensions
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        width = right - left
+        height = bottom - top
+
+        # Check if offsets would result in invalid height
+        effective_height = height - top_offset - bottom_offset
+        if effective_height <= 0:
+            logging.error(f"Offsets result in invalid effective height: {effective_height} (original height: {height}, top_offset: {top_offset}, bottom_offset: {bottom_offset})")
+            raise ValueError("Offsets result in invalid effective height.")
+
+        # Create device context
+        hdc = win32gui.GetWindowDC(hwnd)
+        dc_obj = win32ui.CreateDCFromHandle(hdc)
+        mem_dc = dc_obj.CreateCompatibleDC()
+
+        # Create bitmap for full client area
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(dc_obj, width, height)
+        mem_dc.SelectObject(bmp)
+
+        # Print window into bitmap (captures even if not foreground)
+        result = windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), 3)  # 3 = PW_RENDERFULLCONTENT (Windows 10+)
+        if result != 1:
+            logging.warning("PrintWindow failed; falling back to simple copy.")
+            mem_dc.BitBlt((0, 0), (width, height), dc_obj, (left, top), win32con.SRCCOPY)
+
+        # Convert to PIL Image
+        bmp_info = bmp.GetInfo()
+        bmp_str = bmp.GetBitmapBits(True)
+        screenshot = Image.frombuffer('RGB', (bmp_info['bmWidth'], bmp_info['bmHeight']), bmp_str, 'raw', 'BGRX', 0, 1)
+
+        # Clean up
+        win32gui.DeleteObject(bmp.GetHandle())
+        mem_dc.DeleteDC()
+        dc_obj.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hdc)
+
+        # Apply crop for offsets
+        screenshot = screenshot.crop((0, top_offset, width, height - bottom_offset))
+    else:
+        logging.info("Capturing full screen.")
+        screenshot = ImageGrab.grab()  # Full screen; offsets not applied
+
     buffered = BytesIO()
     screenshot.save(buffered, format="PNG")
     image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    # Save to file if folder specified
-    if save_folder:
+    # Save to file if folder specified and enabled
+    if save_folder and enable_save_screenshots:
         os.makedirs(save_folder, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # To avoid overwriting
         file_path = os.path.join(save_folder, f"screenshot_{timestamp}.png")
@@ -105,7 +141,7 @@ def is_within_time_range(begin_time, end_time):
     end = datetime.datetime.strptime(end_time, "%H:%M").time()
     return begin <= now <= end
 
-def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key):
+def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots):
     """The main job to run periodically."""
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
@@ -113,7 +149,7 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
 
     logging.info(f"Starting job at {time.ctime()}")
     try:
-        image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder)
+        image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
         # Select and format prompt based on position_type
         if position_type == 'none':
             prompt = no_position_prompt.format(symbol=symbol)
@@ -188,6 +224,67 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
     except Exception as e:
         logging.error(f"Error executing trade: {e}")
 
+# Load configuration from config.ini
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+# Logging setup
+LOG_FOLDER = config.get('General', 'log_folder', fallback='logs')
+os.makedirs(LOG_FOLDER, exist_ok=True)
+today = datetime.datetime.now().strftime("%Y%m%d")
+log_file = os.path.join(LOG_FOLDER, f"{today}.txt")
+
+file_handler = logging.FileHandler(log_file)
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+
+logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+
+logging.info("Application started.")
+
+INTERVAL_MINUTES = int(config.get('General', 'interval_minutes', fallback='5'))
+BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
+END_TIME = config.get('General', 'end_time', fallback='23:59')
+WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
+TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
+BOTTOM_OFFSET = int(config.get('General', 'bottom_offset', fallback='0'))
+SAVE_FOLDER = config.get('General', 'save_folder', fallback=None)
+ENABLE_LLM = config.getboolean('General', 'enable_llm', fallback=True)
+ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
+ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
+
+logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
+
+SYMBOL = config.get('LLM', 'symbol', fallback='ES')
+POSITION_TYPE = config.get('LLM', 'position_type', fallback='none')
+NO_POSITION_PROMPT = config.get('LLM', 'no_position_prompt', fallback='Analyze this Bookmap screenshot for {symbol} futures and advise: buy, hold, or sell. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "buy/hold/sell", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
+LONG_POSITION_PROMPT = config.get('LLM', 'long_position_prompt', fallback='Analyze this Bookmap screenshot for a long position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
+SHORT_POSITION_PROMPT = config.get('LLM', 'short_position_prompt', fallback='Analyze this Bookmap screenshot for a short position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
+MODEL = config.get('LLM', 'model', fallback='gpt-4o')
+
+logging.info(f"Loaded LLM config: SYMBOL={SYMBOL}, POSITION_TYPE={POSITION_TYPE}, MODEL={MODEL}")
+
+TOPSTEP_CONFIG = {
+    'api_key': config.get('Topstep', 'api_key', fallback='your-topstep-api-key'),
+    'api_secret': config.get('Topstep', 'api_secret', fallback='your-topstep-api-secret'),
+    'base_url': config.get('Topstep', 'base_url', fallback='https://api.topstep.com/v1'),
+    'buy_endpoint': config.get('Topstep', 'buy_endpoint', fallback='/orders'),
+    'sell_endpoint': config.get('Topstep', 'sell_endpoint', fallback='/orders'),
+    'flatten_endpoint': config.get('Topstep', 'flatten_endpoint', fallback='/positions/flatten'),
+    'quantity': config.get('Topstep', 'quantity', fallback='1')
+}
+
+logging.info(f"Loaded Topstep config: BASE_URL={TOPSTEP_CONFIG['base_url']}, QUANTITY={TOPSTEP_CONFIG['quantity']}")
+
+OPENAI_API_KEY = config.get('OpenAI', 'api_key', fallback='your-openai-api-key-here')
+OPENAI_API_URL = config.get('OpenAI', 'api_url', fallback='https://api.openai.com/v1/chat/completions')
+
+logging.info(f"Loaded OpenAI config: API_URL={OPENAI_API_URL}")
+
 # Schedule the job every INTERVAL_MINUTES minutes
 schedule.every(INTERVAL_MINUTES).minutes.do(
     job, 
@@ -207,7 +304,8 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     enable_llm=ENABLE_LLM,
     enable_trading=ENABLE_TRADING,
     openai_api_url=OPENAI_API_URL,
-    openai_api_key=OPENAI_API_KEY
+    openai_api_key=OPENAI_API_KEY,
+    enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS
 )
 
 # Global flag to control the scheduler
@@ -227,6 +325,7 @@ def start_scheduler(icon):
         scheduler_thread = threading.Thread(target=run_scheduler)
         scheduler_thread.start()
         icon.notify("Scheduler started.")
+        logging.info("Scheduler started.")
 
 def stop_scheduler(icon):
     global running
@@ -235,10 +334,12 @@ def stop_scheduler(icon):
         if scheduler_thread:
             scheduler_thread.join()
         icon.notify("Scheduler stopped.")
+        logging.info("Scheduler stopped.")
 
 def quit_app(icon):
     stop_scheduler(icon)
     icon.stop()
+    logging.info("Application quit.")
 
 # Create tray icon
 def create_tray_icon():
@@ -266,7 +367,7 @@ def set_position(new_position):
     config['LLM']['position_type'] = new_position
     with open('config.ini', 'w') as configfile:
         config.write(configfile)
-    print(f"Position set to: {new_position}")
+    logging.info(f"Position set to: {new_position}")
 
 def toggle_flag(flag_name):
     current = config.getboolean('General', flag_name) if flag_name in ['enable_llm', 'enable_trading'] else False
@@ -275,52 +376,6 @@ def toggle_flag(flag_name):
     with open('config.ini', 'w') as configfile:
         config.write(configfile)
     logging.info(f"Toggled {flag_name} to {new_value}")
-
-# Load configuration from config.ini
-config = configparser.ConfigParser()
-config.read('config.ini')
-
-# Logging setup
-LOG_FOLDER = config['General']['log_folder'] if 'log_folder' in config['General'] else 'logs'
-os.makedirs(LOG_FOLDER, exist_ok=True)
-today = datetime.datetime.now().strftime("%Y%m%d")
-log_file = os.path.join(LOG_FOLDER, f"{today}.txt")
-logging.basicConfig(
-    filename=log_file,
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-
-INTERVAL_MINUTES = int(config['General']['interval_minutes'])
-BEGIN_TIME = config['General']['begin_time']
-END_TIME = config['General']['end_time']
-WINDOW_TITLE = config['General']['window_title'] if config['General']['window_title'] else None
-TOP_OFFSET = int(config['General']['top_offset'])
-BOTTOM_OFFSET = int(config['General']['bottom_offset'])
-SAVE_FOLDER = config['General']['save_folder'] if config['General']['save_folder'] else None
-ENABLE_LLM = config.getboolean('General', 'enable_llm')
-ENABLE_TRADING = config.getboolean('General', 'enable_trading')
-
-SYMBOL = config['LLM']['symbol']
-POSITION_TYPE = config['LLM']['position_type']
-NO_POSITION_PROMPT = config['LLM']['no_position_prompt']
-LONG_POSITION_PROMPT = config['LLM']['long_position_prompt']
-SHORT_POSITION_PROMPT = config['LLM']['short_position_prompt']
-MODEL = config['LLM']['model']
-
-TOPSTEP_CONFIG = {
-    'api_key': config['Topstep']['api_key'],
-    'api_secret': config['Topstep']['api_secret'],
-    'base_url': config['Topstep']['base_url'],
-    'buy_endpoint': config['Topstep']['buy_endpoint'],
-    'sell_endpoint': config['Topstep']['sell_endpoint'],
-    'flatten_endpoint': config['Topstep']['flatten_endpoint'],
-    'quantity': config['Topstep']['quantity']
-}
-
-OPENAI_API_KEY = config['OpenAI']['api_key']
-OPENAI_API_URL = config['OpenAI']['api_url']
 
 if __name__ == "__main__":
     icon = create_tray_icon()

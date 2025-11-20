@@ -33,7 +33,7 @@ def get_window_by_partial_title(partial_title):
     return None
 
 def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_folder=None, enable_save_screenshots=False):
-    """Capture the full screen or a specific window (by partial title) by activating and maximizing if necessary, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string."""
+    """Capture the full screen or a specific window (by partial title) using Win32 PrintWindow without activating, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string."""
     logging.info("Capturing screenshot.")
     if window_title:
         hwnd = get_window_by_partial_title(window_title)
@@ -42,23 +42,20 @@ def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_fo
             raise ValueError(f"No window found matching partial title '{window_title}'.")
         logging.info(f"Window found: HWND={hwnd}, Title={win32gui.GetWindowText(hwnd)}")
 
-        # Check and activate/maximize if necessary
-        if win32gui.IsIconic(hwnd):
-            logging.info("Window is minimized; restoring.")
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        if win32gui.GetForegroundWindow() != hwnd:
-            logging.info("Window not in foreground; activating.")
-            win32gui.SetForegroundWindow(hwnd)
-        logging.info("Maximizing window.")
-        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+        # Check if window is minimized and restore it without activating
+        was_minimized = win32gui.IsIconic(hwnd)
+        if was_minimized:
+            logging.info("Window is minimized; restoring without activation.")
+            # SW_SHOWNOACTIVATE (4) - Displays window without activating it
+            win32gui.ShowWindow(hwnd, 4)
+            time.sleep(0.5)  # Brief pause to allow window to restore
 
-        # Brief sleep to allow window to render
-        time.sleep(0.5)
-
-        # Get updated window dimensions after maximizing
+        # Get window dimensions after ensuring it's restored
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         width = right - left
         height = bottom - top
+
+        logging.info(f"Window dimensions: {width}x{height}")
 
         # Check if offsets would result in invalid height
         effective_height = height - top_offset - bottom_offset
@@ -66,12 +63,59 @@ def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_fo
             logging.error(f"Offsets result in invalid effective height: {effective_height} (original height: {height}, top_offset: {top_offset}, bottom_offset: {bottom_offset})")
             raise ValueError("Offsets result in invalid effective height.")
 
-        # Capture using ImageGrab with bbox
-        bbox = (left, top, right, bottom)
-        screenshot = ImageGrab.grab(bbox=bbox)
+        # Capture using Win32 PrintWindow (works without bringing to foreground)
+        try:
+            # Create device contexts
+            hwndDC = win32gui.GetWindowDC(hwnd)
+            mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+            saveDC = mfcDC.CreateCompatibleDC()
+
+            # Create bitmap
+            saveBitMap = win32ui.CreateBitmap()
+            saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
+            saveDC.SelectObject(saveBitMap)
+
+            # Use PrintWindow to capture window content
+            result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 3)  # 3 = PW_RENDERFULLCONTENT
+            
+            if result == 0:
+                logging.warning("PrintWindow returned 0, attempting fallback to BitBlt")
+                # Fallback to BitBlt if PrintWindow fails
+                saveDC.BitBlt((0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY)
+
+            # Convert to PIL Image
+            bmpinfo = saveBitMap.GetInfo()
+            bmpstr = saveBitMap.GetBitmapBits(True)
+            screenshot = Image.frombuffer(
+                'RGB',
+                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                bmpstr, 'raw', 'BGRX', 0, 1
+            )
+
+            # Clean up
+            win32gui.DeleteObject(saveBitMap.GetHandle())
+            saveDC.DeleteDC()
+            mfcDC.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwndDC)
+
+            logging.info("Screenshot captured using PrintWindow")
+
+            # Restore minimized state if it was originally minimized
+            if was_minimized:
+                logging.info("Re-minimizing window.")
+                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+
+        except Exception as e:
+            # Make sure to restore minimized state even on error
+            if was_minimized:
+                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+            logging.error(f"Error capturing window with PrintWindow: {e}")
+            raise ValueError(f"Failed to capture window: {e}")
 
         # Apply crop for offsets
-        screenshot = screenshot.crop((0, top_offset, width, height - bottom_offset))
+        if top_offset > 0 or bottom_offset > 0:
+            screenshot = screenshot.crop((0, top_offset, width, height - bottom_offset))
+            logging.info(f"Applied offsets: top={top_offset}, bottom={bottom_offset}")
     else:
         logging.info("Capturing full screen.")
         screenshot = ImageGrab.grab()  # Full screen; offsets not applied
@@ -236,76 +280,152 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
         return 'none'  # Default to none on error
 
 def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, position_type='none', auth_token=None, execute_trades=False):
-    """Execute trade via Topstep API based on action (or mock/log details if disabled)."""
+    """Execute trade via Topstep API based on action with stop loss and take profit (or mock/log details if disabled)."""
     logging.info(f"Preparing to execute trade: {action} with target {price_target} and stop {stop_loss}")
+    
+    # Get configuration values
     account_id = topstep_config.get('account_id', '')
-    symbol = SYMBOL
-    quantity = int(topstep_config['quantity']) if action != 'scale' else int(topstep_config['quantity']) // 2
+    if not account_id:
+        logging.error("No account_id configured - cannot place order")
+        return
+    
+    # Get contract ID from config or from the available contracts
+    contract_id = topstep_config.get('contract_id', '')
+    
+    # If not in config, try to get it from available contracts
+    if not contract_id:
+        contracts = topstep_config.get('available_contracts', [])
+        if contracts and isinstance(contracts, list) and len(contracts) > 0:
+            contract_id = contracts[0].get('symbol', '') if isinstance(contracts[0], dict) else ''
+    
+    if not contract_id:
+        logging.error("No contract ID available - cannot place order")
+        logging.error("Please set contract_id in config.ini or ensure contract search was successful on startup")
+        return
+    
+    # Get order size
+    size = int(topstep_config['quantity']) if action != 'scale' else int(topstep_config['quantity']) // 2
+    
+    # Determine order side based on action
+    # side: 0 = bid (buy), 1 = ask (sell)
+    if action == 'buy':
+        side = 0  # Bid (buy)
+    elif action == 'sell':
+        side = 1  # Ask (sell)
+    elif action == 'close':
+        # Close position: if long, sell; if short, buy
+        if position_type == 'long':
+            side = 1  # Ask (sell to close long)
+        elif position_type == 'short':
+            side = 0  # Bid (buy to close short)
+        else:
+            logging.error("Close action requires long or short position_type")
+            return
+    elif action == 'scale':
+        # Scale position: if long, sell; if short, buy
+        if position_type == 'long':
+            side = 1  # Ask (sell to scale out long)
+        elif position_type == 'short':
+            side = 0  # Bid (buy to scale out short)
+        else:
+            logging.error("Scale action requires long or short position_type")
+            return
+    elif action == 'flatten':
+        logging.error("Flatten action not implemented - use close instead")
+        return
+    else:
+        logging.error(f"Unknown action: {action}")
+        return
+    
+    # Build the correct TopstepX API payload
+    # type: 2 = Market order
+    payload = {
+        "accountId": int(account_id),
+        "contractId": contract_id,
+        "type": 2,  # Market order
+        "side": side,  # 0 = bid (buy), 1 = ask (sell)
+        "size": size
+    }
+    
+    # Add stop loss and take profit if enabled and provided
+    # Only add these for entry orders (buy/sell), not for close/scale actions
+    enable_sl = topstep_config.get('enable_stop_loss', True)
+    enable_tp = topstep_config.get('enable_take_profit', True)
+    
+    if action in ['buy', 'sell']:
+        # Calculate or use provided stop loss and take profit
+        max_risk = topstep_config.get('max_risk_per_contract', '')
+        max_profit = topstep_config.get('max_profit_per_contract', '')
+        tick_size = topstep_config.get('tick_size', 0.25)
+        
+        # Use LLM suggestions if no config limits set
+        if stop_loss and enable_sl:
+            # If max_risk is set, limit the stop loss distance
+            if max_risk and max_risk.strip():
+                max_risk_points = float(max_risk)
+                if side == 0:  # Buy order
+                    # For buy, stop loss should be below entry
+                    # Assuming price_target is the expected entry price for market orders
+                    calculated_sl = stop_loss if stop_loss else (price_target - max_risk_points if price_target else None)
+                else:  # Sell order
+                    # For sell, stop loss should be above entry
+                    calculated_sl = stop_loss if stop_loss else (price_target + max_risk_points if price_target else None)
+                
+                if calculated_sl:
+                    payload['stopLoss'] = float(calculated_sl)
+                    logging.info(f"Stop Loss set to: {calculated_sl}")
+            else:
+                # Use LLM suggestion directly
+                payload['stopLoss'] = float(stop_loss)
+                logging.info(f"Stop Loss set to: {stop_loss} (from LLM)")
+        
+        if price_target and enable_tp:
+            # If max_profit is set, limit the take profit distance
+            if max_profit and max_profit.strip():
+                max_profit_points = float(max_profit)
+                if side == 0:  # Buy order
+                    # For buy, take profit should be above entry
+                    # We'll use the price_target as the take profit
+                    calculated_tp = price_target
+                else:  # Sell order
+                    # For sell, take profit should be below entry
+                    calculated_tp = price_target
+                
+                if calculated_tp:
+                    payload['takeProfit'] = float(calculated_tp)
+                    logging.info(f"Take Profit set to: {calculated_tp}")
+            else:
+                # Use LLM suggestion directly
+                payload['takeProfit'] = float(price_target)
+                logging.info(f"Take Profit set to: {price_target} (from LLM)")
 
     if not enable_trading:
         # Log full request details for testing
         base_url = topstep_config['base_url']
-        url = base_url + (topstep_config['buy_endpoint'] if action == 'buy' else topstep_config['sell_endpoint'] if action in ['sell', 'close'] else topstep_config['flatten_endpoint'])
-        if account_id:
-            url += f"?account_id={account_id}"
+        url = base_url + topstep_config['buy_endpoint']  # All orders go to /api/Order/place endpoint
         headers = {"Authorization": f"Bearer {auth_token or '[AUTH_TOKEN]'}", "Content-Type": "application/json"}
-        payload = {
-            "symbol": symbol,
-            "quantity": quantity,
-            "price_target": price_target,
-            "stop_loss": stop_loss
-        }
-        if account_id:
-            payload['account_id'] = account_id
-        logging.info(f"Trading disabled - Mock request: URL={url}, Headers={headers}, Payload={payload}")
+        logging.info(f"Trading disabled - Mock request: URL={url}, Headers={headers}, Payload={json.dumps(payload, indent=2)}")
         return
 
     if not auth_token:
         logging.error("No auth token available for trade execution")
         return
 
-    # Existing real execution code...
+    # Real execution code
     base_url = topstep_config['base_url']
+    url = base_url + topstep_config['buy_endpoint']  # All orders go to /api/Order/place endpoint
 
     headers = {
         "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "symbol": symbol,
-        "quantity": quantity,
-        "price_target": price_target,
-        "stop_loss": stop_loss
-    }
-    if account_id:
-        payload['account_id'] = account_id  # Assume included in payload; adjust per docs
-
-    if action == 'buy':
-        url = base_url + topstep_config['buy_endpoint']
-    elif action in ['sell', 'close', 'flatten']:
-        url = base_url + topstep_config['sell_endpoint'] if action in ['sell', 'close'] else base_url + topstep_config['flatten_endpoint']
-    elif action == 'scale':
-        if position_type == 'long':
-            url = base_url + topstep_config['sell_endpoint']  # Sell to scale out long
-            logging.info("Scaling long position: Using sell_endpoint")
-        elif position_type == 'short':
-            url = base_url + topstep_config['buy_endpoint']  # Buy to scale out short
-            payload['quantity'] = abs(quantity)  # Positive for buy
-            logging.info("Scaling short position: Using buy_endpoint")
-        else:
-            logging.error("Scale action requires long or short position_type")
-            return
-    else:
-        logging.error(f"Unknown action: {action}")
-        return
-
     # Debug logging
     logging.info("=== EXECUTING TRADE ===")
     logging.info(f"Trade URL: {url}")
     logging.info(f"Auth Token: {auth_token[:20]}..." if auth_token else "None")
     logging.info(f"Headers: {headers}")
-    logging.info(f"Payload: {json.dumps(payload)}")
+    logging.info(f"Payload: {json.dumps(payload, indent=2)}")
 
     # Check if we should actually execute the trade or just log it
     if not execute_trades:
@@ -323,10 +443,19 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         trade_response = response.json()
         logging.info(f"Trade Response Body: {json.dumps(trade_response, indent=2)}")
         logging.info(f"Trade executed successfully: {action}")
+        
+        # Log stop loss and take profit order details if present
+        if 'stopLoss' in payload:
+            logging.info(f"Stop Loss order placed at: {payload['stopLoss']}")
+        if 'takeProfit' in payload:
+            logging.info(f"Take Profit order placed at: {payload['takeProfit']}")
+            
     except requests.exceptions.Timeout:
         logging.error("Trade request timed out")
     except requests.exceptions.RequestException as e:
         logging.error(f"Trade request failed: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logging.error(f"Error response: {e.response.text}")
     except Exception as e:
         logging.error(f"Error executing trade: {e}")
 
@@ -596,11 +725,18 @@ TOPSTEP_CONFIG = {
     'positions_endpoint': config.get('Topstep', 'positions_endpoint', fallback='/positions'),
     'accounts_endpoint': config.get('Topstep', 'accounts_endpoint', fallback='/api/Account/search'),
     'account_id': config.get('Topstep', 'account_id', fallback=''),
+    'contract_id': config.get('Topstep', 'contract_id', fallback=''),
     'quantity': config.get('Topstep', 'quantity', fallback='1'),
-    'contract_to_search': config.get('Topstep', 'contract_to_search', fallback='ES')
+    'contract_to_search': config.get('Topstep', 'contract_to_search', fallback='ES'),
+    'max_risk_per_contract': config.get('Topstep', 'max_risk_per_contract', fallback=''),
+    'max_profit_per_contract': config.get('Topstep', 'max_profit_per_contract', fallback=''),
+    'enable_stop_loss': config.getboolean('Topstep', 'enable_stop_loss', fallback=True),
+    'enable_take_profit': config.getboolean('Topstep', 'enable_take_profit', fallback=True),
+    'tick_size': config.getfloat('Topstep', 'tick_size', fallback=0.25)
 }
 
-logging.info(f"Loaded Topstep config: BASE_URL={TOPSTEP_CONFIG['base_url']}, ACCOUNT_ID={TOPSTEP_CONFIG['account_id'] or 'None'}, QUANTITY={TOPSTEP_CONFIG['quantity']}, CONTRACT_TO_SEARCH={TOPSTEP_CONFIG['contract_to_search']}")
+logging.info(f"Loaded Topstep config: BASE_URL={TOPSTEP_CONFIG['base_url']}, ACCOUNT_ID={TOPSTEP_CONFIG['account_id'] or 'None'}, CONTRACT_ID={TOPSTEP_CONFIG['contract_id'] or 'None (will use search results)'}, QUANTITY={TOPSTEP_CONFIG['quantity']}, CONTRACT_TO_SEARCH={TOPSTEP_CONFIG['contract_to_search']}")
+logging.info(f"Risk Management: ENABLE_STOP_LOSS={TOPSTEP_CONFIG['enable_stop_loss']}, ENABLE_TAKE_PROFIT={TOPSTEP_CONFIG['enable_take_profit']}, MAX_RISK={TOPSTEP_CONFIG['max_risk_per_contract'] or 'LLM suggestion'}, MAX_PROFIT={TOPSTEP_CONFIG['max_profit_per_contract'] or 'LLM suggestion'}, TICK_SIZE={TOPSTEP_CONFIG['tick_size']}")
 
 OPENAI_API_KEY = config.get('OpenAI', 'api_key', fallback='your-openai-api-key-here')
 OPENAI_API_URL = config.get('OpenAI', 'api_url', fallback='https://api.openai.com/v1/chat/completions')

@@ -183,6 +183,12 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
         return
 
     logging.info(f"Starting job at {time.ctime()}")
+    
+    # Check if there are active positions - if yes, skip screenshot and LLM analysis
+    if check_active_trades(topstep_config, enable_trading, auth_token):
+        logging.info("Active position detected - Skipping screenshot and LLM analysis until position is closed")
+        return
+    
     try:
         current_position_type = get_current_position(symbol, topstep_config, enable_trading, auth_token)
         logging.info(f"Determined current position_type: {current_position_type}")
@@ -240,19 +246,20 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
     base_url = topstep_config['base_url']
     positions_endpoint = topstep_config.get('positions_endpoint', '/positions')
     account_id = topstep_config.get('account_id', '')
+    
+    if not account_id:
+        logging.error("No account_id configured for positions query")
+        return 'none'
 
     url = base_url + positions_endpoint
-    query_params = {}
-    if account_id:
-        query_params["account_id"] = account_id
-
-    # Add query parameters to URL
-    if query_params:
-        url += "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
 
     headers = {
         "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "accountId": int(account_id)
     }
 
     # Debug logging
@@ -260,11 +267,14 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
     logging.info(f"Positions URL: {url}")
     logging.info(f"Auth Token: {auth_token[:20]}..." if auth_token else "None")
     logging.info(f"Headers: {headers}")
+    logging.info(f"Payload: {json.dumps(payload)}")
 
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
         positions = response.json()  # Assume returns list of {'symbol': str, 'quantity': int}
+        logging.info(f"Positions Response: {json.dumps(positions, indent=2)}")
+        
         for pos in positions:
             if pos['symbol'] == symbol:
                 quantity = pos['quantity']
@@ -275,9 +285,89 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                 else:
                     return 'none'
         return 'none'  # No position found
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        logging.error("Positions query timed out")
+        return 'none'
+    except requests.exceptions.RequestException as e:
         logging.error(f"Error querying positions: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logging.error(f"Error response: {e.response.text}")
         return 'none'  # Default to none on error
+    except Exception as e:
+        logging.error(f"Unexpected error querying positions: {e}")
+        return 'none'
+
+def check_active_trades(topstep_config, enable_trading, auth_token=None):
+    """Check if there are any active open positions - returns True if positions are active."""
+    if not enable_trading:
+        logging.debug("Trading disabled - No active trades check needed")
+        return False
+
+    if not auth_token:
+        logging.error("No auth token available for active trades check")
+        return False
+
+    base_url = topstep_config['base_url']
+    account_id = topstep_config.get('account_id', '')
+    
+    if not account_id:
+        logging.error("No account_id configured for active trades check")
+        return False
+    
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "accountId": int(account_id)
+    }
+
+    try:
+        # Check for active positions
+        positions_endpoint = topstep_config.get('positions_endpoint', '/positions')
+        positions_url = base_url + positions_endpoint
+        
+        response = requests.post(positions_url, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        positions = response.json()
+        
+        # If positions is a list and has any items with non-zero quantity, we have active trades
+        if isinstance(positions, list) and len(positions) > 0:
+            for pos in positions:
+                quantity = pos.get('quantity', 0)
+                if quantity != 0:
+                    symbol = pos.get('symbol', 'Unknown')
+                    logging.info(f"Active position found: {symbol} with quantity {quantity}")
+                    return True
+        
+        # DISABLED: Check for working orders (uncomment to re-enable)
+        # orders_endpoint = topstep_config.get('working_orders_endpoint', '/api/Order/searchWorking')
+        # orders_url = base_url + orders_endpoint
+        # 
+        # response = requests.post(orders_url, headers=headers, json=payload, timeout=10)
+        # response.raise_for_status()
+        # orders = response.json()
+        # 
+        # # If orders is a list and has any items, we have active orders
+        # if isinstance(orders, list) and len(orders) > 0:
+        #     logging.info(f"Found {len(orders)} working order(s)")
+        #     return True
+        
+        logging.debug("No active positions found")
+        return False
+        
+    except requests.exceptions.Timeout:
+        logging.error("Active trades check timed out")
+        return False
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error checking active trades: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logging.error(f"Error response: {e.response.text}")
+        return False
+    except Exception as e:
+        logging.error(f"Unexpected error checking active trades: {e}")
+        return False
 
 def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, position_type='none', auth_token=None, execute_trades=False):
     """Execute trade via Topstep API based on action with stop loss and take profit (or mock/log details if disabled)."""
@@ -347,7 +437,7 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         "size": size
     }
     
-    # Add stop loss and take profit if enabled and provided
+    # Add stop loss and take profit brackets if enabled and provided
     # Only add these for entry orders (buy/sell), not for close/scale actions
     enable_sl = topstep_config.get('enable_stop_loss', True)
     enable_tp = topstep_config.get('enable_take_profit', True)
@@ -358,46 +448,58 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         max_profit = topstep_config.get('max_profit_per_contract', '')
         tick_size = topstep_config.get('tick_size', 0.25)
         
-        # Use LLM suggestions if no config limits set
-        if stop_loss and enable_sl:
-            # If max_risk is set, limit the stop loss distance
+        # Build stopLossBracket object
+        if enable_sl and (stop_loss or (max_risk and max_risk.strip())):
+            stop_loss_bracket = {
+                "type": 4  # 4 = Stop order
+            }
+            
             if max_risk and max_risk.strip():
+                # Use configured max risk in points
                 max_risk_points = float(max_risk)
-                if side == 0:  # Buy order
-                    # For buy, stop loss should be below entry
-                    # Assuming price_target is the expected entry price for market orders
-                    calculated_sl = stop_loss if stop_loss else (price_target - max_risk_points if price_target else None)
-                else:  # Sell order
-                    # For sell, stop loss should be above entry
-                    calculated_sl = stop_loss if stop_loss else (price_target + max_risk_points if price_target else None)
+                # Calculate ticks from points
+                stop_loss_ticks = int(max_risk_points / tick_size)
                 
-                if calculated_sl:
-                    payload['stopLoss'] = float(calculated_sl)
-                    logging.info(f"Stop Loss set to: {calculated_sl}")
-            else:
-                # Use LLM suggestion directly
-                payload['stopLoss'] = float(stop_loss)
-                logging.info(f"Stop Loss set to: {stop_loss} (from LLM)")
+                # For long positions (side=0/buy), stop loss ticks should be negative (below entry)
+                if side == 0:
+                    stop_loss_ticks = -stop_loss_ticks
+                
+                stop_loss_bracket['ticks'] = stop_loss_ticks
+                logging.info(f"Stop Loss Bracket set to: {stop_loss_ticks} ticks ({max_risk_points} points)")
+            elif stop_loss:
+                # Use LLM suggestion - calculate from price if we have an entry price
+                # For market orders, we might not know exact entry, so use the stop_loss as price
+                stop_loss_bracket['price'] = float(stop_loss)
+                logging.info(f"Stop Loss Bracket set to price: {stop_loss} (from LLM)")
+            
+            if stop_loss_bracket:
+                payload['stopLossBracket'] = stop_loss_bracket
         
-        if price_target and enable_tp:
-            # If max_profit is set, limit the take profit distance
+        # Build takeProfitBracket object
+        if enable_tp and (price_target or (max_profit and max_profit.strip())):
+            take_profit_bracket = {
+                "type": 1  # 1 = Limit order
+            }
+            
             if max_profit and max_profit.strip():
+                # Use configured max profit in points
                 max_profit_points = float(max_profit)
-                if side == 0:  # Buy order
-                    # For buy, take profit should be above entry
-                    # We'll use the price_target as the take profit
-                    calculated_tp = price_target
-                else:  # Sell order
-                    # For sell, take profit should be below entry
-                    calculated_tp = price_target
+                # Calculate ticks from points
+                take_profit_ticks = int(max_profit_points / tick_size)
                 
-                if calculated_tp:
-                    payload['takeProfit'] = float(calculated_tp)
-                    logging.info(f"Take Profit set to: {calculated_tp}")
-            else:
-                # Use LLM suggestion directly
-                payload['takeProfit'] = float(price_target)
-                logging.info(f"Take Profit set to: {price_target} (from LLM)")
+                # For short positions (side=1/sell), take profit ticks should be negative
+                if side == 1:
+                    take_profit_ticks = -take_profit_ticks
+                
+                take_profit_bracket['ticks'] = take_profit_ticks
+                logging.info(f"Take Profit Bracket set to: {take_profit_ticks} ticks ({max_profit_points} points)")
+            elif price_target:
+                # Use LLM suggestion - use the target price
+                take_profit_bracket['price'] = float(price_target)
+                logging.info(f"Take Profit Bracket set to price: {price_target} (from LLM)")
+            
+            if take_profit_bracket:
+                payload['takeProfitBracket'] = take_profit_bracket
 
     if not enable_trading:
         # Log full request details for testing
@@ -444,11 +546,19 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         logging.info(f"Trade Response Body: {json.dumps(trade_response, indent=2)}")
         logging.info(f"Trade executed successfully: {action}")
         
-        # Log stop loss and take profit order details if present
-        if 'stopLoss' in payload:
-            logging.info(f"Stop Loss order placed at: {payload['stopLoss']}")
-        if 'takeProfit' in payload:
-            logging.info(f"Take Profit order placed at: {payload['takeProfit']}")
+        # Log stop loss and take profit bracket details if present
+        if 'stopLossBracket' in payload:
+            sl_bracket = payload['stopLossBracket']
+            if 'ticks' in sl_bracket:
+                logging.info(f"Stop Loss bracket placed: {sl_bracket['ticks']} ticks")
+            elif 'price' in sl_bracket:
+                logging.info(f"Stop Loss bracket placed at price: {sl_bracket['price']}")
+        if 'takeProfitBracket' in payload:
+            tp_bracket = payload['takeProfitBracket']
+            if 'ticks' in tp_bracket:
+                logging.info(f"Take Profit bracket placed: {tp_bracket['ticks']} ticks")
+            elif 'price' in tp_bracket:
+                logging.info(f"Take Profit bracket placed at price: {tp_bracket['price']}")
             
     except requests.exceptions.Timeout:
         logging.error("Trade request timed out")
@@ -528,7 +638,7 @@ def get_available_contracts(topstep_config, auth_token=None, symbol=None):
 
     if symbol:
         # Use contract search for specific symbol
-        contracts_endpoint = '/api/Contract/search'
+        contracts_endpoint = topstep_config.get('contracts_endpoint', '/api/Contract/search')
         url = base_url + contracts_endpoint
 
         headers = {
@@ -579,7 +689,7 @@ def get_available_contracts(topstep_config, auth_token=None, symbol=None):
             return None
     else:
         # Fallback to available contracts endpoint
-        contracts_endpoint = '/api/Contract/available'
+        contracts_endpoint = topstep_config.get('contracts_available_endpoint', '/api/Contract/available')
         url = base_url + contracts_endpoint
         headers = {
             "Authorization": f"Bearer {auth_token}",
@@ -690,6 +800,7 @@ logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler]
 logging.info("Application started.")
 
 INTERVAL_MINUTES = int(config.get('General', 'interval_minutes', fallback='5'))
+TRADE_STATUS_CHECK_INTERVAL = int(config.get('General', 'trade_status_check_interval', fallback='10'))
 BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
 END_TIME = config.get('General', 'end_time', fallback='23:59')
 WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
@@ -701,7 +812,7 @@ ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
 EXECUTE_TRADES = config.getboolean('General', 'execute_trades', fallback=False)
 ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
 
-logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
+logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
 
 SYMBOL = config.get('LLM', 'symbol', fallback='ES')
 DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')  # Symbol for LLM communications and human readable formats
@@ -723,7 +834,10 @@ TOPSTEP_CONFIG = {
     'sell_endpoint': config.get('Topstep', 'sell_endpoint', fallback='/orders'),
     'flatten_endpoint': config.get('Topstep', 'flatten_endpoint', fallback='/positions/flatten'),
     'positions_endpoint': config.get('Topstep', 'positions_endpoint', fallback='/positions'),
+    'working_orders_endpoint': config.get('Topstep', 'working_orders_endpoint', fallback='/api/Order/searchWorking'),
     'accounts_endpoint': config.get('Topstep', 'accounts_endpoint', fallback='/api/Account/search'),
+    'contracts_endpoint': config.get('Topstep', 'contracts_endpoint', fallback='/api/Contract/search'),
+    'contracts_available_endpoint': config.get('Topstep', 'contracts_available_endpoint', fallback='/api/Contract/available'),
     'account_id': config.get('Topstep', 'account_id', fallback=''),
     'contract_id': config.get('Topstep', 'contract_id', fallback=''),
     'quantity': config.get('Topstep', 'quantity', fallback='1'),
@@ -805,20 +919,30 @@ else:
     logging.info("No accounts fetched (check API key/endpoint or enable_trading).")
 
 # Log exact Topstep URLs and example POST requests for debug
-account_id_param = f"?account_id={TOPSTEP_CONFIG['account_id']}" if TOPSTEP_CONFIG['account_id'] else ""
-logging.info("Topstep Debug URLs:")
+logging.info("Topstep Debug URLs (all POST requests):")
 logging.info(f"Login URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['login_endpoint']}")
-logging.info(f"Contract Search URL: {TOPSTEP_CONFIG['base_url']}/api/Contract/search")
-logging.info(f"Buy URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['buy_endpoint'] + account_id_param}")
-logging.info(f"Sell URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['sell_endpoint'] + account_id_param}")
-logging.info(f"Flatten URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['flatten_endpoint'] + account_id_param}")
-logging.info(f"Positions URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['positions_endpoint'] + account_id_param}")
-logging.info(f"Accounts URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['accounts_endpoint'] + account_id_param}")
+logging.info(f"Accounts URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['accounts_endpoint']}")
+logging.info(f"Contract Search URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['contracts_endpoint']}")
+logging.info(f"Order Place URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['buy_endpoint']}")
+logging.info(f"Positions URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['positions_endpoint']}")
+logging.info(f"Working Orders URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['working_orders_endpoint']}")
 
-example_payload = {"symbol": TOPSTEP_CONFIG.get('contract_to_search', DISPLAY_SYMBOL), "quantity": int(TOPSTEP_CONFIG['quantity']), "price_target": 0, "stop_loss": 0}
+# Example payloads for different endpoints
+logging.info("Example POST Payloads:")
 if TOPSTEP_CONFIG['account_id']:
-    example_payload['account_id'] = TOPSTEP_CONFIG['account_id']
-logging.info(f"Example POST Payload: {json.dumps(example_payload, indent=2)}")
+    account_payload = {"accountId": int(TOPSTEP_CONFIG['account_id'])}
+    logging.info(f"  Positions/Orders payload: {json.dumps(account_payload)}")
+    
+    order_payload = {
+        "accountId": int(TOPSTEP_CONFIG['account_id']),
+        "contractId": TOPSTEP_CONFIG.get('contract_id', 'CON.F.US.EP.Z25'),
+        "type": 2,
+        "side": 0,
+        "size": int(TOPSTEP_CONFIG['quantity']),
+        "stopLossBracket": {"type": 4, "ticks": -16},
+        "takeProfitBracket": {"type": 1, "ticks": 64}
+    }
+    logging.info(f"  Order payload example: {json.dumps(order_payload, indent=2)}")
 logging.info(f"Headers Template: {{'Authorization': 'Bearer [auth_token]', 'Content-Type': 'application/json'}}")
 
 # Schedule the job every INTERVAL_MINUTES minutes
@@ -846,9 +970,35 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     execute_trades=EXECUTE_TRADES
 )
 
+# Run the first job immediately on startup (before entering the scheduler loop)
+logging.info("Running initial screenshot job immediately on startup...")
+job(
+    window_title=WINDOW_TITLE, 
+    top_offset=TOP_OFFSET, 
+    bottom_offset=BOTTOM_OFFSET, 
+    save_folder=SAVE_FOLDER, 
+    begin_time=BEGIN_TIME, 
+    end_time=END_TIME,
+    symbol=SYMBOL,
+    position_type=POSITION_TYPE,
+    no_position_prompt=NO_POSITION_PROMPT,
+    long_position_prompt=LONG_POSITION_PROMPT,
+    short_position_prompt=SHORT_POSITION_PROMPT,
+    model=MODEL,
+    topstep_config=TOPSTEP_CONFIG,
+    enable_llm=ENABLE_LLM,
+    enable_trading=ENABLE_TRADING,
+    openai_api_url=OPENAI_API_URL,
+    openai_api_key=OPENAI_API_KEY,
+    enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
+    auth_token=AUTH_TOKEN,
+    execute_trades=EXECUTE_TRADES
+)
+
 # Global flag to control the scheduler
 running = False
 scheduler_thread = None
+trade_monitor_thread = None
 
 def run_scheduler():
     global running
@@ -856,22 +1006,53 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
+def run_trade_monitor():
+    """Background thread to continuously monitor trade status."""
+    global running
+    last_active_state = None
+    
+    while running:
+        try:
+            is_active = check_active_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
+            
+            # Log state changes
+            if is_active != last_active_state:
+                if is_active:
+                    logging.info("⚠️ Trade monitoring: Active position detected - LLM analysis paused")
+                else:
+                    logging.info("✅ Trade monitoring: No active positions - LLM analysis will resume on next cycle")
+                last_active_state = is_active
+            
+            time.sleep(TRADE_STATUS_CHECK_INTERVAL)
+        except Exception as e:
+            logging.error(f"Error in trade monitor thread: {e}")
+            time.sleep(TRADE_STATUS_CHECK_INTERVAL)
+
 def start_scheduler(icon):
-    global running, scheduler_thread
+    global running, scheduler_thread, trade_monitor_thread
     if not running:
         running = True
-        scheduler_thread = threading.Thread(target=run_scheduler)
+        scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
         scheduler_thread.start()
+        
+        # Start trade monitor thread if trading is enabled
+        if ENABLE_TRADING:
+            trade_monitor_thread = threading.Thread(target=run_trade_monitor, daemon=True)
+            trade_monitor_thread.start()
+            logging.info(f"Trade monitor started (checking every {TRADE_STATUS_CHECK_INTERVAL}s)")
+        
         icon.notify("Scheduler started.")
         logging.info("Scheduler started.")
         icon.icon = icon.green_image  # Set to green when running
 
 def stop_scheduler(icon):
-    global running
+    global running, scheduler_thread, trade_monitor_thread
     if running:
         running = False
         if scheduler_thread:
-            scheduler_thread.join()
+            scheduler_thread.join(timeout=2)
+        if trade_monitor_thread:
+            trade_monitor_thread.join(timeout=2)
         icon.notify("Scheduler stopped.")
         logging.info("Scheduler stopped.")
         icon.icon = icon.red_image  # Set to red when stopped
@@ -903,6 +1084,7 @@ def create_tray_icon():
             # Add more as needed or make dynamic
         )),
         item('Test Positions Endpoint', lambda icon, item: test_positions()),
+        item('Test Active Positions Check', lambda icon, item: test_active_trades()),
         item('List All Contracts', lambda icon, item: list_all_contracts()),
         item('Take Screenshot Now', lambda icon, item: manual_job()),
         item('Exit', quit_app)
@@ -937,8 +1119,13 @@ def set_account(new_account_id):
 
 def test_positions():
     logging.info("Testing positions endpoint.")
-    position_type = get_current_position(SYMBOL, TOPSTEP_CONFIG, ENABLE_TRADING)
+    position_type = get_current_position(SYMBOL, TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
     logging.info(f"Test result: Position type = {position_type}")
+
+def test_active_trades():
+    logging.info("Testing active positions check.")
+    has_active_trades = check_active_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
+    logging.info(f"Test result: Active positions = {has_active_trades}")
 
 def list_all_contracts():
     """Manually fetch and log all available contracts from Topstep API."""

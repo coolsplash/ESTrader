@@ -32,7 +32,7 @@ def get_window_by_partial_title(partial_title):
     return None
 
 def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_folder=None, enable_save_screenshots=False):
-    """Capture the full screen or a specific window (by partial title) without activating it, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string."""
+    """Capture the full screen or a specific window (by partial title) by activating and maximizing if necessary, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string."""
     logging.info("Capturing screenshot.")
     if window_title:
         hwnd = get_window_by_partial_title(window_title)
@@ -41,8 +41,21 @@ def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_fo
             raise ValueError(f"No window found matching partial title '{window_title}'.")
         logging.info(f"Window found: HWND={hwnd}, Title={win32gui.GetWindowText(hwnd)}")
 
-        # Get window dimensions
-        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        # Check and activate/maximize if necessary
+        if win32gui.IsIconic(hwnd):
+            logging.info("Window is minimized; restoring.")
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        if win32gui.GetForegroundWindow() != hwnd:
+            logging.info("Window not in foreground; activating.")
+            win32gui.SetForegroundWindow(hwnd)
+        logging.info("Maximizing window.")
+        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+
+        # Brief sleep to allow window to render
+        time.sleep(0.5)
+
+        # Get updated window dimensions after maximizing
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         width = right - left
         height = bottom - top
 
@@ -52,32 +65,9 @@ def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_fo
             logging.error(f"Offsets result in invalid effective height: {effective_height} (original height: {height}, top_offset: {top_offset}, bottom_offset: {bottom_offset})")
             raise ValueError("Offsets result in invalid effective height.")
 
-        # Create device context
-        hdc = win32gui.GetWindowDC(hwnd)
-        dc_obj = win32ui.CreateDCFromHandle(hdc)
-        mem_dc = dc_obj.CreateCompatibleDC()
-
-        # Create bitmap for full client area
-        bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(dc_obj, width, height)
-        mem_dc.SelectObject(bmp)
-
-        # Print window into bitmap (captures even if not foreground)
-        result = windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), 3)  # 3 = PW_RENDERFULLCONTENT (Windows 10+)
-        if result != 1:
-            logging.warning("PrintWindow failed; falling back to simple copy.")
-            mem_dc.BitBlt((0, 0), (width, height), dc_obj, (left, top), win32con.SRCCOPY)
-
-        # Convert to PIL Image
-        bmp_info = bmp.GetInfo()
-        bmp_str = bmp.GetBitmapBits(True)
-        screenshot = Image.frombuffer('RGB', (bmp_info['bmWidth'], bmp_info['bmHeight']), bmp_str, 'raw', 'BGRX', 0, 1)
-
-        # Clean up
-        win32gui.DeleteObject(bmp.GetHandle())
-        mem_dc.DeleteDC()
-        dc_obj.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hdc)
+        # Capture using ImageGrab with bbox
+        bbox = (left, top, right, bottom)
+        screenshot = ImageGrab.grab(bbox=bbox)
 
         # Apply crop for offsets
         screenshot = screenshot.crop((0, top_offset, width, height - bottom_offset))
@@ -149,20 +139,31 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
 
     logging.info(f"Starting job at {time.ctime()}")
     try:
+        current_position_type = get_current_position(symbol, topstep_config, enable_trading)
+        logging.info(f"Determined current position_type: {current_position_type}")
+
         image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
-        # Select and format prompt based on position_type
-        if position_type == 'none':
+        # Select and format prompt based on current_position_type
+        if current_position_type == 'none':
             prompt = no_position_prompt.format(symbol=symbol)
-        elif position_type == 'long':
+        elif current_position_type == 'long':
             prompt = long_position_prompt.format(symbol=symbol)
-        elif position_type == 'short':
+        elif current_position_type == 'short':
             prompt = short_position_prompt.format(symbol=symbol)
         else:
-            logging.error(f"Invalid position_type: {position_type}")
-            raise ValueError(f"Invalid position_type: {position_type}")
+            logging.error(f"Invalid position_type: {current_position_type}")
+            raise ValueError(f"Invalid position_type: {current_position_type}")
 
         llm_response = upload_to_llm(image_base64, prompt, model, enable_llm, openai_api_url, openai_api_key)
         if llm_response:
+            # Strip markdown if present (e.g., ```json ... ```)
+            llm_response = llm_response.strip()
+            if llm_response.startswith('```json') and llm_response.endswith('```'):
+                llm_response = llm_response[7:-3].strip()  # Remove ```json and trailing ```
+            elif llm_response.startswith('```') and llm_response.endswith('```'):
+                llm_response = llm_response[3:-3].strip()  # Remove generic ```
+            logging.info(f"Cleaned LLM Response for parsing: {llm_response}")
+
             # Parse JSON response
             try:
                 advice = json.loads(llm_response)
@@ -175,44 +176,104 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 # Execute trade based on action
                 if action in ['buy', 'sell', 'scale', 'close', 'flatten']:
                     logging.info(f"Executing trade: {action}")
-                    execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading)
-            except json.JSONDecodeError:
-                logging.error("Error parsing LLM response as JSON.")
+                    execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, current_position_type)
+            except json.JSONDecodeError as e:
+                logging.error(f"Error parsing LLM response as JSON: {e}")
     except ValueError as e:
         logging.error(f"Error: {e}")
 
-def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading):
-    """Execute trade via Topstep API based on action (or mock if disabled)."""
-    logging.info(f"Preparing to execute trade: {action} with target {price_target} and stop {stop_loss}")
+def get_current_position(symbol, topstep_config, enable_trading):
+    """Query Topstep API for current position of the symbol and determine type (or mock if disabled)."""
     if not enable_trading:
-        logging.info(f"Trading disabled - Mock execution: {action}")
-        return
+        logging.info("Trading disabled - Mock positions query: Returning 'none'")
+        return 'none'
 
     base_url = topstep_config['base_url']
     api_key = topstep_config['api_key']
-    api_secret = topstep_config['api_secret']
-    quantity = int(topstep_config['quantity'])
-    symbol = config['LLM']['symbol']  # From LLM config
+    positions_endpoint = topstep_config.get('positions_endpoint', '/positions')
+    account_id = topstep_config.get('account_id', '')
+
+    url = base_url + positions_endpoint
+    if account_id:
+        url += f"?account_id={account_id}"  # Assume query param; adjust per API docs
 
     headers = {
-        "Authorization": f"Bearer {api_key}",  # Assuming Bearer token; adjust if needed
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
 
-    # Example payload; adjust based on actual Topstep API docs
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        positions = response.json()  # Assume returns list of {'symbol': str, 'quantity': int}
+        for pos in positions:
+            if pos['symbol'] == symbol:
+                quantity = pos['quantity']
+                if quantity > 0:
+                    return 'long'
+                elif quantity < 0:
+                    return 'short'
+                else:
+                    return 'none'
+        return 'none'  # No position found
+    except Exception as e:
+        logging.error(f"Error querying positions: {e}")
+        return 'none'  # Default to none on error
+
+def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, position_type='none'):
+    """Execute trade via Topstep API based on action (or mock/log details if disabled)."""
+    logging.info(f"Preparing to execute trade: {action} with target {price_target} and stop {stop_loss}")
+    account_id = topstep_config.get('account_id', '')
+    symbol = SYMBOL
+    quantity = int(topstep_config['quantity']) if action != 'scale' else int(topstep_config['quantity']) // 2
+
+    if not enable_trading:
+        # Log full request details for testing
+        base_url = topstep_config['base_url']
+        url = base_url + (topstep_config['buy_endpoint'] if action == 'buy' else topstep_config['sell_endpoint'] if action in ['sell', 'close'] else topstep_config['flatten_endpoint'])
+        if account_id:
+            url += f"?account_id={account_id}"
+        headers = {"Authorization": f"Bearer {topstep_config['api_key']}", "Content-Type": "application/json"}
+        payload = {"symbol": symbol, "quantity": quantity, "price_target": price_target, "stop_loss": stop_loss}
+        if account_id:
+            payload['account_id'] = account_id
+        logging.info(f"Trading disabled - Mock request: URL={url}, Headers={headers}, Payload={payload}")
+        return
+
+    # Existing real execution code...
+    base_url = topstep_config['base_url']
+    api_key = topstep_config['api_key']
+    api_secret = topstep_config['api_secret']
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
     payload = {
         "symbol": symbol,
         "quantity": quantity,
         "price_target": price_target,
         "stop_loss": stop_loss
     }
+    if account_id:
+        payload['account_id'] = account_id  # Assume included in payload; adjust per docs
 
     if action == 'buy':
         url = base_url + topstep_config['buy_endpoint']
-    elif action == 'sell' or action == 'close' or action == 'flatten':
+    elif action in ['sell', 'close', 'flatten']:
         url = base_url + topstep_config['sell_endpoint'] if action in ['sell', 'close'] else base_url + topstep_config['flatten_endpoint']
-        if action == 'scale':
-            payload['quantity'] = quantity // 2  # Example: scale by halving; customize
+    elif action == 'scale':
+        if position_type == 'long':
+            url = base_url + topstep_config['sell_endpoint']  # Sell to scale out long
+            logging.info("Scaling long position: Using sell_endpoint")
+        elif position_type == 'short':
+            url = base_url + topstep_config['buy_endpoint']  # Buy to scale out short
+            payload['quantity'] = abs(quantity)  # Positive for buy
+            logging.info("Scaling short position: Using buy_endpoint")
+        else:
+            logging.error("Scale action requires long or short position_type")
+            return
     else:
         logging.error(f"Unknown action: {action}")
         return
@@ -275,10 +336,12 @@ TOPSTEP_CONFIG = {
     'buy_endpoint': config.get('Topstep', 'buy_endpoint', fallback='/orders'),
     'sell_endpoint': config.get('Topstep', 'sell_endpoint', fallback='/orders'),
     'flatten_endpoint': config.get('Topstep', 'flatten_endpoint', fallback='/positions/flatten'),
+    'positions_endpoint': config.get('Topstep', 'positions_endpoint', fallback='/positions'),
+    'account_id': config.get('Topstep', 'account_id', fallback=''),
     'quantity': config.get('Topstep', 'quantity', fallback='1')
 }
 
-logging.info(f"Loaded Topstep config: BASE_URL={TOPSTEP_CONFIG['base_url']}, QUANTITY={TOPSTEP_CONFIG['quantity']}")
+logging.info(f"Loaded Topstep config: BASE_URL={TOPSTEP_CONFIG['base_url']}, ACCOUNT_ID={TOPSTEP_CONFIG['account_id'] or 'None'}, QUANTITY={TOPSTEP_CONFIG['quantity']}")
 
 OPENAI_API_KEY = config.get('OpenAI', 'api_key', fallback='your-openai-api-key-here')
 OPENAI_API_URL = config.get('OpenAI', 'api_url', fallback='https://api.openai.com/v1/chat/completions')
@@ -326,6 +389,7 @@ def start_scheduler(icon):
         scheduler_thread.start()
         icon.notify("Scheduler started.")
         logging.info("Scheduler started.")
+        icon.icon = icon.green_image  # Set to green when running
 
 def stop_scheduler(icon):
     global running
@@ -335,6 +399,7 @@ def stop_scheduler(icon):
             scheduler_thread.join()
         icon.notify("Scheduler stopped.")
         logging.info("Scheduler stopped.")
+        icon.icon = icon.red_image  # Set to red when stopped
 
 def quit_app(icon):
     stop_scheduler(icon)
@@ -343,8 +408,9 @@ def quit_app(icon):
 
 # Create tray icon
 def create_tray_icon():
-    # Use a simple icon (you can replace with a real ICO file)
-    image = Image.new('RGB', (64, 64), color=(0, 255, 0))
+    # Use simple icons (green for running, red for stopped)
+    green_image = Image.new('RGB', (64, 64), color=(0, 255, 0))
+    red_image = Image.new('RGB', (64, 64), color=(255, 0, 0))
     menu = (
         item('Start', start_scheduler),
         item('Stop', stop_scheduler),
@@ -355,9 +421,19 @@ def create_tray_icon():
         )),
         item('Toggle LLM', lambda icon, item: toggle_flag('enable_llm')),
         item('Toggle Trading', lambda icon, item: toggle_flag('enable_trading')),
+        item('Select Account', pystray.Menu(
+            item('Default (None)', lambda icon, item: set_account('')),
+            item('Account1', lambda icon, item: set_account('account1')),
+            item('Account2', lambda icon, item: set_account('account2'))
+            # Add more as needed or make dynamic
+        )),
+        item('Test Positions Endpoint', lambda icon, item: test_positions()),
+        item('Take Screenshot Now', lambda icon, item: manual_job()),
         item('Exit', quit_app)
     )
-    icon = pystray.Icon("screenshot_uploader", image, "Screenshot Uploader", menu)
+    icon = pystray.Icon("screenshot_uploader", green_image, "Screenshot Uploader", menu)
+    icon.green_image = green_image
+    icon.red_image = red_image
     return icon
 
 def set_position(new_position):
@@ -376,6 +452,41 @@ def toggle_flag(flag_name):
     with open('config.ini', 'w') as configfile:
         config.write(configfile)
     logging.info(f"Toggled {flag_name} to {new_value}")
+
+def set_account(new_account_id):
+    config['Topstep']['account_id'] = new_account_id
+    with open('config.ini', 'w') as configfile:
+        config.write(configfile)
+    logging.info(f"Account set to: {new_account_id or 'Default (None)'}")
+
+def test_positions():
+    logging.info("Testing positions endpoint.")
+    position_type = get_current_position(SYMBOL, TOPSTEP_CONFIG, ENABLE_TRADING)
+    logging.info(f"Test result: Position type = {position_type}")
+
+def manual_job():
+    logging.info("Manual screenshot triggered.")
+    job(
+        window_title=WINDOW_TITLE, 
+        top_offset=TOP_OFFSET, 
+        bottom_offset=BOTTOM_OFFSET, 
+        save_folder=SAVE_FOLDER, 
+        begin_time=BEGIN_TIME, 
+        end_time=END_TIME,
+        symbol=SYMBOL,
+        position_type=POSITION_TYPE,
+        no_position_prompt=NO_POSITION_PROMPT,
+        long_position_prompt=LONG_POSITION_PROMPT,
+        short_position_prompt=SHORT_POSITION_PROMPT,
+        model=MODEL,
+        topstep_config=TOPSTEP_CONFIG,
+        enable_llm=ENABLE_LLM,
+        enable_trading=ENABLE_TRADING,
+        openai_api_url=OPENAI_API_URL,
+        openai_api_key=OPENAI_API_KEY,
+        enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS
+    )
+    logging.info("Manual job completed.")
 
 if __name__ == "__main__":
     icon = create_tray_icon()

@@ -14,6 +14,7 @@ from pystray import MenuItem as item
 from PIL import Image
 import json # Added for JSON parsing
 import logging
+import base64  # For Basic Auth
 import win32ui
 import win32con
 from ctypes import windll
@@ -131,7 +132,7 @@ def is_within_time_range(begin_time, end_time):
     end = datetime.datetime.strptime(end_time, "%H:%M").time()
     return begin <= now <= end
 
-def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots):
+def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False):
     """The main job to run periodically."""
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
@@ -139,17 +140,17 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
 
     logging.info(f"Starting job at {time.ctime()}")
     try:
-        current_position_type = get_current_position(symbol, topstep_config, enable_trading)
+        current_position_type = get_current_position(symbol, topstep_config, enable_trading, auth_token)
         logging.info(f"Determined current position_type: {current_position_type}")
 
         image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
         # Select and format prompt based on current_position_type
         if current_position_type == 'none':
-            prompt = no_position_prompt.format(symbol=symbol)
+            prompt = no_position_prompt.format(symbol=DISPLAY_SYMBOL)
         elif current_position_type == 'long':
-            prompt = long_position_prompt.format(symbol=symbol)
+            prompt = long_position_prompt.format(symbol=DISPLAY_SYMBOL)
         elif current_position_type == 'short':
-            prompt = short_position_prompt.format(symbol=symbol)
+            prompt = short_position_prompt.format(symbol=DISPLAY_SYMBOL)
         else:
             logging.error(f"Invalid position_type: {current_position_type}")
             raise ValueError(f"Invalid position_type: {current_position_type}")
@@ -176,31 +177,45 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 # Execute trade based on action
                 if action in ['buy', 'sell', 'scale', 'close', 'flatten']:
                     logging.info(f"Executing trade: {action}")
-                    execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, current_position_type)
+                    execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades)
             except json.JSONDecodeError as e:
                 logging.error(f"Error parsing LLM response as JSON: {e}")
     except ValueError as e:
         logging.error(f"Error: {e}")
 
-def get_current_position(symbol, topstep_config, enable_trading):
+def get_current_position(symbol, topstep_config, enable_trading, auth_token=None):
     """Query Topstep API for current position of the symbol and determine type (or mock if disabled)."""
     if not enable_trading:
         logging.info("Trading disabled - Mock positions query: Returning 'none'")
         return 'none'
 
+    if not auth_token:
+        logging.error("No auth token available for positions query")
+        return 'none'
+
     base_url = topstep_config['base_url']
-    api_key = topstep_config['api_key']
     positions_endpoint = topstep_config.get('positions_endpoint', '/positions')
     account_id = topstep_config.get('account_id', '')
 
     url = base_url + positions_endpoint
+    query_params = {}
     if account_id:
-        url += f"?account_id={account_id}"  # Assume query param; adjust per API docs
+        query_params["account_id"] = account_id
+
+    # Add query parameters to URL
+    if query_params:
+        url += "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json"
     }
+
+    # Debug logging
+    logging.info("=== FETCHING POSITIONS ===")
+    logging.info(f"Positions URL: {url}")
+    logging.info(f"Auth Token: {auth_token[:20]}..." if auth_token else "None")
+    logging.info(f"Headers: {headers}")
 
     try:
         response = requests.get(url, headers=headers)
@@ -220,7 +235,7 @@ def get_current_position(symbol, topstep_config, enable_trading):
         logging.error(f"Error querying positions: {e}")
         return 'none'  # Default to none on error
 
-def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, position_type='none'):
+def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, position_type='none', auth_token=None, execute_trades=False):
     """Execute trade via Topstep API based on action (or mock/log details if disabled)."""
     logging.info(f"Preparing to execute trade: {action} with target {price_target} and stop {stop_loss}")
     account_id = topstep_config.get('account_id', '')
@@ -233,20 +248,27 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         url = base_url + (topstep_config['buy_endpoint'] if action == 'buy' else topstep_config['sell_endpoint'] if action in ['sell', 'close'] else topstep_config['flatten_endpoint'])
         if account_id:
             url += f"?account_id={account_id}"
-        headers = {"Authorization": f"Bearer {topstep_config['api_key']}", "Content-Type": "application/json"}
-        payload = {"symbol": symbol, "quantity": quantity, "price_target": price_target, "stop_loss": stop_loss}
+        headers = {"Authorization": f"Bearer {auth_token or '[AUTH_TOKEN]'}", "Content-Type": "application/json"}
+        payload = {
+            "symbol": symbol,
+            "quantity": quantity,
+            "price_target": price_target,
+            "stop_loss": stop_loss
+        }
         if account_id:
             payload['account_id'] = account_id
         logging.info(f"Trading disabled - Mock request: URL={url}, Headers={headers}, Payload={payload}")
         return
 
+    if not auth_token:
+        logging.error("No auth token available for trade execution")
+        return
+
     # Existing real execution code...
     base_url = topstep_config['base_url']
-    api_key = topstep_config['api_key']
-    api_secret = topstep_config['api_secret']
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json"
     }
 
@@ -278,12 +300,243 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         logging.error(f"Unknown action: {action}")
         return
 
+    # Debug logging
+    logging.info("=== EXECUTING TRADE ===")
+    logging.info(f"Trade URL: {url}")
+    logging.info(f"Auth Token: {auth_token[:20]}..." if auth_token else "None")
+    logging.info(f"Headers: {headers}")
+    logging.info(f"Payload: {json.dumps(payload)}")
+
+    # Check if we should actually execute the trade or just log it
+    if not execute_trades:
+        logging.info("=== DRY RUN MODE - TRADE NOT EXECUTED ===")
+        logging.info(f"Would execute {action} trade: {json.dumps(payload, indent=2)}")
+        logging.info("Set execute_trades=true in config.ini to enable actual trade execution")
+        return
+
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        logging.info(f"Trade Response Status: {response.status_code}")
+        logging.info(f"Trade Response Headers: {dict(response.headers)}")
+
         response.raise_for_status()
-        logging.info(f"Trade executed: {action} - Response: {response.json()}")
+        trade_response = response.json()
+        logging.info(f"Trade Response Body: {json.dumps(trade_response, indent=2)}")
+        logging.info(f"Trade executed successfully: {action}")
+    except requests.exceptions.Timeout:
+        logging.error("Trade request timed out")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Trade request failed: {e}")
     except Exception as e:
         logging.error(f"Error executing trade: {e}")
+
+def login_topstep(topstep_config):
+    """Authenticate with TopstepX API and retrieve access token."""
+    base_url = topstep_config['base_url']
+    user_name = topstep_config.get('user_name', topstep_config['api_key'])
+    api_secret = topstep_config.get('api_secret', '')
+    login_endpoint = topstep_config.get('login_endpoint', '/api/Auth/loginKey')
+
+    url = base_url + login_endpoint
+    headers = {
+        "Content-Type": "application/json",
+        "accept": "text/plain"
+    }
+    payload = {
+        "userName": user_name,
+        "apiKey": api_secret
+    }
+
+    # Debug logging
+    logging.info("=== TOPSTEP LOGIN ATTEMPT ===")
+    logging.info(f"Login URL: {url}")
+    logging.info(f"Username: {user_name}")
+    logging.info(f"API Secret (used as apikey): {api_secret[:10]}..." if api_secret else "None")
+    logging.info(f"Login Headers: {headers}")
+    logging.info(f"Login Payload: {json.dumps(payload)}")
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        logging.info(f"Login Response Status: {response.status_code}")
+        logging.info(f"Login Response Headers: {dict(response.headers)}")
+
+        if response.status_code == 200:
+            try:
+                response_data = response.json()
+                logging.info(f"Login Response Body: {json.dumps(response_data, indent=2)}")
+
+                # Extract token from response - adjust based on actual API response structure
+                token = response_data.get('token') or response_data.get('access_token') or response_data.get('auth_token')
+                if token:
+                    logging.info("Login successful - Token retrieved")
+                    return token
+                else:
+                    logging.error("Login response does not contain token field")
+                    logging.error(f"Available fields: {list(response_data.keys())}")
+                    return None
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse login response as JSON: {e}")
+                logging.error(f"Raw response: {response.text}")
+                return None
+        else:
+            logging.error(f"Login failed with status {response.status_code}: {response.text}")
+            return None
+
+    except requests.exceptions.Timeout:
+        logging.error("Login request timed out")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Login request failed: {e}")
+        return None
+
+def get_available_contracts(topstep_config, auth_token=None, symbol=None):
+    """Query API for contract search by symbol (or available contracts if no symbol specified)."""
+    if not auth_token:
+        logging.error("No auth token available for contracts query")
+        return None
+
+    base_url = topstep_config['base_url']
+
+    if symbol:
+        # Use contract search for specific symbol
+        contracts_endpoint = '/api/Contract/search'
+        url = base_url + contracts_endpoint
+
+        headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json",
+            "accept": "text/plain"
+        }
+
+        payload = {
+            "searchText": symbol,
+            "live": False
+        }
+
+        # Debug logging
+        logging.info("=== SEARCHING CONTRACT BY SYMBOL ===")
+        logging.info(f"Contract Search URL: {url}")
+        logging.info(f"Search Payload: {json.dumps(payload)}")
+        logging.info(f"Auth Token: {auth_token[:20]}..." if auth_token else "None")
+        logging.info(f"Headers: {headers}")
+
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            logging.info(f"Contract Search Response Status: {response.status_code}")
+            logging.info(f"Contract Search Response Headers: {dict(response.headers)}")
+
+            response.raise_for_status()
+            contracts = response.json()
+            logging.info(f"Contract Search Response Body: {json.dumps(contracts, indent=2)}")
+
+            if isinstance(contracts, list) and contracts:
+                contract = contracts[0]  # Take the first matching contract
+                contract_symbol = contract.get('symbol', 'Unknown')
+                contract_name = contract.get('name', 'Unknown')
+                logging.info(f"Found contract for {symbol}: {contract_symbol} - {contract_name}")
+                return contracts
+            else:
+                logging.warning(f"No contracts found for symbol {symbol}")
+                return None
+
+        except requests.exceptions.Timeout:
+            logging.error("Contract search request timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Contract search request failed: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Error searching contracts: {e}")
+            return None
+    else:
+        # Fallback to available contracts endpoint
+        contracts_endpoint = '/api/Contract/available'
+        url = base_url + contracts_endpoint
+        headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json",
+            "accept": "text/plain"
+        }
+
+        payload = {
+            "live": False
+        }
+
+        # Debug logging
+        logging.info("=== FETCHING AVAILABLE CONTRACTS ===")
+        logging.info(f"Contracts URL: {url}")
+        logging.info(f"Request Payload: {json.dumps(payload)}")
+        logging.info(f"Auth Token: {auth_token[:20]}..." if auth_token else "None")
+        logging.info(f"Headers: {headers}")
+
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            logging.info(f"Contracts Response Status: {response.status_code}")
+            logging.info(f"Contracts Response Headers: {dict(response.headers)}")
+
+            response.raise_for_status()
+            contracts = response.json()
+            logging.info(f"Contracts Response Body: {json.dumps(contracts, indent=2)}")
+            logging.info(f"Found {len(contracts) if isinstance(contracts, list) else 'N/A'} available contracts")
+            return contracts
+        except requests.exceptions.Timeout:
+            logging.error("Contracts request timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Contracts request failed: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Error fetching contracts: {e}")
+            return None
+
+def get_accounts(topstep_config, enable_trading, auth_token=None):
+    """Query API for list of accounts (or skip if trading disabled)."""
+    if not enable_trading:
+        logging.info("Trading disabled - Skipping accounts query on startup.")
+        return None
+
+    if not auth_token:
+        logging.error("No auth token available for accounts query")
+        return None
+
+    base_url = topstep_config['base_url']
+    accounts_endpoint = topstep_config.get('accounts_endpoint', '/api/Account/search')
+
+    url = base_url + accounts_endpoint
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+        "accept": "text/plain"
+    }
+    payload = {
+        "onlyActiveAccounts": True
+    }
+
+    # Debug logging
+    logging.info("=== FETCHING ACCOUNTS ===")
+    logging.info(f"Accounts URL: {url}")
+    logging.info(f"Auth Token: {auth_token[:20]}..." if auth_token else "None")
+    logging.info(f"Headers: {headers}")
+    logging.info(f"Payload: {json.dumps(payload)}")
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        logging.info(f"Accounts Response Status: {response.status_code}")
+        logging.info(f"Accounts Response Headers: {dict(response.headers)}")
+
+        response.raise_for_status()
+        accounts = response.json()
+        logging.info(f"Accounts Response Body: {json.dumps(accounts, indent=2)}")
+        return accounts
+    except requests.exceptions.Timeout:
+        logging.error("Accounts request timed out")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Accounts request failed: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Error fetching accounts: {e}")
+        return None
 
 # Load configuration from config.ini
 config = configparser.ConfigParser()
@@ -316,37 +569,121 @@ BOTTOM_OFFSET = int(config.get('General', 'bottom_offset', fallback='0'))
 SAVE_FOLDER = config.get('General', 'save_folder', fallback=None)
 ENABLE_LLM = config.getboolean('General', 'enable_llm', fallback=True)
 ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
+EXECUTE_TRADES = config.getboolean('General', 'execute_trades', fallback=False)
 ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
 
-logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
+logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
 
 SYMBOL = config.get('LLM', 'symbol', fallback='ES')
+DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')  # Symbol for LLM communications and human readable formats
 POSITION_TYPE = config.get('LLM', 'position_type', fallback='none')
 NO_POSITION_PROMPT = config.get('LLM', 'no_position_prompt', fallback='Analyze this Bookmap screenshot for {symbol} futures and advise: buy, hold, or sell. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "buy/hold/sell", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
 LONG_POSITION_PROMPT = config.get('LLM', 'long_position_prompt', fallback='Analyze this Bookmap screenshot for a long position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
 SHORT_POSITION_PROMPT = config.get('LLM', 'short_position_prompt', fallback='Analyze this Bookmap screenshot for a short position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
 MODEL = config.get('LLM', 'model', fallback='gpt-4o')
 
-logging.info(f"Loaded LLM config: SYMBOL={SYMBOL}, POSITION_TYPE={POSITION_TYPE}, MODEL={MODEL}")
+logging.info(f"Loaded LLM config: SYMBOL={SYMBOL}, DISPLAY_SYMBOL={DISPLAY_SYMBOL}, POSITION_TYPE={POSITION_TYPE}, MODEL={MODEL}")
 
 TOPSTEP_CONFIG = {
+    'user_name': config.get('Topstep', 'user_name', fallback=''),
     'api_key': config.get('Topstep', 'api_key', fallback='your-topstep-api-key'),
     'api_secret': config.get('Topstep', 'api_secret', fallback='your-topstep-api-secret'),
     'base_url': config.get('Topstep', 'base_url', fallback='https://api.topstep.com/v1'),
+    'login_endpoint': config.get('Topstep', 'login_endpoint', fallback='/api/Auth/loginKey'),
     'buy_endpoint': config.get('Topstep', 'buy_endpoint', fallback='/orders'),
     'sell_endpoint': config.get('Topstep', 'sell_endpoint', fallback='/orders'),
     'flatten_endpoint': config.get('Topstep', 'flatten_endpoint', fallback='/positions/flatten'),
     'positions_endpoint': config.get('Topstep', 'positions_endpoint', fallback='/positions'),
+    'accounts_endpoint': config.get('Topstep', 'accounts_endpoint', fallback='/api/Account/search'),
     'account_id': config.get('Topstep', 'account_id', fallback=''),
-    'quantity': config.get('Topstep', 'quantity', fallback='1')
+    'quantity': config.get('Topstep', 'quantity', fallback='1'),
+    'contract_to_search': config.get('Topstep', 'contract_to_search', fallback='ES')
 }
 
-logging.info(f"Loaded Topstep config: BASE_URL={TOPSTEP_CONFIG['base_url']}, ACCOUNT_ID={TOPSTEP_CONFIG['account_id'] or 'None'}, QUANTITY={TOPSTEP_CONFIG['quantity']}")
+logging.info(f"Loaded Topstep config: BASE_URL={TOPSTEP_CONFIG['base_url']}, ACCOUNT_ID={TOPSTEP_CONFIG['account_id'] or 'None'}, QUANTITY={TOPSTEP_CONFIG['quantity']}, CONTRACT_TO_SEARCH={TOPSTEP_CONFIG['contract_to_search']}")
 
 OPENAI_API_KEY = config.get('OpenAI', 'api_key', fallback='your-openai-api-key-here')
 OPENAI_API_URL = config.get('OpenAI', 'api_url', fallback='https://api.openai.com/v1/chat/completions')
 
 logging.info(f"Loaded OpenAI config: API_URL={OPENAI_API_URL}")
+
+# Global auth token for Topstep API
+AUTH_TOKEN = None
+
+# Login to TopstepX and get auth token
+if ENABLE_TRADING:
+    logging.info("Trading enabled - Attempting to login to TopstepX API")
+    AUTH_TOKEN = login_topstep(TOPSTEP_CONFIG)
+    if AUTH_TOKEN:
+        logging.info("Login successful - Auth token obtained")
+        TOPSTEP_CONFIG['auth_token'] = AUTH_TOKEN  # Store in config for convenience
+
+        # NOTE: Automatic contract listing disabled - use tray menu "List All Contracts" to fetch manually
+        # # Fetch all available contracts after successful login
+        # logging.info("Fetching all available contracts...")
+        # all_contracts = get_available_contracts(TOPSTEP_CONFIG, AUTH_TOKEN)  # No symbol parameter = fetch all
+        # if all_contracts:
+        #     logging.info(f"Successfully fetched {len(all_contracts) if isinstance(all_contracts, list) else 'N/A'} available contracts")
+        #     # Log some contract details for better readability
+        #     if isinstance(all_contracts, list) and len(all_contracts) > 0:
+        #         logging.info("Sample contracts:")
+        #         for contract in all_contracts[:5]:  # Show first 5 contracts
+        #             if isinstance(contract, dict):
+        #                 symbol = contract.get('symbol', 'Unknown')
+        #                 name = contract.get('name', 'Unknown')
+        #                 logging.info(f"  - {symbol}: {name}")
+        #         if len(all_contracts) > 5:
+        #             logging.info(f"  ... and {len(all_contracts) - 5} more contracts")
+        #     TOPSTEP_CONFIG['all_available_contracts'] = all_contracts  # Store for later use
+        # else:
+        #     logging.warning("Failed to fetch all available contracts")
+    else:
+        logging.error("Login failed - Trading functionality may not work")
+else:
+    logging.info("Trading disabled - Skipping TopstepX login")
+
+# Fetch and log accounts if trading enabled
+accounts = get_accounts(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
+if accounts:
+    logging.info(f"Accounts response: {json.dumps(accounts, indent=2)}")
+
+    # Fetch contract for the configured symbol after successful accounts fetch
+    contract_to_search = TOPSTEP_CONFIG.get('contract_to_search', DISPLAY_SYMBOL)
+    logging.info(f"Searching for contract for symbol: {contract_to_search}")
+    contracts = get_available_contracts(TOPSTEP_CONFIG, AUTH_TOKEN, contract_to_search)
+    if contracts:
+        logging.info(f"Successfully found contract(s) for {contract_to_search}")
+        # Log contract details for better readability
+        if isinstance(contracts, list) and contracts:
+            contract = contracts[0]  # Log the first/primary contract
+            if isinstance(contract, dict):
+                contract_symbol = contract.get('symbol', 'Unknown')
+                contract_name = contract.get('name', 'Unknown')
+                logging.info(f"Contract found: {contract_symbol} - {contract_name}")
+            else:
+                logging.info(f"Contract found: {contract}")
+        TOPSTEP_CONFIG['available_contracts'] = contracts  # Store for later use
+    else:
+        logging.warning(f"Failed to find contract for symbol {contract_to_search}")
+else:
+    logging.info("No accounts fetched (check API key/endpoint or enable_trading).")
+
+# Log exact Topstep URLs and example POST requests for debug
+account_id_param = f"?account_id={TOPSTEP_CONFIG['account_id']}" if TOPSTEP_CONFIG['account_id'] else ""
+logging.info("Topstep Debug URLs:")
+logging.info(f"Login URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['login_endpoint']}")
+logging.info(f"Contract Search URL: {TOPSTEP_CONFIG['base_url']}/api/Contract/search")
+logging.info(f"Buy URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['buy_endpoint'] + account_id_param}")
+logging.info(f"Sell URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['sell_endpoint'] + account_id_param}")
+logging.info(f"Flatten URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['flatten_endpoint'] + account_id_param}")
+logging.info(f"Positions URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['positions_endpoint'] + account_id_param}")
+logging.info(f"Accounts URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['accounts_endpoint'] + account_id_param}")
+
+example_payload = {"symbol": TOPSTEP_CONFIG.get('contract_to_search', DISPLAY_SYMBOL), "quantity": int(TOPSTEP_CONFIG['quantity']), "price_target": 0, "stop_loss": 0}
+if TOPSTEP_CONFIG['account_id']:
+    example_payload['account_id'] = TOPSTEP_CONFIG['account_id']
+logging.info(f"Example POST Payload: {json.dumps(example_payload, indent=2)}")
+logging.info(f"Headers Template: {{'Authorization': 'Bearer [auth_token]', 'Content-Type': 'application/json'}}")
 
 # Schedule the job every INTERVAL_MINUTES minutes
 schedule.every(INTERVAL_MINUTES).minutes.do(
@@ -368,7 +705,9 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     enable_trading=ENABLE_TRADING,
     openai_api_url=OPENAI_API_URL,
     openai_api_key=OPENAI_API_KEY,
-    enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS
+    enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
+    auth_token=AUTH_TOKEN,
+    execute_trades=EXECUTE_TRADES
 )
 
 # Global flag to control the scheduler
@@ -428,6 +767,7 @@ def create_tray_icon():
             # Add more as needed or make dynamic
         )),
         item('Test Positions Endpoint', lambda icon, item: test_positions()),
+        item('List All Contracts', lambda icon, item: list_all_contracts()),
         item('Take Screenshot Now', lambda icon, item: manual_job()),
         item('Exit', quit_app)
     )
@@ -464,6 +804,34 @@ def test_positions():
     position_type = get_current_position(SYMBOL, TOPSTEP_CONFIG, ENABLE_TRADING)
     logging.info(f"Test result: Position type = {position_type}")
 
+def list_all_contracts():
+    """Manually fetch and log all available contracts from Topstep API."""
+    logging.info("Manually fetching all available contracts...")
+    if not ENABLE_TRADING:
+        logging.warning("Trading is disabled - cannot fetch contracts")
+        return
+    
+    if not AUTH_TOKEN:
+        logging.error("No auth token available - cannot fetch contracts")
+        return
+    
+    all_contracts = get_available_contracts(TOPSTEP_CONFIG, AUTH_TOKEN)  # No symbol parameter = fetch all
+    if all_contracts:
+        logging.info(f"Successfully fetched {len(all_contracts) if isinstance(all_contracts, list) else 'N/A'} available contracts")
+        # Log some contract details for better readability
+        if isinstance(all_contracts, list) and len(all_contracts) > 0:
+            logging.info("Sample contracts:")
+            for contract in all_contracts[:5]:  # Show first 5 contracts
+                if isinstance(contract, dict):
+                    symbol = contract.get('symbol', 'Unknown')
+                    name = contract.get('name', 'Unknown')
+                    logging.info(f"  - {symbol}: {name}")
+            if len(all_contracts) > 5:
+                logging.info(f"  ... and {len(all_contracts) - 5} more contracts")
+        TOPSTEP_CONFIG['all_available_contracts'] = all_contracts  # Store for later use
+    else:
+        logging.warning("Failed to fetch all available contracts")
+
 def manual_job():
     logging.info("Manual screenshot triggered.")
     job(
@@ -484,7 +852,9 @@ def manual_job():
         enable_trading=ENABLE_TRADING,
         openai_api_url=OPENAI_API_URL,
         openai_api_key=OPENAI_API_KEY,
-        enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS
+        enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
+        auth_token=AUTH_TOKEN,
+        execute_trades=EXECUTE_TRADES
     )
     logging.info("Manual job completed.")
 

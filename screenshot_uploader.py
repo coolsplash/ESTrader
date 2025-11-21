@@ -18,6 +18,10 @@ import base64  # For Basic Auth
 import win32ui
 import win32con
 from ctypes import windll
+import tkinter as tk
+from tkinter import messagebox
+import sys
+import ctypes
 
 def get_window_by_partial_title(partial_title):
     """Find a window handle by partial, case-insensitive title match."""
@@ -176,6 +180,356 @@ def is_within_time_range(begin_time, end_time):
     end = datetime.datetime.strptime(end_time, "%H:%M").time()
     return begin <= now <= end
 
+def show_error_dialog(error_message, error_code):
+    """Show Windows native error dialog with Continue/Exit options."""
+    logging.critical("="*80)
+    logging.critical(f"CRITICAL ERROR (Code {error_code}): {error_message}")
+    logging.critical("Displaying Windows native error dialog to user...")
+    logging.critical("="*80)
+    
+    # Play system error sound
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONHAND)
+    except:
+        pass
+    
+    try:
+        # Windows MessageBox constants
+        # MB_YESNO = 4, MB_ICONERROR = 16, MB_SYSTEMMODAL = 0x1000, MB_TOPMOST = 0x40000
+        # IDYES = 6, IDNO = 7
+        
+        message = (
+            f"Trading Error (Code {error_code})\n\n"
+            f"{error_message}\n\n"
+            f"Do you want to continue running the program?\n\n"
+            f"YES = Continue running\n"
+            f"NO = Exit program"
+        )
+        
+        logging.critical("Calling Windows MessageBoxW...")
+        
+        # Use MessageBoxW for proper Unicode support
+        # 4 = MB_YESNO (Yes/No buttons)
+        # 16 = MB_ICONERROR (Error icon)
+        # 0x1000 = MB_SYSTEMMODAL (System modal - stays on top)
+        result = ctypes.windll.user32.MessageBoxW(
+            0,  # No parent window
+            message, 
+            "ESTrader - Trading Error", 
+            4 | 16 | 0x1000  # MB_YESNO | MB_ICONERROR | MB_SYSTEMMODAL
+        )
+        
+        logging.critical(f"MessageBox returned: {result}")
+        
+        if result == 6:  # IDYES - Continue
+            logging.warning("User chose to CONTINUE after error code 2")
+            logging.warning("Program continuing despite error code 2 - user override")
+        else:  # IDNO (7) or dialog closed - Exit
+            logging.critical("User chose to EXIT after error code 2")
+            logging.critical("Program terminated due to trading error")
+            sys.exit(1)
+            
+    except Exception as e:
+        logging.error(f"Error showing Windows MessageBox: {e}")
+        logging.exception("Full traceback:")
+        logging.critical("MessageBox failed - exiting program for safety")
+        sys.exit(1)
+
+def close_position(position_details, topstep_config, enable_trading, auth_token=None, execute_trades=False):
+    """Close the entire position by placing an opposite market order."""
+    try:
+        if not enable_trading:
+            logging.info("Trading disabled - Would close position (mock)")
+            return
+        
+        if not execute_trades:
+            logging.info("Execute trades disabled - Would close position (mock)")
+            return
+        
+        # Extract position information
+        position_type = position_details.get('position_type')
+        size = position_details.get('size', 0)
+        symbol = position_details.get('symbol')
+        avg_price = position_details.get('average_price')
+        
+        logging.info(f"=" * 80)
+        logging.info(f"CLOSING POSITION")
+        logging.info(f"Position Type: {position_type.upper()}")
+        logging.info(f"Size: {size} contracts")
+        logging.info(f"Symbol: {symbol}")
+        logging.info(f"Entry Price: {avg_price}")
+        logging.info(f"=" * 80)
+        
+        # Determine the side for closing: opposite of current position
+        # If long, sell to close. If short, buy to close.
+        if position_type == 'long':
+            side = 1  # Ask (sell to close long)
+            action_text = "SELL to close LONG"
+        elif position_type == 'short':
+            side = 0  # Bid (buy to close short)
+            action_text = "BUY to close SHORT"
+        else:
+            logging.error(f"Invalid position type for closing: {position_type}")
+            return
+        
+        # Build the close order payload
+        account_id = topstep_config['account_id']
+        contract_id = topstep_config['contract_id']
+        
+        payload = {
+            "accountId": int(account_id),
+            "contractId": contract_id,
+            "type": 2,  # Market order for immediate execution
+            "side": side,
+            "size": int(size)  # Close the entire position
+        }
+        
+        logging.info(f"Placing CLOSE order: {action_text}")
+        logging.info(f"Payload: {json.dumps(payload, indent=2)}")
+        
+        # Place the order
+        base_url = topstep_config['base_url']
+        endpoint = topstep_config['buy_endpoint']  # Same endpoint for buy/sell
+        url = base_url + endpoint
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {auth_token}'
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        response_data = response.json()
+        
+        logging.info(f"Close Order Response (Status {response.status_code}):")
+        logging.info(json.dumps(response_data, indent=2))
+        
+        # Check for errors
+        if not response_data.get('success', True):
+            error_code = response_data.get('errorCode', 0)
+            error_message = response_data.get('errorMessage', 'Unknown error')
+            logging.error(f"Failed to close position: {error_message} (Code: {error_code})")
+            
+            # Handle critical error code 2
+            if error_code == 2:
+                show_error_dialog(error_code, error_message)
+        else:
+            logging.info(f"Position CLOSED successfully!")
+            
+    except Exception as e:
+        logging.error(f"Error closing position: {e}")
+        logging.exception("Full traceback:")
+
+def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, topstep_config, enable_trading, auth_token=None, execute_trades=False, position_type='none'):
+    """Modify existing stop loss and take profit orders for the current position by canceling old orders and placing new brackets."""
+    try:
+        if not enable_trading:
+            logging.info("Trading disabled - Would modify stops/targets (mock)")
+            return
+        
+        if not execute_trades:
+            logging.info("Execute trades disabled - Would modify stops/targets (mock)")
+            return
+        
+        if not auth_token:
+            logging.error("No auth token available for modifying orders")
+            return
+        
+        # Extract position information
+        size = position_details.get('size', 0)
+        symbol = position_details.get('symbol')
+        avg_price = position_details.get('average_price')
+        
+        logging.info(f"=" * 80)
+        logging.info(f"MODIFYING STOPS & TARGETS")
+        logging.info(f"Position Type: {position_type.upper()}")
+        logging.info(f"Size: {size} contracts")
+        logging.info(f"Symbol: {symbol}")
+        logging.info(f"Entry Price: {avg_price}")
+        logging.info(f"New Price Target: {new_price_target}")
+        logging.info(f"New Stop Loss: {new_stop_loss}")
+        logging.info(f"=" * 80)
+        
+        # Get configuration
+        account_id = topstep_config['account_id']
+        contract_id = topstep_config['contract_id']
+        base_url = topstep_config['base_url']
+        tick_size = topstep_config.get('tick_size', 0.25)
+        
+        # Validate price data
+        if not avg_price or not new_price_target or not new_stop_loss:
+            logging.warning("Missing price data for calculating stops/targets")
+            return
+        
+        # Calculate ticks from entry price
+        profit_distance = abs(float(new_price_target) - float(avg_price))
+        risk_distance = abs(float(new_stop_loss) - float(avg_price))
+        
+        take_profit_ticks = int(profit_distance / tick_size)
+        stop_loss_ticks = int(risk_distance / tick_size)
+        
+        # Adjust signs based on position type
+        # For long: TP is positive ticks, SL is negative ticks
+        # For short: TP is negative ticks, SL is positive ticks
+        if position_type == 'short':
+            take_profit_ticks = -take_profit_ticks
+        if position_type == 'long':
+            stop_loss_ticks = -stop_loss_ticks
+        
+        logging.info(f"Calculated: TP ticks={take_profit_ticks}, SL ticks={stop_loss_ticks}")
+        
+        # Step 1: Get working orders for this account
+        working_orders_endpoint = topstep_config.get('working_orders_endpoint', '/api/Order/searchWorking')
+        working_orders_url = base_url + working_orders_endpoint
+        
+        headers = {
+            'Authorization': f'Bearer {auth_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {"accountId": int(account_id)}
+        
+        logging.info(f"Step 1: Fetching working orders from {working_orders_url}")
+        logging.info(f"Payload: {json.dumps(payload)}")
+        
+        response = requests.post(working_orders_url, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        working_orders_data = response.json()
+        
+        logging.info(f"Working orders response: {json.dumps(working_orders_data, indent=2)}")
+        
+        # Extract orders list from response
+        working_orders = []
+        if isinstance(working_orders_data, list):
+            working_orders = working_orders_data
+        elif isinstance(working_orders_data, dict):
+            if 'orders' in working_orders_data:
+                working_orders = working_orders_data['orders']
+            elif 'data' in working_orders_data:
+                working_orders = working_orders_data['data']
+        
+        logging.info(f"Found {len(working_orders)} working order(s)")
+        
+        # Step 2: Identify and cancel stop loss and take profit orders for this contract
+        cancel_order_endpoint = topstep_config.get('cancel_order_endpoint', '/api/Order/cancel')
+        cancel_url = base_url + cancel_order_endpoint
+        
+        orders_to_cancel = []
+        for order in working_orders:
+            order_contract_id = order.get('contractId') or order.get('contract') or order.get('symbol')
+            order_type = order.get('type')
+            order_id = order.get('orderId') or order.get('id')
+            
+            # Order types: 1 = Limit (take profit), 4 = Stop (stop loss)
+            if order_contract_id == contract_id and order_type in [1, 4]:
+                orders_to_cancel.append({
+                    'orderId': order_id,
+                    'type': order_type,
+                    'type_name': 'Take Profit' if order_type == 1 else 'Stop Loss'
+                })
+        
+        logging.info(f"Found {len(orders_to_cancel)} bracket order(s) to cancel")
+        
+        # Cancel each order
+        for order_info in orders_to_cancel:
+            try:
+                cancel_payload = {"orderId": order_info['orderId']}
+                logging.info(f"Canceling {order_info['type_name']} order ID: {order_info['orderId']}")
+                logging.info(f"Cancel URL: {cancel_url}")
+                logging.info(f"Cancel Payload: {json.dumps(cancel_payload)}")
+                
+                cancel_response = requests.post(cancel_url, headers=headers, json=cancel_payload, timeout=10)
+                cancel_response_data = cancel_response.json()
+                
+                logging.info(f"Cancel response: {json.dumps(cancel_response_data, indent=2)}")
+                
+                if cancel_response_data.get('success', True):
+                    logging.info(f"Successfully canceled {order_info['type_name']} order")
+                else:
+                    error_msg = cancel_response_data.get('errorMessage', 'Unknown error')
+                    logging.warning(f"Failed to cancel {order_info['type_name']} order: {error_msg}")
+                    
+            except Exception as e:
+                logging.error(f"Error canceling order {order_info['orderId']}: {e}")
+        
+        # Step 3: Place new bracket orders with updated stops/targets
+        logging.info("Step 3: Placing new bracket orders with updated prices")
+        
+        # Determine the side for the bracket orders (opposite of position)
+        # If we're long, brackets are sell orders. If short, brackets are buy orders.
+        if position_type == 'long':
+            bracket_side = 1  # Ask (sell)
+        elif position_type == 'short':
+            bracket_side = 0  # Bid (buy)
+        else:
+            logging.error(f"Invalid position type: {position_type}")
+            return
+        
+        # Place new stop loss order
+        if topstep_config.get('enable_stop_loss', True):
+            stop_loss_payload = {
+                "accountId": int(account_id),
+                "contractId": contract_id,
+                "type": 4,  # Stop order
+                "side": bracket_side,
+                "size": int(size),
+                "stopPrice": float(new_stop_loss)
+            }
+            
+            logging.info(f"Placing new stop loss order at {new_stop_loss}")
+            logging.info(f"Stop Loss Payload: {json.dumps(stop_loss_payload, indent=2)}")
+            
+            place_url = base_url + topstep_config['buy_endpoint']
+            sl_response = requests.post(place_url, headers=headers, json=stop_loss_payload, timeout=10)
+            sl_response_data = sl_response.json()
+            
+            logging.info(f"Stop loss order response: {json.dumps(sl_response_data, indent=2)}")
+            
+            if sl_response_data.get('success', True):
+                logging.info("Successfully placed new stop loss order")
+            else:
+                error_msg = sl_response_data.get('errorMessage', 'Unknown error')
+                error_code = sl_response_data.get('errorCode', 0)
+                logging.error(f"Failed to place stop loss order: {error_msg}")
+                if error_code == 2:
+                    show_error_dialog(error_code, error_msg)
+        
+        # Place new take profit order
+        if topstep_config.get('enable_take_profit', True):
+            take_profit_payload = {
+                "accountId": int(account_id),
+                "contractId": contract_id,
+                "type": 1,  # Limit order
+                "side": bracket_side,
+                "size": int(size),
+                "price": float(new_price_target)
+            }
+            
+            logging.info(f"Placing new take profit order at {new_price_target}")
+            logging.info(f"Take Profit Payload: {json.dumps(take_profit_payload, indent=2)}")
+            
+            tp_response = requests.post(place_url, headers=headers, json=take_profit_payload, timeout=10)
+            tp_response_data = tp_response.json()
+            
+            logging.info(f"Take profit order response: {json.dumps(tp_response_data, indent=2)}")
+            
+            if tp_response_data.get('success', True):
+                logging.info("Successfully placed new take profit order")
+            else:
+                error_msg = tp_response_data.get('errorMessage', 'Unknown error')
+                error_code = tp_response_data.get('errorCode', 0)
+                logging.error(f"Failed to place take profit order: {error_msg}")
+                if error_code == 2:
+                    show_error_dialog(error_code, error_msg)
+        
+        logging.info("=" * 80)
+        logging.info("STOP LOSS AND TAKE PROFIT MODIFICATION COMPLETE")
+        logging.info("=" * 80)
+            
+    except Exception as e:
+        logging.error(f"Error modifying stops and targets: {e}")
+        logging.exception("Full traceback:")
+
 def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False):
     """The main job to run periodically."""
     if not is_within_time_range(begin_time, end_time):
@@ -184,14 +538,91 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
 
     logging.info(f"Starting job at {time.ctime()}")
     
-    # Check if there are active positions - if yes, skip screenshot and LLM analysis
-    if check_active_trades(topstep_config, enable_trading, auth_token):
-        logging.info("Active position detected - Skipping screenshot and LLM analysis until position is closed")
-        return
-    
     try:
-        current_position_type = get_current_position(symbol, topstep_config, enable_trading, auth_token)
+        # Get current position status and details
+        current_position_type, position_details = get_current_position(
+            symbol, topstep_config, enable_trading, auth_token, return_details=True
+        )
         logging.info(f"Determined current position_type: {current_position_type}")
+        
+        # If we have an active position, manage it instead of looking for new entries
+        if current_position_type in ['long', 'short'] and position_details:
+            logging.info(f"Managing active {current_position_type} position...")
+            logging.info(f"Position details: Size={position_details.get('size')}, "
+                        f"Avg Price={position_details.get('average_price')}, "
+                        f"Unrealized P&L={position_details.get('unrealized_pnl')}")
+            
+            # Take screenshot for position management
+            image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
+            
+            # Format prompt with position details
+            position_prompt_template = config.get('LLM', 'position_prompt', fallback='')
+            if not position_prompt_template:
+                # Fallback to long/short specific prompts
+                position_prompt_template = long_position_prompt if current_position_type == 'long' else short_position_prompt
+            
+            # Add position data to prompt
+            # Format the position prompt with available template variables
+            position_prompt = position_prompt_template.format(
+                symbol=DISPLAY_SYMBOL,
+                size=position_details.get('size', 0),
+                average_price=position_details.get('average_price', 0),
+                position_type=position_details.get('position_type', 'unknown'),
+                quantity=position_details.get('quantity', 0),
+                unrealized_pnl=position_details.get('unrealized_pnl', 0)
+            )
+            
+            logging.info(f"Using position management prompt")
+            
+            # Get LLM advice on position management
+            llm_response = upload_to_llm(image_base64, position_prompt, model, enable_llm, openai_api_url, openai_api_key)
+            if llm_response:
+                # Strip markdown if present
+                llm_response = llm_response.strip()
+                if llm_response.startswith('```json') and llm_response.endswith('```'):
+                    llm_response = llm_response[7:-3].strip()
+                elif llm_response.startswith('```') and llm_response.endswith('```'):
+                    llm_response = llm_response[3:-3].strip()
+                logging.info(f"Position Management LLM Response: {llm_response}")
+                
+                # Parse and execute position management action
+                try:
+                    advice = json.loads(llm_response)
+                    action = advice.get('action', '').lower()
+                    price_target = advice.get('price_target')
+                    stop_loss = advice.get('stop_loss')
+                    reasoning = advice.get('reasoning')
+                    logging.info(f"Position Management Advice: Action={action}, Target={price_target}, Stop={stop_loss}, Reasoning={reasoning}")
+                    
+                    # Handle position management actions
+                    if action == 'close':
+                        logging.info(f"LLM advises to CLOSE position. Reasoning: {reasoning}")
+                        # Close the entire position by placing opposite market order
+                        close_position(position_details, topstep_config, enable_trading, auth_token, execute_trades)
+                    
+                    elif action == 'scale':
+                        logging.info(f"LLM advises to SCALE position. Reasoning: {reasoning}")
+                        # Partially close the position (scale out)
+                        execute_topstep_trade(action, None, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades, position_details)
+                    
+                    elif action == 'adjust' or (action == 'hold' and price_target and stop_loss):
+                        logging.info(f"LLM advises to ADJUST stops/targets. New Target={price_target}, New Stop={stop_loss}. Reasoning: {reasoning}")
+                        # Modify existing stop loss and take profit orders
+                        modify_stops_and_targets(position_details, price_target, stop_loss, topstep_config, enable_trading, auth_token, execute_trades, current_position_type)
+                    
+                    elif action == 'hold':
+                        logging.info(f"LLM advises to HOLD position. Reasoning: {reasoning}")
+                        # Do nothing, keep current position
+                    
+                    else:
+                        logging.warning(f"Unknown position management action: {action}")
+                except json.JSONDecodeError as e:
+                    logging.error(f"Error parsing position management LLM response as JSON: {e}")
+            
+            return  # Done managing position, exit job
+        
+        # No position - look for new entry opportunities
+        logging.info("No active position - analyzing for new entry opportunities")
 
         image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
         # Select and format prompt based on current_position_type
@@ -219,37 +650,44 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
             try:
                 advice = json.loads(llm_response)
                 action = advice.get('action')
+                entry_price = advice.get('entry_price')
                 price_target = advice.get('price_target')
                 stop_loss = advice.get('stop_loss')
                 reasoning = advice.get('reasoning')
-                logging.info(f"Parsed Advice: Action={action}, Target={price_target}, Stop={stop_loss}, Reasoning={reasoning}")
+                confidence = advice.get('confidence')
+                logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}")
 
                 # Execute trade based on action
                 if action in ['buy', 'sell', 'scale', 'close', 'flatten']:
                     logging.info(f"Executing trade: {action}")
-                    execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades)
+                    execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades)
             except json.JSONDecodeError as e:
                 logging.error(f"Error parsing LLM response as JSON: {e}")
     except ValueError as e:
         logging.error(f"Error: {e}")
 
-def get_current_position(symbol, topstep_config, enable_trading, auth_token=None):
-    """Query Topstep API for current position of the symbol and determine type (or mock if disabled)."""
+def get_current_position(symbol, topstep_config, enable_trading, auth_token=None, return_details=False):
+    """Query Topstep API for current position of the symbol and determine type (or mock if disabled).
+    
+    Args:
+        return_details: If True, returns (position_type, position_details) tuple instead of just position_type
+    """
     if not enable_trading:
         logging.info("Trading disabled - Mock positions query: Returning 'none'")
-        return 'none'
+        return ('none', None) if return_details else 'none'
 
     if not auth_token:
         logging.error("No auth token available for positions query")
-        return 'none'
+        return ('none', None) if return_details else 'none'
 
     base_url = topstep_config['base_url']
     positions_endpoint = topstep_config.get('positions_endpoint', '/positions')
     account_id = topstep_config.get('account_id', '')
+    contract_id = topstep_config.get('contract_id', '')
     
     if not account_id:
         logging.error("No account_id configured for positions query")
-        return 'none'
+        return ('none', None) if return_details else 'none'
 
     url = base_url + positions_endpoint
 
@@ -272,30 +710,227 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
-        positions = response.json()  # Assume returns list of {'symbol': str, 'quantity': int}
-        logging.info(f"Positions Response: {json.dumps(positions, indent=2)}")
+        positions = response.json()
         
-        for pos in positions:
-            if pos['symbol'] == symbol:
-                quantity = pos['quantity']
-                if quantity > 0:
-                    return 'long'
-                elif quantity < 0:
-                    return 'short'
+        # Log the full JSON response for debugging
+        logging.info("="*80)
+        logging.info("POSITIONS API RESPONSE:")
+        logging.info(f"Status Code: {response.status_code}")
+        logging.info(f"Response Type: {type(positions)}")
+        logging.info("Full JSON Response:")
+        logging.info(json.dumps(positions, indent=2) if isinstance(positions, (dict, list)) else str(positions))
+        logging.info("="*80)
+        
+        # Handle different response formats
+        if isinstance(positions, str):
+            logging.error(f"Unexpected string response from positions API: {positions}")
+            return ('none', None) if return_details else 'none'
+        
+        # If response is a list of positions
+        if isinstance(positions, list):
+            if len(positions) == 0:
+                logging.info("No positions found (empty list)")
+                return ('none', None) if return_details else 'none'
+            
+            for pos in positions:
+                if not isinstance(pos, dict):
+                    logging.error(f"Position item is not a dictionary: {type(pos)} - {pos}")
+                    continue
+                    
+                pos_symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract')
+                quantity = pos.get('quantity', 0) or pos.get('size', 0) or pos.get('netQuantity', 0)
+                
+                if pos_symbol == symbol or pos_symbol == contract_id:
+                    logging.info(f"Found matching position: symbol={pos_symbol}, quantity={quantity}")
+                    if quantity > 0:
+                        return ('long', None) if return_details else 'long'
+                    elif quantity < 0:
+                        return ('short', None) if return_details else 'short'
+                    else:
+                        return ('none', None) if return_details else 'none'
+            
+            logging.info(f"No matching position found for symbol {symbol}")
+            return ('none', None) if return_details else 'none'
+        
+        # If response is a single dict (not a list)
+        elif isinstance(positions, dict):
+            # Check if it's a wrapper with a 'positions' key (TopstepX format)
+            if 'positions' in positions and isinstance(positions['positions'], list):
+                positions_list = positions['positions']
+                logging.info(f"DEBUG: Found {len(positions_list)} position(s) in response")
+                
+                if len(positions_list) == 0:
+                    logging.info("No positions found (empty positions list)")
+                    return ('none', None) if return_details else 'none'
+                
+                # Log all positions for debugging
+                logging.info("DEBUG: All positions in response:")
+                for idx, pos in enumerate(positions_list):
+                    if isinstance(pos, dict):
+                        pos_symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract')
+                        quantity = pos.get('quantity', 0) or pos.get('size', 0) or pos.get('netQuantity', 0)
+                        logging.info(f"  Position {idx+1}: symbol={pos_symbol}, quantity={quantity}, full={pos}")
+                    else:
+                        logging.info(f"  Position {idx+1}: Not a dict - {type(pos)} - {pos}")
+                
+                logging.info(f"DEBUG: Looking for symbol='{symbol}' or contract_id='{contract_id}'")
+                
+                for pos in positions_list:
+                    if not isinstance(pos, dict):
+                        continue
+                    pos_symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract')
+                    quantity = pos.get('quantity', 0) or pos.get('size', 0) or pos.get('netQuantity', 0)
+                    
+                    logging.info(f"DEBUG: Comparing '{pos_symbol}' with '{symbol}' or '{contract_id}'")
+                    
+                    if pos_symbol == symbol or pos_symbol == contract_id:
+                        # Get position type: 1 = Long, 2 = Short
+                        position_type_code = pos.get('type') or pos.get('positionType')
+                        
+                        logging.info(f"MATCH FOUND: symbol={pos_symbol}, quantity={quantity}, type={position_type_code}")
+                        
+                        # Determine if long or short based on type field
+                        if position_type_code == 1:
+                            position_type_str = 'long'
+                        elif position_type_code == 2:
+                            position_type_str = 'short'
+                        else:
+                            # Fallback to quantity-based detection if type field not present
+                            if quantity > 0:
+                                position_type_str = 'long'
+                            elif quantity < 0:
+                                position_type_str = 'short'
+                            else:
+                                position_type_str = 'none'
+                        
+                        # Extract position details
+                        position_details = {
+                            'symbol': pos_symbol,
+                            'size': abs(quantity),  # Always positive
+                            'quantity': quantity,
+                            'position_type': position_type_str,
+                            'average_price': pos.get('averagePrice') or pos.get('avgPrice') or pos.get('entryPrice') or 0,
+                            'unrealized_pnl': pos.get('unrealizedPnl') or pos.get('unrealizedPL') or pos.get('pnl') or 0,
+                            'type_code': position_type_code,
+                            'rawPosition': pos  # Full position object for reference
+                        }
+                        
+                        logging.info(f"Returning '{position_type_str}' (type={position_type_code}, size={abs(quantity)})")
+                        return (position_type_str, position_details) if return_details else position_type_str
+                
+                logging.info(f"No matching position found for symbol {symbol} in positions list")
+                return ('none', None) if return_details else 'none'
+            
+            # Check if it's a wrapper with a 'data' key
+            elif 'data' in positions and isinstance(positions['data'], list):
+                positions_list = positions['data']
+                if len(positions_list) == 0:
+                    logging.info("No positions found (empty data list)")
+                    return ('none', None) if return_details else 'none'
+                
+                for pos in positions_list:
+                    if not isinstance(pos, dict):
+                        continue
+                    pos_symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract')
+                    quantity = pos.get('quantity', 0) or pos.get('size', 0) or pos.get('netQuantity', 0)
+                    
+                    if pos_symbol == symbol or pos_symbol == contract_id:
+                        # Get position type: 1 = Long, 2 = Short
+                        position_type_code = pos.get('type') or pos.get('positionType')
+                        
+                        logging.info(f"Found matching position: symbol={pos_symbol}, quantity={quantity}, type={position_type_code}")
+                        
+                        # Determine if long or short based on type field
+                        if position_type_code == 1:
+                            position_type_str = 'long'
+                        elif position_type_code == 2:
+                            position_type_str = 'short'
+                        else:
+                            # Fallback to quantity-based detection
+                            if quantity > 0:
+                                position_type_str = 'long'
+                            elif quantity < 0:
+                                position_type_str = 'short'
+                            else:
+                                position_type_str = 'none'
+                        
+                        position_details = {
+                            'symbol': pos_symbol,
+                            'size': abs(quantity),
+                            'quantity': quantity,
+                            'position_type': position_type_str,
+                            'average_price': pos.get('averagePrice') or pos.get('avgPrice') or pos.get('entryPrice') or 0,
+                            'unrealized_pnl': pos.get('unrealizedPnl') or pos.get('unrealizedPL') or pos.get('pnl') or 0,
+                            'type_code': position_type_code,
+                            'rawPosition': pos
+                        }
+                        
+                        return (position_type_str, position_details) if return_details else position_type_str
+                
+                logging.info(f"No matching position found for symbol {symbol} in data list")
+                return ('none', None) if return_details else 'none'
+            
+            # Check if it's a single position object
+            else:
+                pos_symbol = positions.get('symbol') or positions.get('contractId') or positions.get('contract')
+                quantity = positions.get('quantity', 0) or positions.get('size', 0) or positions.get('netQuantity', 0)
+                
+                if pos_symbol and (pos_symbol == symbol or pos_symbol == contract_id):
+                    # Get position type: 1 = Long, 2 = Short
+                    position_type_code = positions.get('type') or positions.get('positionType')
+                    
+                    logging.info(f"Found matching position: symbol={pos_symbol}, quantity={quantity}, type={position_type_code}")
+                    
+                    # Determine if long or short based on type field
+                    if position_type_code == 1:
+                        position_type_str = 'long'
+                    elif position_type_code == 2:
+                        position_type_str = 'short'
+                    else:
+                        # Fallback to quantity-based detection
+                        if quantity > 0:
+                            position_type_str = 'long'
+                        elif quantity < 0:
+                            position_type_str = 'short'
+                        else:
+                            position_type_str = 'none'
+                    
+                    position_details = {
+                        'symbol': pos_symbol,
+                        'size': abs(quantity),
+                        'quantity': quantity,
+                        'position_type': position_type_str,
+                        'average_price': positions.get('averagePrice') or positions.get('avgPrice') or positions.get('entryPrice') or 0,
+                        'unrealized_pnl': positions.get('unrealizedPnl') or positions.get('unrealizedPL') or positions.get('pnl') or 0,
+                        'type_code': position_type_code,
+                        'rawPosition': positions
+                    }
+                    
+                    return (position_type_str, position_details) if return_details else position_type_str
                 else:
-                    return 'none'
-        return 'none'  # No position found
+                    logging.info(f"No positions found - response indicates no open positions")
+                    return ('none', None) if return_details else 'none'
+        
+        else:
+            logging.error(f"Unexpected positions response type: {type(positions)}")
+            return ('none', None) if return_details else 'none'
+            
     except requests.exceptions.Timeout:
         logging.error("Positions query timed out")
-        return 'none'
+        return ('none', None) if return_details else 'none'
     except requests.exceptions.RequestException as e:
         logging.error(f"Error querying positions: {e}")
         if hasattr(e, 'response') and e.response is not None:
             logging.error(f"Error response: {e.response.text}")
-        return 'none'  # Default to none on error
+        return ('none', None) if return_details else 'none'
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to parse positions response as JSON: {e}")
+        logging.error(f"Raw response: {response.text}")
+        return ('none', None) if return_details else 'none'
     except Exception as e:
         logging.error(f"Unexpected error querying positions: {e}")
-        return 'none'
+        logging.exception("Full traceback:")
+        return ('none', None) if return_details else 'none'
 
 def check_active_trades(topstep_config, enable_trading, auth_token=None):
     """Check if there are any active open positions - returns True if positions are active."""
@@ -314,11 +949,13 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
         logging.error("No account_id configured for active trades check")
         return False
     
+    logging.debug(f"DEBUG: Checking active trades for account {account_id}")
+
     headers = {
         "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json"
     }
-    
+
     payload = {
         "accountId": int(account_id)
     }
@@ -328,18 +965,66 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
         positions_endpoint = topstep_config.get('positions_endpoint', '/positions')
         positions_url = base_url + positions_endpoint
         
+        logging.debug(f"DEBUG: Querying {positions_url} with payload {payload}")
+        
         response = requests.post(positions_url, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
         positions = response.json()
         
+        # Log the full JSON response for debugging
+        logging.info("="*80)
+        logging.info("CHECK ACTIVE TRADES - API RESPONSE:")
+        logging.info(f"Status Code: {response.status_code}")
+        logging.info(f"Response Type: {type(positions)}")
+        logging.info("Full JSON Response:")
+        logging.info(json.dumps(positions, indent=2) if isinstance(positions, (dict, list)) else str(positions))
+        logging.info("="*80)
+        
+        # Handle different response formats
+        if isinstance(positions, str):
+            logging.error(f"Unexpected string response from positions API: {positions}")
+            return False
+        
         # If positions is a list and has any items with non-zero quantity, we have active trades
         if isinstance(positions, list) and len(positions) > 0:
             for pos in positions:
-                quantity = pos.get('quantity', 0)
+                if not isinstance(pos, dict):
+                    logging.error(f"Position item is not a dictionary: {type(pos)} - {pos}")
+                    continue
+                
+                quantity = pos.get('quantity', 0) or pos.get('size', 0) or pos.get('netQuantity', 0)
                 if quantity != 0:
-                    symbol = pos.get('symbol', 'Unknown')
+                    symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract', 'Unknown')
                     logging.info(f"Active position found: {symbol} with quantity {quantity}")
                     return True
+        
+        # If response is a single dict with positions data
+        elif isinstance(positions, dict):
+            # Check for 'positions' key (TopstepX format)
+            if 'positions' in positions and isinstance(positions['positions'], list):
+                positions_list = positions['positions']
+                logging.debug(f"DEBUG (check_active_trades): Found {len(positions_list)} position(s)")
+                
+                for idx, pos in enumerate(positions_list):
+                    if not isinstance(pos, dict):
+                        continue
+                    quantity = pos.get('quantity', 0) or pos.get('size', 0) or pos.get('netQuantity', 0)
+                    symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract', 'Unknown')
+                    logging.debug(f"  Position {idx+1}: symbol={symbol}, quantity={quantity}")
+                    
+                    if quantity != 0:
+                        logging.info(f"Active position found: {symbol} with quantity {quantity}")
+                        return True
+            # Check for 'data' key
+            elif 'data' in positions and isinstance(positions['data'], list):
+                for pos in positions['data']:
+                    if not isinstance(pos, dict):
+                        continue
+                    quantity = pos.get('quantity', 0) or pos.get('size', 0) or pos.get('netQuantity', 0)
+                    if quantity != 0:
+                        symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract', 'Unknown')
+                        logging.info(f"Active position found: {symbol} with quantity {quantity}")
+                        return True
         
         # DISABLED: Check for working orders (uncomment to re-enable)
         # orders_endpoint = topstep_config.get('working_orders_endpoint', '/api/Order/searchWorking')
@@ -355,6 +1040,7 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
         #     return True
         
         logging.debug("No active positions found")
+        logging.info("No active trades - OK to analyze new screenshots")
         return False
         
     except requests.exceptions.Timeout:
@@ -369,9 +1055,9 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
         logging.error(f"Unexpected error checking active trades: {e}")
         return False
 
-def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enable_trading, position_type='none', auth_token=None, execute_trades=False):
+def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_config, enable_trading, position_type='none', auth_token=None, execute_trades=False, position_details=None):
     """Execute trade via Topstep API based on action with stop loss and take profit (or mock/log details if disabled)."""
-    logging.info(f"Preparing to execute trade: {action} with target {price_target} and stop {stop_loss}")
+    logging.info(f"Preparing to execute trade: {action} with entry {entry_price}, target {price_target} and stop {stop_loss}")
     
     # Get configuration values
     account_id = topstep_config.get('account_id', '')
@@ -394,7 +1080,17 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         return
     
     # Get order size
-    size = int(topstep_config['quantity']) if action != 'scale' else int(topstep_config['quantity']) // 2
+    if action == 'scale':
+        # For scaling, use actual position size if available, otherwise fall back to config
+        if position_details and position_details.get('size'):
+            actual_size = int(position_details.get('size'))
+            size = max(1, actual_size // 2)  # Scale out half, but at least 1 contract
+            logging.info(f"Scaling: Closing {size} of {actual_size} contracts (half of position)")
+        else:
+            size = max(1, int(topstep_config['quantity']) // 2)
+            logging.warning(f"Scaling: No position details available, using config quantity // 2 = {size}")
+    else:
+        size = int(topstep_config['quantity'])
     
     # Determine order side based on action
     # side: 0 = bid (buy), 1 = ask (sell)
@@ -411,6 +1107,10 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         else:
             logging.error("Close action requires long or short position_type")
             return
+        # For close action, use actual position size if available
+        if position_details and position_details.get('size'):
+            size = int(position_details.get('size'))
+            logging.info(f"Closing: Using actual position size of {size} contracts")
     elif action == 'scale':
         # Scale position: if long, sell; if short, buy
         if position_type == 'long':
@@ -428,14 +1128,16 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         return
     
     # Build the correct TopstepX API payload
-    # type: 2 = Market order
+    # Use market order for immediate execution
+    order_type = 2  # Market order
     payload = {
         "accountId": int(account_id),
         "contractId": contract_id,
-        "type": 2,  # Market order
+        "type": order_type,  # Market order
         "side": side,  # 0 = bid (buy), 1 = ask (sell)
         "size": size
     }
+    logging.info(f"Using MARKET order for {action}")
     
     # Add stop loss and take profit brackets if enabled and provided
     # Only add these for entry orders (buy/sell), not for close/scale actions
@@ -448,13 +1150,60 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         max_profit = topstep_config.get('max_profit_per_contract', '')
         tick_size = topstep_config.get('tick_size', 0.25)
         
+        # Calculate profit and risk distances from LLM if we have entry_price
+        llm_profit_distance = None
+        llm_risk_distance = None
+        use_llm_profit = False
+        use_llm_risk = False
+        
+        if entry_price and price_target and stop_loss:
+            # Calculate distances in points from entry price
+            llm_profit_distance = abs(float(price_target) - float(entry_price))
+            llm_risk_distance = abs(float(stop_loss) - float(entry_price))
+            
+            logging.info(f"LLM suggests: Profit distance={llm_profit_distance:.2f} points, Risk distance={llm_risk_distance:.2f} points")
+            
+            # Compare with configured limits
+            if max_profit and max_profit.strip():
+                max_profit_points = float(max_profit)
+                if llm_profit_distance > max_profit_points:
+                    use_llm_profit = True
+                    logging.info(f"LLM profit target ({llm_profit_distance:.2f} pts) is BETTER than config ({max_profit_points} pts) - Using LLM")
+                else:
+                    logging.info(f"Config profit target ({max_profit_points} pts) is better than LLM ({llm_profit_distance:.2f} pts) - Using config")
+            else:
+                use_llm_profit = True
+                logging.info(f"No config profit limit - Using LLM profit target")
+            
+            if max_risk and max_risk.strip():
+                max_risk_points = float(max_risk)
+                if llm_risk_distance < max_risk_points:
+                    use_llm_risk = True
+                    logging.info(f"LLM stop loss ({llm_risk_distance:.2f} pts) is TIGHTER than config ({max_risk_points} pts) - Using LLM")
+                else:
+                    logging.info(f"Config stop loss ({max_risk_points} pts) is tighter than LLM ({llm_risk_distance:.2f} pts) - Using config")
+            else:
+                use_llm_risk = True
+                logging.info(f"No config risk limit - Using LLM stop loss")
+        
         # Build stopLossBracket object
         if enable_sl and (stop_loss or (max_risk and max_risk.strip())):
             stop_loss_bracket = {
                 "type": 4  # 4 = Stop order
             }
             
-            if max_risk and max_risk.strip():
+            # Use LLM stop loss if it's tighter (better)
+            if use_llm_risk and entry_price and stop_loss:
+                # Calculate ticks from LLM distance
+                stop_loss_ticks = int(llm_risk_distance / tick_size)
+                
+                # For long positions (side=0/buy), stop loss ticks should be negative (below entry)
+                if side == 0:
+                    stop_loss_ticks = -stop_loss_ticks
+                
+                stop_loss_bracket['ticks'] = stop_loss_ticks
+                logging.info(f"Stop Loss Bracket set to: {stop_loss_ticks} ticks ({llm_risk_distance:.2f} points) from LLM")
+            elif max_risk and max_risk.strip():
                 # Use configured max risk in points
                 max_risk_points = float(max_risk)
                 # Calculate ticks from points
@@ -465,12 +1214,11 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
                     stop_loss_ticks = -stop_loss_ticks
                 
                 stop_loss_bracket['ticks'] = stop_loss_ticks
-                logging.info(f"Stop Loss Bracket set to: {stop_loss_ticks} ticks ({max_risk_points} points)")
+                logging.info(f"Stop Loss Bracket set to: {stop_loss_ticks} ticks ({max_risk_points} points) from config")
             elif stop_loss:
-                # Use LLM suggestion - calculate from price if we have an entry price
-                # For market orders, we might not know exact entry, so use the stop_loss as price
+                # Fallback: Use LLM suggestion as price
                 stop_loss_bracket['price'] = float(stop_loss)
-                logging.info(f"Stop Loss Bracket set to price: {stop_loss} (from LLM)")
+                logging.info(f"Stop Loss Bracket set to price: {stop_loss} (from LLM, no entry price available)")
             
             if stop_loss_bracket:
                 payload['stopLossBracket'] = stop_loss_bracket
@@ -481,7 +1229,18 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
                 "type": 1  # 1 = Limit order
             }
             
-            if max_profit and max_profit.strip():
+            # Use LLM profit target if it's larger (better)
+            if use_llm_profit and entry_price and price_target:
+                # Calculate ticks from LLM distance
+                take_profit_ticks = int(llm_profit_distance / tick_size)
+                
+                # For short positions (side=1/sell), take profit ticks should be negative
+                if side == 1:
+                    take_profit_ticks = -take_profit_ticks
+                
+                take_profit_bracket['ticks'] = take_profit_ticks
+                logging.info(f"Take Profit Bracket set to: {take_profit_ticks} ticks ({llm_profit_distance:.2f} points) from LLM")
+            elif max_profit and max_profit.strip():
                 # Use configured max profit in points
                 max_profit_points = float(max_profit)
                 # Calculate ticks from points
@@ -492,11 +1251,11 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
                     take_profit_ticks = -take_profit_ticks
                 
                 take_profit_bracket['ticks'] = take_profit_ticks
-                logging.info(f"Take Profit Bracket set to: {take_profit_ticks} ticks ({max_profit_points} points)")
+                logging.info(f"Take Profit Bracket set to: {take_profit_ticks} ticks ({max_profit_points} points) from config")
             elif price_target:
-                # Use LLM suggestion - use the target price
+                # Fallback: Use LLM suggestion as price
                 take_profit_bracket['price'] = float(price_target)
-                logging.info(f"Take Profit Bracket set to price: {price_target} (from LLM)")
+                logging.info(f"Take Profit Bracket set to price: {price_target} (from LLM, no entry price available)")
             
             if take_profit_bracket:
                 payload['takeProfitBracket'] = take_profit_bracket
@@ -544,6 +1303,28 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         response.raise_for_status()
         trade_response = response.json()
         logging.info(f"Trade Response Body: {json.dumps(trade_response, indent=2)}")
+        
+        # Check for API error response (success: false, errorCode: 2)
+        if isinstance(trade_response, dict):
+            success = trade_response.get('success', True)
+            error_code = trade_response.get('errorCode', 0)
+            error_message = trade_response.get('errorMessage', 'Unknown error')
+            
+            # If error code is 2, show dialog with Continue/Exit options
+            if not success and error_code == 2:
+                logging.error("="*80)
+                logging.error(f"DETECTED ERROR CODE 2: {error_message}")
+                logging.error("Calling show_error_dialog()...")
+                logging.error("="*80)
+                show_error_dialog(error_message, error_code)
+                logging.error("Returned from show_error_dialog()")
+                return  # Return after dialog (will exit if user chose Exit, continue if user chose Continue)
+            
+            # If other error, log it but continue
+            if not success:
+                logging.error(f"API returned error (code {error_code}): {error_message}")
+                return
+        
         logging.info(f"Trade executed successfully: {action}")
         
         # Log stop loss and take profit bracket details if present
@@ -566,6 +1347,21 @@ def execute_topstep_trade(action, price_target, stop_loss, topstep_config, enabl
         logging.error(f"Trade request failed: {e}")
         if hasattr(e, 'response') and e.response is not None:
             logging.error(f"Error response: {e.response.text}")
+            # Try to parse error response for error code 2
+            try:
+                error_json = e.response.json()
+                if isinstance(error_json, dict):
+                    error_code = error_json.get('errorCode', 0)
+                    error_message = error_json.get('errorMessage', str(e))
+                    if error_code == 2:
+                        logging.error("="*80)
+                        logging.error(f"DETECTED ERROR CODE 2 in exception: {error_message}")
+                        logging.error("Calling show_error_dialog()...")
+                        logging.error("="*80)
+                        show_error_dialog(error_message, error_code)
+                        logging.error("Returned from show_error_dialog()")
+            except:
+                pass
     except Exception as e:
         logging.error(f"Error executing trade: {e}")
 
@@ -835,6 +1631,7 @@ TOPSTEP_CONFIG = {
     'flatten_endpoint': config.get('Topstep', 'flatten_endpoint', fallback='/positions/flatten'),
     'positions_endpoint': config.get('Topstep', 'positions_endpoint', fallback='/positions'),
     'working_orders_endpoint': config.get('Topstep', 'working_orders_endpoint', fallback='/api/Order/searchWorking'),
+    'cancel_order_endpoint': config.get('Topstep', 'cancel_order_endpoint', fallback='/api/Order/cancel'),
     'accounts_endpoint': config.get('Topstep', 'accounts_endpoint', fallback='/api/Account/search'),
     'contracts_endpoint': config.get('Topstep', 'contracts_endpoint', fallback='/api/Contract/search'),
     'contracts_available_endpoint': config.get('Topstep', 'contracts_available_endpoint', fallback='/api/Contract/available'),
@@ -936,7 +1733,7 @@ if TOPSTEP_CONFIG['account_id']:
     order_payload = {
         "accountId": int(TOPSTEP_CONFIG['account_id']),
         "contractId": TOPSTEP_CONFIG.get('contract_id', 'CON.F.US.EP.Z25'),
-        "type": 2,
+        "type": 2,  # Market order
         "side": 0,
         "size": int(TOPSTEP_CONFIG['quantity']),
         "stopLossBracket": {"type": 4, "ticks": -16},
@@ -1018,9 +1815,9 @@ def run_trade_monitor():
             # Log state changes
             if is_active != last_active_state:
                 if is_active:
-                    logging.info("⚠️ Trade monitoring: Active position detected - LLM analysis paused")
+                    logging.info("Trade monitoring: Active position detected - LLM analysis paused")
                 else:
-                    logging.info("✅ Trade monitoring: No active positions - LLM analysis will resume on next cycle")
+                    logging.info("Trade monitoring: No active positions - LLM analysis will resume on next cycle")
                 last_active_state = is_active
             
             time.sleep(TRADE_STATUS_CHECK_INTERVAL)

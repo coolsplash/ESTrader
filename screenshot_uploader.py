@@ -832,13 +832,16 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
         logging.error(f"Error modifying stops and targets: {e}")
         logging.exception("Full traceback:")
 
-def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None):
+def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_time='23:59', force_close_time='23:59'):
     """The main job to run periodically."""
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
         return
 
     logging.info(f"Starting job at {time.ctime()}")
+    
+    current_time = datetime.datetime.now().time()
+    force_close = datetime.datetime.strptime(force_close_time, "%H:%M").time()
     
     # Load daily market context
     daily_context = get_daily_context()
@@ -849,6 +852,17 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
             symbol, topstep_config, enable_trading, auth_token, return_details=True
         )
         logging.info(f"Determined current position_type: {current_position_type}")
+        
+        # Check if it's time to force close all positions
+        if current_time >= force_close:
+            if current_position_type in ['long', 'short'] and position_details:
+                logging.info(f"FORCE CLOSE TIME REACHED ({force_close_time}) - Closing all positions immediately")
+                close_position(position_details, topstep_config, enable_trading, auth_token, execute_trades, telegram_config, 
+                             f"Force close at {force_close_time} end-of-day rule", daily_context)
+                return  # Exit after force close
+            else:
+                logging.info(f"Force close time reached ({force_close_time}) but no active positions to close")
+                return  # No need to analyze for new trades after force close time
         
         # Log working orders info
         if working_orders:
@@ -953,6 +967,12 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                     logging.error(f"Error parsing position management LLM response as JSON: {e}")
             
             return  # Done managing position, exit job
+        
+        # No position - check if we can still enter new trades
+        no_new_trades = datetime.datetime.strptime(no_new_trades_time, "%H:%M").time()
+        if current_time >= no_new_trades:
+            logging.info(f"No new trades time reached ({no_new_trades_time}) - Skipping entry analysis")
+            return
         
         # No position - look for new entry opportunities
         logging.info("No active position - analyzing for new entry opportunities")
@@ -2143,6 +2163,8 @@ INTERVAL_MINUTES = int(config.get('General', 'interval_minutes', fallback='5'))
 TRADE_STATUS_CHECK_INTERVAL = int(config.get('General', 'trade_status_check_interval', fallback='10'))
 BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
 END_TIME = config.get('General', 'end_time', fallback='23:59')
+NO_NEW_TRADES_TIME = config.get('General', 'no_new_trades_time', fallback='23:59')
+FORCE_CLOSE_TIME = config.get('General', 'force_close_time', fallback='23:59')
 WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
 TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
 BOTTOM_OFFSET = int(config.get('General', 'bottom_offset', fallback='0'))
@@ -2152,7 +2174,7 @@ ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
 EXECUTE_TRADES = config.getboolean('General', 'execute_trades', fallback=False)
 ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
 
-logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
+logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_TIME={NO_NEW_TRADES_TIME}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
 
 SYMBOL = config.get('LLM', 'symbol', fallback='ES')
 DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')  # Symbol for LLM communications and human readable formats
@@ -2320,7 +2342,9 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
     auth_token=AUTH_TOKEN,
     execute_trades=EXECUTE_TRADES,
-    telegram_config=TELEGRAM_CONFIG
+    telegram_config=TELEGRAM_CONFIG,
+    no_new_trades_time=NO_NEW_TRADES_TIME,
+    force_close_time=FORCE_CLOSE_TIME
 )
 
 # Run the first job immediately on startup (before entering the scheduler loop)
@@ -2346,7 +2370,9 @@ job(
     enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
     auth_token=AUTH_TOKEN,
     execute_trades=EXECUTE_TRADES,
-    telegram_config=TELEGRAM_CONFIG
+    telegram_config=TELEGRAM_CONFIG,
+    no_new_trades_time=NO_NEW_TRADES_TIME,
+    force_close_time=FORCE_CLOSE_TIME
 )
 
 # Global flag to control the scheduler
@@ -2532,7 +2558,9 @@ def manual_job():
         enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
         auth_token=AUTH_TOKEN,
         execute_trades=EXECUTE_TRADES,
-        telegram_config=TELEGRAM_CONFIG
+        telegram_config=TELEGRAM_CONFIG,
+        no_new_trades_time=NO_NEW_TRADES_TIME,
+        force_close_time=FORCE_CLOSE_TIME
     )
     logging.info("Manual job completed.")
 

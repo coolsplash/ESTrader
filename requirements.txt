@@ -5,3 +5,6 @@ schedule
 pywin32
 configparser
 pystray
+yfinance
+pandas
+numpy

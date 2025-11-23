@@ -1,0 +1,54 @@
+Example Market Context with 15-Minute Intraday Volume Profile
+===============================================================
+
+Market Context (Nov 23, 2025):
+ES: Open 6560.00, Current 6620.25 (+60.25, +0.92%), Range 6525.00-6677.50
+5-Day Trend: DOWNTREND (-1.07%)
+VWAP (5-day): 6648.94 | Price is 28.69 pts BEARISH of VWAP
+VIX: 23.43 (-11.3%) - Elevated volatility
+
+Volume Profile (Top 5 levels from past 5 days):
+  1. 6708.39 pts (POC - Point of Control)
+  2. 6685.82 pts
+  3. 6657.61 pts
+  4. 6646.32 pts
+  5. 6606.82 pts
+
+Intraday 15m Volume Profile (Past 5 days, 260 bars):
+Intraday VWAP: 6652.50 | Price is 32.25 pts BEARISH
+Top 5 High Volume Zones:
+  1. 6710.25 pts (8.2% of volume) (Intraday POC)
+  2. 6688.75 pts (6.5% of volume)
+  3. 6665.50 pts (5.9% of volume)
+  4. 6642.25 pts (5.3% of volume)
+  5. 6620.00 pts (4.8% of volume)
+
+Key Levels: Support 6525.00, Resistance 6677.50
+
+===============================================================
+
+What This Adds:
+---------------
+1. **More Granular Volume Profile**: Instead of just daily bars, you get 15-minute bar volume analysis
+   - Shows exact price levels where most trading activity occurred intraday
+   - More precise entry/exit zones
+
+2. **Intraday VWAP**: Separate VWAP calculation based on 15-minute intervals
+   - Better for intraday trading decisions
+   - Shows current price position relative to intraday average
+
+3. **Volume Percentage**: Shows what % of total volume traded at each level
+   - Higher % = stronger support/resistance
+   - POC (Point of Control) = highest volume level
+
+4. **Bar Count**: Shows how many 15-minute bars analyzed (e.g., 260 bars = ~5 days)
+   - More bars = more statistical significance
+
+Configuration in config.ini:
+---------------------------
+[MarketData]
+enable_intraday = true          # Turn on/off intraday analysis
+intraday_interval = 15m         # Options: 5m, 15m, 30m, 1h
+intraday_days = 5               # How many days of intraday data
+intraday_volume_nodes = 5       # Top N volume levels to show
+

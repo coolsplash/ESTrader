@@ -22,6 +22,269 @@ import tkinter as tk
 from tkinter import messagebox
 import sys
 import ctypes
+import urllib.parse  # For Telegram URL encoding
+import csv
+import uuid
+from market_data import MarketDataAnalyzer
+
+def generate_trade_id():
+    """Generate a unique trade ID."""
+    return str(uuid.uuid4())[:8]
+
+def get_active_trade_info():
+    """Get the current active trade info from file.
+    
+    Returns:
+        dict: {'trade_id': str, 'entry_price': float, 'position_type': str} or None
+    """
+    try:
+        trade_info_file = os.path.join('trades', 'active_trade.json')
+        if os.path.exists(trade_info_file):
+            with open(trade_info_file, 'r') as f:
+                return json.load(f)
+        return None
+    except Exception as e:
+        logging.error(f"Error reading active trade info: {e}")
+        return None
+
+def get_active_trade_id():
+    """Get the current active trade ID from file."""
+    info = get_active_trade_info()
+    return info['trade_id'] if info else None
+
+def save_active_trade_info(trade_id, entry_price, position_type):
+    """Save the active trade info to file."""
+    try:
+        trades_folder = 'trades'
+        os.makedirs(trades_folder, exist_ok=True)
+        trade_info_file = os.path.join(trades_folder, 'active_trade.json')
+        trade_info = {
+            'trade_id': trade_id,
+            'entry_price': float(entry_price),
+            'position_type': position_type
+        }
+        with open(trade_info_file, 'w') as f:
+            json.dump(trade_info, f)
+        logging.info(f"Saved active trade info: {trade_info}")
+    except Exception as e:
+        logging.error(f"Error saving active trade info: {e}")
+
+def clear_active_trade_info():
+    """Clear the active trade info file."""
+    try:
+        trade_info_file = os.path.join('trades', 'active_trade.json')
+        if os.path.exists(trade_info_file):
+            os.remove(trade_info_file)
+            logging.info("Cleared active trade info")
+    except Exception as e:
+        logging.error(f"Error clearing active trade info: {e}")
+
+def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=None, take_profit=None, 
+                    reasoning=None, confidence=None, profit_loss=None, profit_loss_points=None, 
+                    balance=None, market_context=None, trade_id=None, entry_price=None):
+    """Log a trade event to the monthly CSV file.
+    
+    Args:
+        event_type: "ENTRY", "ADJUSTMENT", "SCALE", "CLOSE"
+        symbol: Trading symbol (e.g., "ES")
+        position_type: "long" or "short"
+        size: Number of contracts
+        price: Current price for this event
+        stop_loss: Stop loss price
+        take_profit: Take profit price
+        reasoning: LLM reasoning
+        confidence: LLM confidence (0-100)
+        profit_loss: P&L in dollars
+        profit_loss_points: P&L in points
+        balance: Account balance after event
+        market_context: Market context at time of event
+        trade_id: Trade ID (will be generated if None for ENTRY events)
+        entry_price: Original entry price (for calculating P&L on exit)
+    
+    Returns:
+        str: The trade_id used
+    """
+    try:
+        # Generate or get trade ID
+        if event_type == "ENTRY":
+            if trade_id is None:
+                trade_id = generate_trade_id()
+            save_active_trade_info(trade_id, price, position_type)
+        else:
+            if trade_id is None:
+                trade_id = get_active_trade_id()
+                if trade_id is None:
+                    logging.error("No active trade ID found for non-ENTRY event")
+                    trade_id = "UNKNOWN"
+        
+        # Prepare timestamp info
+        now = datetime.datetime.now()
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        date = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H:%M:%S")
+        
+        # Create monthly CSV filename
+        trades_folder = 'trades'
+        os.makedirs(trades_folder, exist_ok=True)
+        year_month = now.strftime("%Y_%m")
+        csv_file = os.path.join(trades_folder, f"{year_month}.csv")
+        
+        # Check if file exists to determine if we need to write headers
+        file_exists = os.path.exists(csv_file)
+        
+        # Prepare row data
+        row = {
+            'trade_id': trade_id,
+            'timestamp': timestamp,
+            'date': date,
+            'time': time_str,
+            'event_type': event_type,
+            'symbol': symbol,
+            'position_type': position_type,
+            'size': size,
+            'price': price,
+            'entry_price': entry_price if entry_price else (price if event_type == "ENTRY" else ''),
+            'stop_loss': stop_loss if stop_loss else '',
+            'take_profit': take_profit if take_profit else '',
+            'reasoning': reasoning if reasoning else '',
+            'confidence': confidence if confidence else '',
+            'profit_loss': profit_loss if profit_loss else '',
+            'profit_loss_points': profit_loss_points if profit_loss_points else '',
+            'balance': balance if balance else '',
+            'success': 'TRUE' if profit_loss and float(profit_loss) > 0 else ('FALSE' if profit_loss else ''),
+            'market_context': market_context if market_context else ''
+        }
+        
+        # Write to CSV
+        with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+            fieldnames = ['trade_id', 'timestamp', 'date', 'time', 'event_type', 'symbol', 'position_type', 
+                         'size', 'price', 'entry_price', 'stop_loss', 'take_profit', 'reasoning', 'confidence',
+                         'profit_loss', 'profit_loss_points', 'balance', 'success', 'market_context']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            
+            # Write header if new file
+            if not file_exists:
+                writer.writeheader()
+            
+            writer.writerow(row)
+        
+        logging.info(f"Logged {event_type} event to {csv_file}: trade_id={trade_id}, price={price}")
+        
+        # Clear trade info if position fully closed
+        if event_type == "CLOSE":
+            clear_active_trade_info()
+        
+        return trade_id
+        
+    except Exception as e:
+        logging.error(f"Error logging trade event: {e}")
+        logging.exception("Full traceback:")
+        return trade_id
+
+def get_daily_context():
+    """Read today's market context from context/YYMMDD.txt file.
+    If no context exists, generate it from market data.
+    
+    Returns:
+        str: The context text, or empty string if file doesn't exist
+    """
+    try:
+        context_folder = 'context'
+        os.makedirs(context_folder, exist_ok=True)
+        today = datetime.datetime.now().strftime("%y%m%d")
+        context_file = os.path.join(context_folder, f"{today}.txt")
+        
+        if os.path.exists(context_file):
+            with open(context_file, 'r', encoding='utf-8') as f:
+                context = f.read().strip()
+                logging.info(f"Loaded context from {context_file}: {context[:100]}..." if len(context) > 100 else f"Loaded context from {context_file}: {context}")
+                return context
+        else:
+            logging.info(f"No context file found for today ({context_file})")
+            # Try to generate market context from Yahoo Finance data
+            try:
+                logging.info("Attempting to generate market context from Yahoo Finance data...")
+                analyzer = MarketDataAnalyzer()
+                context = analyzer.generate_market_context(force_refresh=True)
+                
+                # Save the generated context for today
+                with open(context_file, 'w', encoding='utf-8') as f:
+                    f.write(context)
+                logging.info(f"Generated and saved market context to {context_file}")
+                
+                return context
+            except Exception as e:
+                logging.error(f"Could not generate market context: {e}")
+                return ""
+    except Exception as e:
+        logging.error(f"Error reading daily context: {e}")
+        return ""
+
+def save_daily_context(new_context, old_context):
+    """Save updated market context to context/YYMMDD.txt file.
+    
+    Only saves if the context has changed.
+    
+    Args:
+        new_context: The new context from LLM response
+        old_context: The context that was sent to LLM
+    """
+    try:
+        # Only update if context changed
+        if new_context == old_context:
+            logging.debug("Context unchanged, not updating file")
+            return
+        
+        context_folder = 'context'
+        today = datetime.datetime.now().strftime("%y%m%d")
+        context_file = os.path.join(context_folder, f"{today}.txt")
+        
+        # Create folder if it doesn't exist
+        os.makedirs(context_folder, exist_ok=True)
+        
+        # Write the new context
+        with open(context_file, 'w', encoding='utf-8') as f:
+            f.write(new_context)
+        
+        logging.info(f"Updated context in {context_file}: {new_context[:100]}..." if len(new_context) > 100 else f"Updated context in {context_file}: {new_context}")
+        
+    except Exception as e:
+        logging.error(f"Error saving daily context: {e}")
+        logging.exception("Full traceback:")
+
+def send_telegram_message(message, telegram_config):
+    """Send a message to Telegram chat."""
+    try:
+        if not telegram_config or not telegram_config.get('api_key') or not telegram_config.get('chat_id'):
+            logging.debug("Telegram config not available - skipping notification")
+            return False
+        
+        api_key = telegram_config['api_key']
+        chat_id = telegram_config['chat_id']
+        
+        url = f"https://api.telegram.org/bot{api_key}/sendMessage"
+        
+        payload = {
+            'chat_id': chat_id,
+            'text': message,
+            'parse_mode': 'HTML'  # Enable HTML formatting
+        }
+        
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        
+        logging.info(f"Telegram notification sent successfully")
+        return True
+        
+    except requests.exceptions.Timeout:
+        logging.error("Telegram notification timed out")
+        return False
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to send Telegram notification: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Error sending Telegram notification: {e}")
+        return False
 
 def get_window_by_partial_title(partial_title):
     """Find a window handle by partial, case-insensitive title match."""
@@ -236,7 +499,7 @@ def show_error_dialog(error_message, error_code):
         logging.critical("MessageBox failed - exiting program for safety")
         sys.exit(1)
 
-def close_position(position_details, topstep_config, enable_trading, auth_token=None, execute_trades=False):
+def close_position(position_details, topstep_config, enable_trading, auth_token=None, execute_trades=False, telegram_config=None, reasoning=None, market_context=None):
     """Close the entire position by placing an opposite market order."""
     try:
         if not enable_trading:
@@ -316,12 +579,114 @@ def close_position(position_details, topstep_config, enable_trading, auth_token=
         else:
             logging.info(f"Position CLOSED successfully!")
             
+            # Get updated account balance
+            balance = get_account_balance(account_id, topstep_config, True, auth_token)
+            
+            # Get trade info to calculate P&L
+            trade_info = get_active_trade_info()
+            exit_price = 0  # We don't know exact fill price from market order, estimate from avg_price or use 0
+            profit_loss = None
+            profit_loss_points = None
+            
+            if trade_info:
+                entry_price = trade_info.get('entry_price')
+                if entry_price and avg_price:
+                    # Calculate P&L
+                    if position_type == 'long':
+                        profit_loss_points = float(exit_price if exit_price else avg_price) - float(entry_price)
+                    else:  # short
+                        profit_loss_points = float(entry_price) - float(exit_price if exit_price else avg_price)
+                    
+                    # Assuming ES multiplier of $50 per point
+                    profit_loss = profit_loss_points * 50 * size
+            
+            # Log CLOSE event to CSV
+            log_trade_event(
+                event_type="CLOSE",
+                symbol=symbol,
+                position_type=position_type,
+                size=size,
+                price=exit_price if exit_price else avg_price,
+                reasoning=reasoning,
+                profit_loss=profit_loss,
+                profit_loss_points=profit_loss_points,
+                balance=balance,
+                market_context=market_context,
+                entry_price=trade_info.get('entry_price') if trade_info else None
+            )
+            
+            # Send Telegram notification
+            telegram_msg = (
+                f"🔴 <b>POSITION CLOSED</b>\n"
+                f"Type: {position_type.upper()}\n"
+                f"Size: {size} contract(s)\n"
+                f"Symbol: {symbol}\n"
+                f"Entry Price: {avg_price}\n"
+            )
+            
+            if balance is not None:
+                telegram_msg += f"💰 Balance: ${balance:,.2f}\n"
+            
+            telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            
+            send_telegram_message(telegram_msg, telegram_config)
+            
     except Exception as e:
         logging.error(f"Error closing position: {e}")
         logging.exception("Full traceback:")
 
-def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, topstep_config, enable_trading, auth_token=None, execute_trades=False, position_type='none'):
-    """Modify existing stop loss and take profit orders for the current position by canceling old orders and placing new brackets."""
+def parse_working_orders(working_orders, contract_id):
+    """Parse working orders to extract stop loss and take profit order IDs and prices.
+    
+    Returns:
+        dict: {
+            'stop_loss_order_id': int or None,
+            'stop_loss_price': float or None,
+            'take_profit_order_id': int or None,
+            'take_profit_price': float or None
+        }
+    """
+    result = {
+        'stop_loss_order_id': None,
+        'stop_loss_price': None,
+        'take_profit_order_id': None,
+        'take_profit_price': None
+    }
+    
+    if not working_orders:
+        return result
+    
+    # Extract orders list from response
+    orders_list = []
+    if isinstance(working_orders, list):
+        orders_list = working_orders
+    elif isinstance(working_orders, dict) and 'orders' in working_orders:
+        orders_list = working_orders.get('orders', [])
+    
+    # Find stop loss and take profit orders for this contract
+    for order in orders_list:
+        if not isinstance(order, dict):
+            continue
+        
+        order_contract_id = order.get('contractId')
+        order_type = order.get('type')
+        order_id = order.get('id')
+        
+        # Match contract and identify order type
+        if order_contract_id == contract_id:
+            if order_type == 4:  # Stop loss
+                result['stop_loss_order_id'] = order_id
+                result['stop_loss_price'] = order.get('stopPrice')
+                logging.info(f"Found stop loss order ID: {order_id}, Price: {result['stop_loss_price']}")
+            elif order_type == 1:  # Take profit (limit order)
+                result['take_profit_order_id'] = order_id
+                result['take_profit_price'] = order.get('limitPrice')
+                logging.info(f"Found take profit order ID: {order_id}, Price: {result['take_profit_price']}")
+    
+    return result
+
+def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, topstep_config, enable_trading, auth_token=None, execute_trades=False, position_type='none', working_orders=None, reasoning=None, market_context=None):
+    """Modify existing stop loss and take profit orders using /api/Order/modify endpoint."""
     try:
         if not enable_trading:
             logging.info("Trading disabled - Would modify stops/targets (mock)")
@@ -354,173 +719,110 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
         account_id = topstep_config['account_id']
         contract_id = topstep_config['contract_id']
         base_url = topstep_config['base_url']
-        tick_size = topstep_config.get('tick_size', 0.25)
+        modify_order_endpoint = topstep_config.get('modify_order_endpoint', '/api/Order/modify')
         
         # Validate price data
-        if not avg_price or not new_price_target or not new_stop_loss:
-            logging.warning("Missing price data for calculating stops/targets")
+        if not new_price_target or not new_stop_loss:
+            logging.warning("Missing price data for modifying stops/targets")
             return
         
-        # Calculate ticks from entry price
-        profit_distance = abs(float(new_price_target) - float(avg_price))
-        risk_distance = abs(float(new_stop_loss) - float(avg_price))
+        # Parse working orders to get order IDs
+        if not working_orders:
+            logging.warning("No working orders provided - cannot modify stops/targets")
+            return
         
-        take_profit_ticks = int(profit_distance / tick_size)
-        stop_loss_ticks = int(risk_distance / tick_size)
+        order_ids = parse_working_orders(working_orders, contract_id)
+        stop_loss_order_id = order_ids.get('stop_loss_order_id')
+        take_profit_order_id = order_ids.get('take_profit_order_id')
         
-        # Adjust signs based on position type
-        # For long: TP is positive ticks, SL is negative ticks
-        # For short: TP is negative ticks, SL is positive ticks
-        if position_type == 'short':
-            take_profit_ticks = -take_profit_ticks
-        if position_type == 'long':
-            stop_loss_ticks = -stop_loss_ticks
-        
-        logging.info(f"Calculated: TP ticks={take_profit_ticks}, SL ticks={stop_loss_ticks}")
-        
-        # Step 1: Get working orders for this account
-        working_orders_endpoint = topstep_config.get('working_orders_endpoint', '/api/Order/searchWorking')
-        working_orders_url = base_url + working_orders_endpoint
-        
+        # Set up headers for modify requests
         headers = {
             'Authorization': f'Bearer {auth_token}',
             'Content-Type': 'application/json'
         }
         
-        payload = {"accountId": int(account_id)}
+        modify_url = base_url + modify_order_endpoint
         
-        logging.info(f"Step 1: Fetching working orders from {working_orders_url}")
-        logging.info(f"Payload: {json.dumps(payload)}")
-        
-        response = requests.post(working_orders_url, headers=headers, json=payload, timeout=10)
-        response.raise_for_status()
-        working_orders_data = response.json()
-        
-        logging.info(f"Working orders response: {json.dumps(working_orders_data, indent=2)}")
-        
-        # Extract orders list from response
-        working_orders = []
-        if isinstance(working_orders_data, list):
-            working_orders = working_orders_data
-        elif isinstance(working_orders_data, dict):
-            if 'orders' in working_orders_data:
-                working_orders = working_orders_data['orders']
-            elif 'data' in working_orders_data:
-                working_orders = working_orders_data['data']
-        
-        logging.info(f"Found {len(working_orders)} working order(s)")
-        
-        # Step 2: Identify and cancel stop loss and take profit orders for this contract
-        cancel_order_endpoint = topstep_config.get('cancel_order_endpoint', '/api/Order/cancel')
-        cancel_url = base_url + cancel_order_endpoint
-        
-        orders_to_cancel = []
-        for order in working_orders:
-            order_contract_id = order.get('contractId') or order.get('contract') or order.get('symbol')
-            order_type = order.get('type')
-            order_id = order.get('orderId') or order.get('id')
-            
-            # Order types: 1 = Limit (take profit), 4 = Stop (stop loss)
-            if order_contract_id == contract_id and order_type in [1, 4]:
-                orders_to_cancel.append({
-                    'orderId': order_id,
-                    'type': order_type,
-                    'type_name': 'Take Profit' if order_type == 1 else 'Stop Loss'
-                })
-        
-        logging.info(f"Found {len(orders_to_cancel)} bracket order(s) to cancel")
-        
-        # Cancel each order
-        for order_info in orders_to_cancel:
-            try:
-                cancel_payload = {"orderId": order_info['orderId']}
-                logging.info(f"Canceling {order_info['type_name']} order ID: {order_info['orderId']}")
-                logging.info(f"Cancel URL: {cancel_url}")
-                logging.info(f"Cancel Payload: {json.dumps(cancel_payload)}")
-                
-                cancel_response = requests.post(cancel_url, headers=headers, json=cancel_payload, timeout=10)
-                cancel_response_data = cancel_response.json()
-                
-                logging.info(f"Cancel response: {json.dumps(cancel_response_data, indent=2)}")
-                
-                if cancel_response_data.get('success', True):
-                    logging.info(f"Successfully canceled {order_info['type_name']} order")
-                else:
-                    error_msg = cancel_response_data.get('errorMessage', 'Unknown error')
-                    logging.warning(f"Failed to cancel {order_info['type_name']} order: {error_msg}")
-                    
-            except Exception as e:
-                logging.error(f"Error canceling order {order_info['orderId']}: {e}")
-        
-        # Step 3: Place new bracket orders with updated stops/targets
-        logging.info("Step 3: Placing new bracket orders with updated prices")
-        
-        # Determine the side for the bracket orders (opposite of position)
-        # If we're long, brackets are sell orders. If short, brackets are buy orders.
-        if position_type == 'long':
-            bracket_side = 1  # Ask (sell)
-        elif position_type == 'short':
-            bracket_side = 0  # Bid (buy)
-        else:
-            logging.error(f"Invalid position type: {position_type}")
-            return
-        
-        # Place new stop loss order
-        if topstep_config.get('enable_stop_loss', True):
+        # Modify stop loss order if order ID found
+        if stop_loss_order_id and new_stop_loss:
             stop_loss_payload = {
                 "accountId": int(account_id),
-                "contractId": contract_id,
-                "type": 4,  # Stop order
-                "side": bracket_side,
-                "size": int(size),
+                "orderId": int(stop_loss_order_id),
                 "stopPrice": float(new_stop_loss)
             }
             
-            logging.info(f"Placing new stop loss order at {new_stop_loss}")
+            logging.info(f"Modifying stop loss order ID {stop_loss_order_id} to price {new_stop_loss}")
+            logging.info(f"Modify URL: {modify_url}")
             logging.info(f"Stop Loss Payload: {json.dumps(stop_loss_payload, indent=2)}")
             
-            place_url = base_url + topstep_config['buy_endpoint']
-            sl_response = requests.post(place_url, headers=headers, json=stop_loss_payload, timeout=10)
-            sl_response_data = sl_response.json()
-            
-            logging.info(f"Stop loss order response: {json.dumps(sl_response_data, indent=2)}")
-            
-            if sl_response_data.get('success', True):
-                logging.info("Successfully placed new stop loss order")
-            else:
-                error_msg = sl_response_data.get('errorMessage', 'Unknown error')
-                error_code = sl_response_data.get('errorCode', 0)
-                logging.error(f"Failed to place stop loss order: {error_msg}")
-                if error_code == 2:
-                    show_error_dialog(error_code, error_msg)
+            try:
+                sl_response = requests.post(modify_url, headers=headers, json=stop_loss_payload, timeout=10)
+                sl_response_data = sl_response.json()
+                
+                logging.info(f"Stop loss modify response: {json.dumps(sl_response_data, indent=2)}")
+                
+                if sl_response_data.get('success', True):
+                    logging.info(f"Successfully modified stop loss to {new_stop_loss}")
+                else:
+                    error_msg = sl_response_data.get('errorMessage', 'Unknown error')
+                    error_code = sl_response_data.get('errorCode', 0)
+                    logging.error(f"Failed to modify stop loss: {error_msg}")
+                    if error_code == 2:
+                        show_error_dialog(error_msg, error_code)
+                        
+            except Exception as e:
+                logging.error(f"Error modifying stop loss order: {e}")
+                logging.exception("Full traceback:")
+        else:
+            if not stop_loss_order_id:
+                logging.warning("No stop loss order ID found - cannot modify")
         
-        # Place new take profit order
-        if topstep_config.get('enable_take_profit', True):
+        # Modify take profit order if order ID found
+        if take_profit_order_id and new_price_target:
             take_profit_payload = {
                 "accountId": int(account_id),
-                "contractId": contract_id,
-                "type": 1,  # Limit order
-                "side": bracket_side,
-                "size": int(size),
-                "price": float(new_price_target)
+                "orderId": int(take_profit_order_id),
+                "limitPrice": float(new_price_target)
             }
             
-            logging.info(f"Placing new take profit order at {new_price_target}")
+            logging.info(f"Modifying take profit order ID {take_profit_order_id} to price {new_price_target}")
+            logging.info(f"Modify URL: {modify_url}")
             logging.info(f"Take Profit Payload: {json.dumps(take_profit_payload, indent=2)}")
             
-            tp_response = requests.post(place_url, headers=headers, json=take_profit_payload, timeout=10)
-            tp_response_data = tp_response.json()
-            
-            logging.info(f"Take profit order response: {json.dumps(tp_response_data, indent=2)}")
-            
-            if tp_response_data.get('success', True):
-                logging.info("Successfully placed new take profit order")
-            else:
-                error_msg = tp_response_data.get('errorMessage', 'Unknown error')
-                error_code = tp_response_data.get('errorCode', 0)
-                logging.error(f"Failed to place take profit order: {error_msg}")
-                if error_code == 2:
-                    show_error_dialog(error_code, error_msg)
+            try:
+                tp_response = requests.post(modify_url, headers=headers, json=take_profit_payload, timeout=10)
+                tp_response_data = tp_response.json()
+                
+                logging.info(f"Take profit modify response: {json.dumps(tp_response_data, indent=2)}")
+                
+                if tp_response_data.get('success', True):
+                    logging.info(f"Successfully modified take profit to {new_price_target}")
+                else:
+                    error_msg = tp_response_data.get('errorMessage', 'Unknown error')
+                    error_code = tp_response_data.get('errorCode', 0)
+                    logging.error(f"Failed to modify take profit: {error_msg}")
+                    if error_code == 2:
+                        show_error_dialog(error_msg, error_code)
+                        
+            except Exception as e:
+                logging.error(f"Error modifying take profit order: {e}")
+                logging.exception("Full traceback:")
+        else:
+            if not take_profit_order_id:
+                logging.warning("No take profit order ID found - cannot modify")
+        
+        # Log ADJUSTMENT event to CSV
+        log_trade_event(
+            event_type="ADJUSTMENT",
+            symbol=symbol,
+            position_type=position_type,
+            size=size,
+            price=avg_price,  # Current price (use entry as reference)
+            stop_loss=new_stop_loss,
+            take_profit=new_price_target,
+            reasoning=reasoning,
+            market_context=market_context
+        )
         
         logging.info("=" * 80)
         logging.info("STOP LOSS AND TAKE PROFIT MODIFICATION COMPLETE")
@@ -530,7 +832,7 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
         logging.error(f"Error modifying stops and targets: {e}")
         logging.exception("Full traceback:")
 
-def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False):
+def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None):
     """The main job to run periodically."""
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
@@ -538,12 +840,27 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
 
     logging.info(f"Starting job at {time.ctime()}")
     
+    # Load daily market context
+    daily_context = get_daily_context()
+    
     try:
         # Get current position status and details
-        current_position_type, position_details = get_current_position(
+        current_position_type, position_details, working_orders = get_current_position(
             symbol, topstep_config, enable_trading, auth_token, return_details=True
         )
         logging.info(f"Determined current position_type: {current_position_type}")
+        
+        # Log working orders info
+        if working_orders:
+            if isinstance(working_orders, list):
+                logging.info(f"Found {len(working_orders)} working order(s)")
+            elif isinstance(working_orders, dict) and 'orders' in working_orders:
+                orders_list = working_orders.get('orders', [])
+                logging.info(f"Found {len(orders_list)} working order(s)")
+            else:
+                logging.info("Working orders retrieved but format unclear")
+        else:
+            logging.info("No working orders returned (may be none or query failed)")
         
         # If we have an active position, manage it instead of looking for new entries
         if current_position_type in ['long', 'short'] and position_details:
@@ -561,6 +878,12 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 # Fallback to long/short specific prompts
                 position_prompt_template = long_position_prompt if current_position_type == 'long' else short_position_prompt
             
+            # Parse working orders to get current stop loss and take profit
+            contract_id = topstep_config.get('contract_id', '')
+            order_info = parse_working_orders(working_orders, contract_id)
+            current_stop_loss = order_info.get('stop_loss_price', 'Not set')
+            current_take_profit = order_info.get('take_profit_price', 'Not set')
+            
             # Add position data to prompt
             # Format the position prompt with available template variables
             position_prompt = position_prompt_template.format(
@@ -569,10 +892,15 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 average_price=position_details.get('average_price', 0),
                 position_type=position_details.get('position_type', 'unknown'),
                 quantity=position_details.get('quantity', 0),
-                unrealized_pnl=position_details.get('unrealized_pnl', 0)
+                unrealized_pnl=position_details.get('unrealized_pnl', 0),
+                current_stop_loss=current_stop_loss,
+                current_take_profit=current_take_profit,
+                Context=daily_context
             )
             
             logging.info(f"Using position management prompt")
+            logging.info(f"Current Stop Loss: {current_stop_loss}, Current Take Profit: {current_take_profit}")
+            logging.info(f"Using context: {daily_context[:50]}..." if len(daily_context) > 50 else f"Using context: {daily_context}")
             
             # Get LLM advice on position management
             llm_response = upload_to_llm(image_base64, position_prompt, model, enable_llm, openai_api_url, openai_api_key)
@@ -592,23 +920,28 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                     price_target = advice.get('price_target')
                     stop_loss = advice.get('stop_loss')
                     reasoning = advice.get('reasoning')
+                    new_context = advice.get('context', '')
                     logging.info(f"Position Management Advice: Action={action}, Target={price_target}, Stop={stop_loss}, Reasoning={reasoning}")
+                    
+                    # Save updated context if it changed
+                    if new_context:
+                        save_daily_context(new_context, daily_context)
                     
                     # Handle position management actions
                     if action == 'close':
                         logging.info(f"LLM advises to CLOSE position. Reasoning: {reasoning}")
                         # Close the entire position by placing opposite market order
-                        close_position(position_details, topstep_config, enable_trading, auth_token, execute_trades)
+                        close_position(position_details, topstep_config, enable_trading, auth_token, execute_trades, telegram_config, reasoning, daily_context)
                     
                     elif action == 'scale':
                         logging.info(f"LLM advises to SCALE position. Reasoning: {reasoning}")
                         # Partially close the position (scale out)
-                        execute_topstep_trade(action, None, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades, position_details)
+                        execute_topstep_trade(action, None, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades, position_details, telegram_config, reasoning, None, daily_context)
                     
                     elif action == 'adjust' or (action == 'hold' and price_target and stop_loss):
                         logging.info(f"LLM advises to ADJUST stops/targets. New Target={price_target}, New Stop={stop_loss}. Reasoning: {reasoning}")
                         # Modify existing stop loss and take profit orders
-                        modify_stops_and_targets(position_details, price_target, stop_loss, topstep_config, enable_trading, auth_token, execute_trades, current_position_type)
+                        modify_stops_and_targets(position_details, price_target, stop_loss, topstep_config, enable_trading, auth_token, execute_trades, current_position_type, working_orders, reasoning, daily_context)
                     
                     elif action == 'hold':
                         logging.info(f"LLM advises to HOLD position. Reasoning: {reasoning}")
@@ -623,15 +956,16 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
         
         # No position - look for new entry opportunities
         logging.info("No active position - analyzing for new entry opportunities")
+        logging.info(f"Using context: {daily_context[:50]}..." if len(daily_context) > 50 else f"Using context: {daily_context}")
 
         image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
         # Select and format prompt based on current_position_type
         if current_position_type == 'none':
-            prompt = no_position_prompt.format(symbol=DISPLAY_SYMBOL)
+            prompt = no_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context)
         elif current_position_type == 'long':
-            prompt = long_position_prompt.format(symbol=DISPLAY_SYMBOL)
+            prompt = long_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context)
         elif current_position_type == 'short':
-            prompt = short_position_prompt.format(symbol=DISPLAY_SYMBOL)
+            prompt = short_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context)
         else:
             logging.error(f"Invalid position_type: {current_position_type}")
             raise ValueError(f"Invalid position_type: {current_position_type}")
@@ -655,30 +989,108 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 stop_loss = advice.get('stop_loss')
                 reasoning = advice.get('reasoning')
                 confidence = advice.get('confidence')
+                new_context = advice.get('context', '')
                 logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}")
+
+                # Save updated context if it changed
+                if new_context:
+                    save_daily_context(new_context, daily_context)
 
                 # Execute trade based on action
                 if action in ['buy', 'sell', 'scale', 'close', 'flatten']:
                     logging.info(f"Executing trade: {action}")
-                    execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades)
+                    execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades, None, telegram_config, reasoning, confidence, daily_context)
             except json.JSONDecodeError as e:
                 logging.error(f"Error parsing LLM response as JSON: {e}")
     except ValueError as e:
         logging.error(f"Error: {e}")
 
+def get_working_orders(topstep_config, enable_trading, auth_token=None):
+    """Query Topstep API for all working orders."""
+    if not enable_trading:
+        logging.debug("Trading disabled - Skipping working orders query")
+        return None
+    
+    if not auth_token:
+        logging.error("No auth token available for working orders query")
+        return None
+    
+    base_url = topstep_config['base_url']
+    working_orders_endpoint = topstep_config.get('working_orders_endpoint', '/api/Order/searchOpen')
+    account_id = topstep_config.get('account_id', '')
+    
+    if not account_id:
+        logging.error("No account_id configured for working orders query")
+        return None
+    
+    url = base_url + working_orders_endpoint
+    
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "accountId": int(account_id)
+    }
+    
+    logging.info("=== FETCHING WORKING ORDERS ===")
+    logging.info(f"Account ID: {account_id}")
+    logging.info(f"Working Orders URL: {url}")
+    logging.info(f"Payload: {json.dumps(payload)}")
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        orders = response.json()
+        
+        # Log the full JSON response
+        logging.info("="*80)
+        logging.info("WORKING ORDERS API RESPONSE:")
+        logging.info(f"Status Code: {response.status_code}")
+        logging.info(f"Response Type: {type(orders)}")
+        logging.info("Full JSON Response:")
+        logging.info(json.dumps(orders, indent=2) if isinstance(orders, (dict, list)) else str(orders))
+        logging.info("="*80)
+        
+        return orders
+        
+    except requests.exceptions.Timeout:
+        logging.error("Working orders query timed out")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error querying working orders: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logging.error(f"Error response: {e.response.text}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error querying working orders: {e}")
+        logging.exception("Full traceback:")
+        return None
+
 def get_current_position(symbol, topstep_config, enable_trading, auth_token=None, return_details=False):
     """Query Topstep API for current position of the symbol and determine type (or mock if disabled).
     
     Args:
-        return_details: If True, returns (position_type, position_details) tuple instead of just position_type
+        return_details: If True, returns (position_type, position_details, working_orders) tuple instead of just position_type
     """
+    # Fetch working orders if return_details is True
+    working_orders = None
+    if return_details:
+        logging.info(f"get_current_position called with return_details=True, enable_trading={enable_trading}, auth_token={'present' if auth_token else 'None'}")
+        if enable_trading and auth_token:
+            logging.info("Fetching working orders alongside position...")
+            working_orders = get_working_orders(topstep_config, enable_trading, auth_token)
+        else:
+            logging.warning(f"Skipping working orders fetch - enable_trading={enable_trading}, auth_token={'present' if auth_token else 'None'}")
+    
     if not enable_trading:
         logging.info("Trading disabled - Mock positions query: Returning 'none'")
-        return ('none', None) if return_details else 'none'
+        return ('none', None, None) if return_details else 'none'
 
     if not auth_token:
         logging.error("No auth token available for positions query")
-        return ('none', None) if return_details else 'none'
+        return ('none', None, None) if return_details else 'none'
 
     base_url = topstep_config['base_url']
     positions_endpoint = topstep_config.get('positions_endpoint', '/positions')
@@ -687,7 +1099,7 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
     
     if not account_id:
         logging.error("No account_id configured for positions query")
-        return ('none', None) if return_details else 'none'
+        return ('none', None, None) if return_details else 'none'
 
     url = base_url + positions_endpoint
 
@@ -724,13 +1136,13 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
         # Handle different response formats
         if isinstance(positions, str):
             logging.error(f"Unexpected string response from positions API: {positions}")
-            return ('none', None) if return_details else 'none'
+            return ('none', None, working_orders) if return_details else 'none'
         
         # If response is a list of positions
         if isinstance(positions, list):
             if len(positions) == 0:
                 logging.info("No positions found (empty list)")
-                return ('none', None) if return_details else 'none'
+                return ('none', None, working_orders) if return_details else 'none'
             
             for pos in positions:
                 if not isinstance(pos, dict):
@@ -747,10 +1159,10 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                     elif quantity < 0:
                         return ('short', None) if return_details else 'short'
                     else:
-                        return ('none', None) if return_details else 'none'
+                        return ('none', None, working_orders) if return_details else 'none'
             
             logging.info(f"No matching position found for symbol {symbol}")
-            return ('none', None) if return_details else 'none'
+            return ('none', None, working_orders) if return_details else 'none'
         
         # If response is a single dict (not a list)
         elif isinstance(positions, dict):
@@ -761,7 +1173,7 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                 
                 if len(positions_list) == 0:
                     logging.info("No positions found (empty positions list)")
-                    return ('none', None) if return_details else 'none'
+                    return ('none', None, working_orders) if return_details else 'none'
                 
                 # Log all positions for debugging
                 logging.info("DEBUG: All positions in response:")
@@ -816,17 +1228,17 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                         }
                         
                         logging.info(f"Returning '{position_type_str}' (type={position_type_code}, size={abs(quantity)})")
-                        return (position_type_str, position_details) if return_details else position_type_str
+                        return (position_type_str, position_details, working_orders) if return_details else position_type_str
                 
                 logging.info(f"No matching position found for symbol {symbol} in positions list")
-                return ('none', None) if return_details else 'none'
+                return ('none', None, working_orders) if return_details else 'none'
             
             # Check if it's a wrapper with a 'data' key
             elif 'data' in positions and isinstance(positions['data'], list):
                 positions_list = positions['data']
                 if len(positions_list) == 0:
                     logging.info("No positions found (empty data list)")
-                    return ('none', None) if return_details else 'none'
+                    return ('none', None, working_orders) if return_details else 'none'
                 
                 for pos in positions_list:
                     if not isinstance(pos, dict):
@@ -865,10 +1277,10 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                             'rawPosition': pos
                         }
                         
-                        return (position_type_str, position_details) if return_details else position_type_str
+                        return (position_type_str, position_details, working_orders) if return_details else position_type_str
                 
                 logging.info(f"No matching position found for symbol {symbol} in data list")
-                return ('none', None) if return_details else 'none'
+                return ('none', None, working_orders) if return_details else 'none'
             
             # Check if it's a single position object
             else:
@@ -909,28 +1321,28 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                     return (position_type_str, position_details) if return_details else position_type_str
                 else:
                     logging.info(f"No positions found - response indicates no open positions")
-                    return ('none', None) if return_details else 'none'
+                    return ('none', None, working_orders) if return_details else 'none'
         
         else:
             logging.error(f"Unexpected positions response type: {type(positions)}")
-            return ('none', None) if return_details else 'none'
+            return ('none', None, working_orders) if return_details else 'none'
             
     except requests.exceptions.Timeout:
         logging.error("Positions query timed out")
-        return ('none', None) if return_details else 'none'
+        return ('none', None, working_orders) if return_details else 'none'
     except requests.exceptions.RequestException as e:
         logging.error(f"Error querying positions: {e}")
         if hasattr(e, 'response') and e.response is not None:
             logging.error(f"Error response: {e.response.text}")
-        return ('none', None) if return_details else 'none'
+        return ('none', None, working_orders) if return_details else 'none'
     except json.JSONDecodeError as e:
         logging.error(f"Failed to parse positions response as JSON: {e}")
         logging.error(f"Raw response: {response.text}")
-        return ('none', None) if return_details else 'none'
+        return ('none', None, working_orders) if return_details else 'none'
     except Exception as e:
         logging.error(f"Unexpected error querying positions: {e}")
         logging.exception("Full traceback:")
-        return ('none', None) if return_details else 'none'
+        return ('none', None, working_orders) if return_details else 'none'
 
 def check_active_trades(topstep_config, enable_trading, auth_token=None):
     """Check if there are any active open positions - returns True if positions are active."""
@@ -950,6 +1362,9 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
         return False
     
     logging.debug(f"DEBUG: Checking active trades for account {account_id}")
+    
+    # Also fetch and log working orders
+    working_orders = get_working_orders(topstep_config, enable_trading, auth_token)
 
     headers = {
         "Authorization": f"Bearer {auth_token}",
@@ -1055,7 +1470,7 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
         logging.error(f"Unexpected error checking active trades: {e}")
         return False
 
-def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_config, enable_trading, position_type='none', auth_token=None, execute_trades=False, position_details=None):
+def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_config, enable_trading, position_type='none', auth_token=None, execute_trades=False, position_details=None, telegram_config=None, reasoning=None, confidence=None, market_context=None):
     """Execute trade via Topstep API based on action with stop loss and take profit (or mock/log details if disabled)."""
     logging.info(f"Preparing to execute trade: {action} with entry {entry_price}, target {price_target} and stop {stop_loss}")
     
@@ -1327,19 +1742,99 @@ def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_
         
         logging.info(f"Trade executed successfully: {action}")
         
+        # Get updated account balance
+        balance = get_account_balance(account_id, topstep_config, enable_trading, auth_token)
+        
+        # Log trade event to CSV
+        if action in ['buy', 'sell']:
+            # Entry event
+            event_type = "ENTRY"
+            trade_position_type = 'long' if action == 'buy' else 'short'
+            log_trade_event(
+                event_type=event_type,
+                symbol=contract_id,
+                position_type=trade_position_type,
+                size=size,
+                price=entry_price if entry_price else 0,  # Use entry price if available
+                stop_loss=stop_loss,
+                take_profit=price_target,
+                reasoning=reasoning,
+                confidence=confidence,
+                balance=balance,
+                market_context=market_context
+            )
+        elif action == 'scale':
+            # Scale event (partial exit)
+            trade_info = get_active_trade_info()
+            if trade_info:
+                scale_entry_price = trade_info.get('entry_price')
+                scale_position_type = trade_info.get('position_type')
+                # Calculate P&L for scaled portion
+                if scale_entry_price:
+                    price_diff = (float(entry_price) - float(scale_entry_price)) if scale_position_type == 'long' else (float(scale_entry_price) - float(entry_price))
+                    profit_loss_points = price_diff
+                    # Assuming ES multiplier of $50 per point
+                    profit_loss = profit_loss_points * 50 * size
+                else:
+                    profit_loss_points = None
+                    profit_loss = None
+                
+                log_trade_event(
+                    event_type="SCALE",
+                    symbol=contract_id,
+                    position_type=scale_position_type,
+                    size=size,
+                    price=entry_price if entry_price else 0,
+                    reasoning=reasoning,
+                    profit_loss=profit_loss,
+                    profit_loss_points=profit_loss_points,
+                    balance=balance,
+                    market_context=market_context,
+                    entry_price=scale_entry_price
+                )
+        
+        # Build Telegram notification message
+        action_emoji = "🟢" if action in ['buy', 'long'] else "🔴" if action in ['sell', 'short'] else "🟡"
+        action_text = action.upper()
+        
+        telegram_msg = f"{action_emoji} <b>ORDER PLACED: {action_text}</b>\n"
+        telegram_msg += f"Size: {size} contract(s)\n"
+        telegram_msg += f"Symbol: {contract_id}\n"
+        
+        if entry_price:
+            telegram_msg += f"Entry: {entry_price}\n"
+        
         # Log stop loss and take profit bracket details if present
         if 'stopLossBracket' in payload:
             sl_bracket = payload['stopLossBracket']
             if 'ticks' in sl_bracket:
                 logging.info(f"Stop Loss bracket placed: {sl_bracket['ticks']} ticks")
+                telegram_msg += f"Stop Loss: {sl_bracket['ticks']} ticks\n"
             elif 'price' in sl_bracket:
                 logging.info(f"Stop Loss bracket placed at price: {sl_bracket['price']}")
+                telegram_msg += f"Stop Loss: {sl_bracket['price']}\n"
+        
         if 'takeProfitBracket' in payload:
             tp_bracket = payload['takeProfitBracket']
             if 'ticks' in tp_bracket:
                 logging.info(f"Take Profit bracket placed: {tp_bracket['ticks']} ticks")
+                telegram_msg += f"Take Profit: {tp_bracket['ticks']} ticks\n"
             elif 'price' in tp_bracket:
                 logging.info(f"Take Profit bracket placed at price: {tp_bracket['price']}")
+                telegram_msg += f"Take Profit: {tp_bracket['price']}\n"
+        
+        if price_target:
+            telegram_msg += f"Target: {price_target}\n"
+        if stop_loss:
+            telegram_msg += f"Stop: {stop_loss}\n"
+        
+        if balance is not None:
+            telegram_msg += f"💰 Balance: ${balance:,.2f}\n"
+        
+        telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        # Send Telegram notification
+        send_telegram_message(telegram_msg, telegram_config)
             
     except requests.exceptions.Timeout:
         logging.error("Trade request timed out")
@@ -1524,6 +2019,55 @@ def get_available_contracts(topstep_config, auth_token=None, symbol=None):
             logging.error(f"Error fetching contracts: {e}")
             return None
 
+def get_account_balance(account_id, topstep_config, enable_trading, auth_token=None):
+    """Query API for account balance for a specific account ID."""
+    if not enable_trading:
+        logging.debug("Trading disabled - Skipping account balance query")
+        return None
+    
+    if not auth_token:
+        logging.error("No auth token available for account balance query")
+        return None
+    
+    if not account_id:
+        logging.error("No account_id provided for balance query")
+        return None
+    
+    try:
+        # Get all accounts
+        accounts_response = get_accounts(topstep_config, enable_trading, auth_token)
+        
+        if not accounts_response:
+            logging.warning("No accounts data returned")
+            return None
+        
+        # Extract accounts list from response
+        if not isinstance(accounts_response, dict) or 'accounts' not in accounts_response:
+            logging.error("Unexpected accounts response format")
+            return None
+        
+        accounts_list = accounts_response['accounts']
+        
+        # Find the matching account by id
+        target_account_id = int(account_id)
+        for account in accounts_list:
+            if account.get('id') == target_account_id:
+                balance = account.get('balance')
+                if balance is not None:
+                    logging.info(f"Retrieved balance for account {account_id}: ${balance:,.2f}")
+                    return float(balance)
+                else:
+                    logging.warning(f"Found account {account_id} but no balance field")
+                    return None
+        
+        logging.warning(f"Account {account_id} not found in accounts list")
+        return None
+        
+    except Exception as e:
+        logging.error(f"Error retrieving account balance: {e}")
+        logging.exception("Full traceback:")
+        return None
+
 def get_accounts(topstep_config, enable_trading, auth_token=None):
     """Query API for list of accounts (or skip if trading disabled)."""
     if not enable_trading:
@@ -1630,8 +2174,9 @@ TOPSTEP_CONFIG = {
     'sell_endpoint': config.get('Topstep', 'sell_endpoint', fallback='/orders'),
     'flatten_endpoint': config.get('Topstep', 'flatten_endpoint', fallback='/positions/flatten'),
     'positions_endpoint': config.get('Topstep', 'positions_endpoint', fallback='/positions'),
-    'working_orders_endpoint': config.get('Topstep', 'working_orders_endpoint', fallback='/api/Order/searchWorking'),
+    'working_orders_endpoint': config.get('Topstep', 'working_orders_endpoint', fallback='/api/Order/searchOpen'),
     'cancel_order_endpoint': config.get('Topstep', 'cancel_order_endpoint', fallback='/api/Order/cancel'),
+    'modify_order_endpoint': config.get('Topstep', 'modify_order_endpoint', fallback='/api/Order/modify'),
     'accounts_endpoint': config.get('Topstep', 'accounts_endpoint', fallback='/api/Account/search'),
     'contracts_endpoint': config.get('Topstep', 'contracts_endpoint', fallback='/api/Contract/search'),
     'contracts_available_endpoint': config.get('Topstep', 'contracts_available_endpoint', fallback='/api/Contract/available'),
@@ -1653,6 +2198,16 @@ OPENAI_API_KEY = config.get('OpenAI', 'api_key', fallback='your-openai-api-key-h
 OPENAI_API_URL = config.get('OpenAI', 'api_url', fallback='https://api.openai.com/v1/chat/completions')
 
 logging.info(f"Loaded OpenAI config: API_URL={OPENAI_API_URL}")
+
+TELEGRAM_CONFIG = {
+    'api_key': config.get('Telegram', 'telegram_api_key', fallback=''),
+    'chat_id': config.get('Telegram', 'telegram_chat_id', fallback='')
+}
+
+if TELEGRAM_CONFIG['api_key'] and TELEGRAM_CONFIG['chat_id']:
+    logging.info(f"Loaded Telegram config: Notifications enabled for chat ID {TELEGRAM_CONFIG['chat_id']}")
+else:
+    logging.info("Telegram config not found or incomplete - notifications disabled")
 
 # Global auth token for Topstep API
 AUTH_TOKEN = None
@@ -1764,7 +2319,8 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     openai_api_key=OPENAI_API_KEY,
     enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
     auth_token=AUTH_TOKEN,
-    execute_trades=EXECUTE_TRADES
+    execute_trades=EXECUTE_TRADES,
+    telegram_config=TELEGRAM_CONFIG
 )
 
 # Run the first job immediately on startup (before entering the scheduler loop)
@@ -1789,7 +2345,8 @@ job(
     openai_api_key=OPENAI_API_KEY,
     enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
     auth_token=AUTH_TOKEN,
-    execute_trades=EXECUTE_TRADES
+    execute_trades=EXECUTE_TRADES,
+    telegram_config=TELEGRAM_CONFIG
 )
 
 # Global flag to control the scheduler
@@ -1974,7 +2531,8 @@ def manual_job():
         openai_api_key=OPENAI_API_KEY,
         enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
         auth_token=AUTH_TOKEN,
-        execute_trades=EXECUTE_TRADES
+        execute_trades=EXECUTE_TRADES,
+        telegram_config=TELEGRAM_CONFIG
     )
     logging.info("Manual job completed.")
 

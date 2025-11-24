@@ -716,6 +716,9 @@ def close_position(position_details, topstep_config, enable_trading, auth_token=
             if balance is not None:
                 telegram_msg += f"💰 Balance: ${balance:,.2f}\n"
             
+            if reasoning:
+                telegram_msg += f"📝 Reason: {reasoning}\n"
+            
             telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             
             send_telegram_message(telegram_msg, telegram_config)
@@ -1035,6 +1038,7 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                         if balance is not None:
                             telegram_msg += f"💰 Balance: ${balance:,.2f}\n"
                         
+                        telegram_msg += f"📝 Reason: Position closed - fetched actual results from API\n"
                         telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                         
                         send_telegram_message(telegram_msg, telegram_config)
@@ -1053,24 +1057,26 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
             working_orders = None
         
         # Check if it's time to force close all positions
-        # Only apply force close if the force_close_time is within the current trading session
+        # Force close should only apply within the no-new-trades window (between no_new_trades_time and no_new_trades_end_time)
+        # After no_new_trades_end_time, trading resumes and force close no longer applies
         should_force_close = False
         
-        if is_overnight_session:
-            # Overnight session that crosses midnight (e.g., 22:00-06:00)
-            if force_close >= begin or force_close <= end:
-                # Force close time is within the overnight session
-                if current_time >= force_close:
-                    should_force_close = True
-                elif current_time <= end and force_close <= end:
-                    # We're in the early morning part of the session
-                    should_force_close = True
+        no_new_trades = datetime.datetime.strptime(no_new_trades_time, "%H:%M").time()
+        no_new_trades_end = datetime.datetime.strptime(no_new_trades_end_time, "%H:%M").time()
+        
+        # Determine if we're in the no-new-trades window
+        in_no_trades_window = False
+        if no_new_trades < no_new_trades_end:
+            # Same-day window (e.g., 15:45 to 18:00)
+            in_no_trades_window = no_new_trades <= current_time < no_new_trades_end
         else:
-            # Same-day session (e.g., 08:00-16:00 or 18:00-23:50)
-            if begin <= force_close <= end:
-                # Force close time is within the trading session
-                should_force_close = current_time >= force_close
-            # If force_close is outside the session window, don't apply it
+            # Overnight window (e.g., 23:00 to 02:00)
+            in_no_trades_window = current_time >= no_new_trades or current_time < no_new_trades_end
+        
+        # Only apply force close if we're in the no-new-trades window AND past the force_close_time
+        if in_no_trades_window and current_time >= force_close:
+            should_force_close = True
+            logging.debug(f"In no-new-trades window and past force close time - should_force_close={should_force_close}")
         
         if should_force_close:
             if current_position_type in ['long', 'short'] and position_details:
@@ -1080,7 +1086,7 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 return  # Exit after force close
             else:
                 logging.info(f"Force close time reached ({force_close_time}) but no active positions to close")
-                return  # No need to analyze for new trades after force close time
+                # Continue to check if we're past no_new_trades_end_time to resume trading
         
         # Log working orders info
         if working_orders:
@@ -1186,12 +1192,8 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
             
             return  # Done managing position, exit job
         
-        # No position - check if we can still enter new trades
-        no_new_trades = datetime.datetime.strptime(no_new_trades_time, "%H:%M").time()
-        no_new_trades_end = datetime.datetime.strptime(no_new_trades_end_time, "%H:%M").time()
-        
-        # Check if we're in the no-new-trades window
-        if no_new_trades <= current_time < no_new_trades_end:
+        # No position - check if we can still enter new trades (reuse in_no_trades_window from above)
+        if in_no_trades_window:
             logging.info(f"In no-new-trades window ({no_new_trades_time} to {no_new_trades_end_time}) - Skipping entry analysis")
             return
         
@@ -2111,6 +2113,12 @@ def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_
         
         if balance is not None:
             telegram_msg += f"💰 Balance: ${balance:,.2f}\n"
+        
+        if reasoning:
+            telegram_msg += f"📝 Reason: {reasoning}\n"
+        
+        if confidence is not None:
+            telegram_msg += f"🎯 Confidence: {confidence}%\n"
         
         telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         

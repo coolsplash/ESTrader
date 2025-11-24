@@ -41,12 +41,16 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - `execute_trades` - Actually execute trades (true/false)
 - `interval_minutes` - Screenshot frequency (default: 1)
 - `begin_time`/`end_time` - Trading hours window
+- `no_new_trades_time` - Stop opening new positions at this time
+- `no_new_trades_end_time` - Resume trading after this time
+- `force_close_time` - Force close all positions at this time
 
 ## Data Storage
 - `logs/YYYYMMDD.txt` - Daily execution logs
 - `trades/trades_YYYYMM.csv` - Monthly trade journal with P&L
 - `trades/active_trade.json` - Current position tracking
-- `market_data/` - Cached Yahoo Finance data and context
+- `context/YYMMDD.txt` - Daily market context (unified storage)
+- `market_data/` - Cached Yahoo Finance raw data (CSV files)
 - `screenshots/` - Captured images (timestamped)
 
 ## API Integrations
@@ -72,6 +76,17 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 python market_data.py
 ```
 
+### System Tray Menu Options
+Right-click the tray icon for quick access to:
+- **Start/Stop** - Control the scheduler
+- **Reload Config** - Hot-reload config.ini without restarting
+- **Refresh Market Context** - Fetch latest market data on demand
+- **Set Position** - Manually override position tracking
+- **Toggle LLM/Trading** - Enable/disable features
+- **Take Screenshot Now** - Manual screenshot analysis
+- **Test Positions/Orders** - Debug API connectivity
+- **List All Contracts** - View available contracts
+
 ### Check Logs
 - Latest execution: `logs\YYYYMMDD.txt` (today's date)
 - Trade history: `trades\trades_YYYYMM.csv` (current month)
@@ -93,6 +108,10 @@ python market_data.py
 - All credentials are in config.ini (already configured)
 - Position management happens every 15 seconds when in a trade
 - Screenshots only taken during configured trading hours
+- API queries only run during trading hours (saves API calls)
 - Trade IDs track positions across entry/adjustments/exit
 - Can run in mock mode with safety flags disabled for testing
+- After-hours trading automatically detected (RTH: 9:30 AM - 4:00 PM ET)
+- Hot-reload config without restarting via tray menu
+- Overnight trading sessions supported (e.g., 18:00-23:59)
 

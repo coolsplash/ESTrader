@@ -181,9 +181,30 @@ def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=No
         logging.exception("Full traceback:")
         return trade_id
 
+def is_after_hours():
+    """Check if current time is outside regular trading hours (RTH).
+    
+    Regular Trading Hours (RTH) for ES futures: 8:30 AM - 3:00 PM CT (9:30 AM - 4:00 PM ET)
+    Any time outside this window is considered after-hours/electronic trading hours (ETH).
+    
+    Returns:
+        bool: True if after hours, False if during RTH
+    """
+    current_time = datetime.datetime.now().time()
+    
+    # Regular Trading Hours (RTH): 8:30 AM - 3:00 PM CT
+    rth_start = datetime.datetime.strptime("09:30", "%H:%M").time()
+    rth_end = datetime.datetime.strptime("16:00", "%H:%M").time()
+    
+    # Check if we're outside RTH
+    is_eth = current_time < rth_start or current_time >= rth_end
+    
+    return is_eth
+
 def get_daily_context():
     """Read today's market context from context/YYMMDD.txt file.
     If no context exists, generate it from market data.
+    Appends after-hours notice if trading outside RTH.
     
     Returns:
         str: The context text, or empty string if file doesn't exist
@@ -194,11 +215,12 @@ def get_daily_context():
         today = datetime.datetime.now().strftime("%y%m%d")
         context_file = os.path.join(context_folder, f"{today}.txt")
         
+        context = ""
+        
         if os.path.exists(context_file):
             with open(context_file, 'r', encoding='utf-8') as f:
                 context = f.read().strip()
                 logging.info(f"Loaded context from {context_file}: {context[:100]}..." if len(context) > 100 else f"Loaded context from {context_file}: {context}")
-                return context
         else:
             logging.info(f"No context file found for today ({context_file})")
             # Try to generate market context from Yahoo Finance data
@@ -207,15 +229,42 @@ def get_daily_context():
                 analyzer = MarketDataAnalyzer()
                 context = analyzer.generate_market_context(force_refresh=True)
                 
+                # Check if data fetch failed
+                if "Market data unavailable" in context:
+                    # Try to use yesterday's context as fallback
+                    yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%y%m%d")
+                    yesterday_file = os.path.join(context_folder, f"{yesterday}.txt")
+                    if os.path.exists(yesterday_file):
+                        logging.warning(f"Market data fetch failed, using yesterday's context from {yesterday_file}")
+                        with open(yesterday_file, 'r', encoding='utf-8') as f:
+                            context = f.read() + "\n\n[Note: Using previous day's context - current market data unavailable]"
+                    else:
+                        logging.error("No yesterday context available either")
+                        return context  # Return the unavailable message
+                
                 # Save the generated context for today
                 with open(context_file, 'w', encoding='utf-8') as f:
                     f.write(context)
                 logging.info(f"Generated and saved market context to {context_file}")
-                
-                return context
             except Exception as e:
                 logging.error(f"Could not generate market context: {e}")
-                return ""
+                # Try yesterday's context as final fallback
+                yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%y%m%d")
+                yesterday_file = os.path.join(context_folder, f"{yesterday}.txt")
+                if os.path.exists(yesterday_file):
+                    logging.warning(f"Exception occurred, using yesterday's context from {yesterday_file}")
+                    with open(yesterday_file, 'r', encoding='utf-8') as f:
+                        context = f.read() + "\n\n[Note: Using previous day's context due to error]"
+                else:
+                    return ""
+        
+        # Append after-hours notice if outside RTH
+        if is_after_hours():
+            context += "\n\n⚠️ PLEASE NOTE: THIS IS AFTER HOURS TRADING (Outside Regular Trading Hours 8:30 AM - 3:00 PM CT)"
+            logging.info("After-hours notice appended to context")
+        
+        return context
+        
     except Exception as e:
         logging.error(f"Error reading daily context: {e}")
         return ""
@@ -832,7 +881,7 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
         logging.error(f"Error modifying stops and targets: {e}")
         logging.exception("Full traceback:")
 
-def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_time='23:59', force_close_time='23:59'):
+def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_time='23:59', no_new_trades_end_time='23:59', force_close_time='23:59'):
     """The main job to run periodically."""
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
@@ -841,20 +890,51 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
     logging.info(f"Starting job at {time.ctime()}")
     
     current_time = datetime.datetime.now().time()
+    begin = datetime.datetime.strptime(begin_time, "%H:%M").time()
+    end = datetime.datetime.strptime(end_time, "%H:%M").time()
     force_close = datetime.datetime.strptime(force_close_time, "%H:%M").time()
+    
+    # Determine if this is an overnight session (begin_time > end_time, e.g., 18:00 - 05:00)
+    is_overnight_session = begin > end
     
     # Load daily market context
     daily_context = get_daily_context()
     
     try:
-        # Get current position status and details
-        current_position_type, position_details, working_orders = get_current_position(
-            symbol, topstep_config, enable_trading, auth_token, return_details=True
-        )
-        logging.info(f"Determined current position_type: {current_position_type}")
+        # Get current position status and details (only query API during trading hours)
+        if is_within_time_range(begin_time, end_time):
+            current_position_type, position_details, working_orders = get_current_position(
+                symbol, topstep_config, enable_trading, auth_token, return_details=True
+            )
+            logging.info(f"Determined current position_type: {current_position_type}")
+        else:
+            # Outside trading hours - assume no position and skip API queries
+            logging.info(f"Outside trading hours ({begin_time}-{end_time}) - Skipping position queries")
+            current_position_type = 'none'
+            position_details = None
+            working_orders = None
         
         # Check if it's time to force close all positions
-        if current_time >= force_close:
+        # Only apply force close if the force_close_time is within the current trading session
+        should_force_close = False
+        
+        if is_overnight_session:
+            # Overnight session that crosses midnight (e.g., 22:00-06:00)
+            if force_close >= begin or force_close <= end:
+                # Force close time is within the overnight session
+                if current_time >= force_close:
+                    should_force_close = True
+                elif current_time <= end and force_close <= end:
+                    # We're in the early morning part of the session
+                    should_force_close = True
+        else:
+            # Same-day session (e.g., 08:00-16:00 or 18:00-23:50)
+            if begin <= force_close <= end:
+                # Force close time is within the trading session
+                should_force_close = current_time >= force_close
+            # If force_close is outside the session window, don't apply it
+        
+        if should_force_close:
             if current_position_type in ['long', 'short'] and position_details:
                 logging.info(f"FORCE CLOSE TIME REACHED ({force_close_time}) - Closing all positions immediately")
                 close_position(position_details, topstep_config, enable_trading, auth_token, execute_trades, telegram_config, 
@@ -970,8 +1050,11 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
         
         # No position - check if we can still enter new trades
         no_new_trades = datetime.datetime.strptime(no_new_trades_time, "%H:%M").time()
-        if current_time >= no_new_trades:
-            logging.info(f"No new trades time reached ({no_new_trades_time}) - Skipping entry analysis")
+        no_new_trades_end = datetime.datetime.strptime(no_new_trades_end_time, "%H:%M").time()
+        
+        # Check if we're in the no-new-trades window
+        if no_new_trades <= current_time < no_new_trades_end:
+            logging.info(f"In no-new-trades window ({no_new_trades_time} to {no_new_trades_end_time}) - Skipping entry analysis")
             return
         
         # No position - look for new entry opportunities
@@ -2164,6 +2247,7 @@ TRADE_STATUS_CHECK_INTERVAL = int(config.get('General', 'trade_status_check_inte
 BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
 END_TIME = config.get('General', 'end_time', fallback='23:59')
 NO_NEW_TRADES_TIME = config.get('General', 'no_new_trades_time', fallback='23:59')
+NO_NEW_TRADES_END_TIME = config.get('General', 'no_new_trades_end_time', fallback='23:59')
 FORCE_CLOSE_TIME = config.get('General', 'force_close_time', fallback='23:59')
 WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
 TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
@@ -2174,7 +2258,7 @@ ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
 EXECUTE_TRADES = config.getboolean('General', 'execute_trades', fallback=False)
 ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
 
-logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_TIME={NO_NEW_TRADES_TIME}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
+logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_TIME={NO_NEW_TRADES_TIME}, NO_NEW_TRADES_END_TIME={NO_NEW_TRADES_END_TIME}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
 
 SYMBOL = config.get('LLM', 'symbol', fallback='ES')
 DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')  # Symbol for LLM communications and human readable formats
@@ -2292,6 +2376,43 @@ if accounts:
 else:
     logging.info("No accounts fetched (check API key/endpoint or enable_trading).")
 
+# Ensure we have market context for today before beginning trading
+logging.info("=" * 80)
+logging.info("CHECKING MARKET CONTEXT FOR TODAY")
+logging.info("=" * 80)
+try:
+    context_folder = 'context'
+    today = datetime.datetime.now().strftime("%y%m%d")
+    context_file = os.path.join(context_folder, f"{today}.txt")
+    
+    if not os.path.exists(context_file):
+        logging.info(f"No market context found for today ({today}) - Generating now...")
+        analyzer = MarketDataAnalyzer()
+        market_context = analyzer.generate_market_context(force_refresh=True)
+        
+        # Save the generated context
+        os.makedirs(context_folder, exist_ok=True)
+        with open(context_file, 'w', encoding='utf-8') as f:
+            f.write(market_context)
+        
+        logging.info("=" * 80)
+        logging.info("MARKET CONTEXT GENERATED:")
+        logging.info("=" * 80)
+        logging.info(market_context)
+        logging.info("=" * 80)
+    else:
+        logging.info(f"Market context already exists for today ({today})")
+        with open(context_file, 'r', encoding='utf-8') as f:
+            existing_context = f.read()
+        logging.info("=" * 80)
+        logging.info("EXISTING MARKET CONTEXT:")
+        logging.info("=" * 80)
+        logging.info(existing_context)
+        logging.info("=" * 80)
+except Exception as e:
+    logging.error(f"Error checking/generating startup market context: {e}")
+    logging.exception("Full traceback:")
+
 # Log exact Topstep URLs and example POST requests for debug
 logging.info("Topstep Debug URLs (all POST requests):")
 logging.info(f"Login URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['login_endpoint']}")
@@ -2344,6 +2465,7 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     execute_trades=EXECUTE_TRADES,
     telegram_config=TELEGRAM_CONFIG,
     no_new_trades_time=NO_NEW_TRADES_TIME,
+    no_new_trades_end_time=NO_NEW_TRADES_END_TIME,
     force_close_time=FORCE_CLOSE_TIME
 )
 
@@ -2372,6 +2494,7 @@ job(
     execute_trades=EXECUTE_TRADES,
     telegram_config=TELEGRAM_CONFIG,
     no_new_trades_time=NO_NEW_TRADES_TIME,
+    no_new_trades_end_time=NO_NEW_TRADES_END_TIME,
     force_close_time=FORCE_CLOSE_TIME
 )
 
@@ -2393,15 +2516,22 @@ def run_trade_monitor():
     
     while running:
         try:
-            is_active = check_active_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
-            
-            # Log state changes
-            if is_active != last_active_state:
-                if is_active:
-                    logging.info("Trade monitoring: Active position detected - LLM analysis paused")
-                else:
-                    logging.info("Trade monitoring: No active positions - LLM analysis will resume on next cycle")
-                last_active_state = is_active
+            # Only check trades during trading hours
+            if is_within_time_range(BEGIN_TIME, END_TIME):
+                is_active = check_active_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
+                
+                # Log state changes
+                if is_active != last_active_state:
+                    if is_active:
+                        logging.info("Trade monitoring: Active position detected - LLM analysis paused")
+                    else:
+                        logging.info("Trade monitoring: No active positions - LLM analysis will resume on next cycle")
+                    last_active_state = is_active
+            else:
+                # Outside trading hours, reset state
+                if last_active_state is not None:
+                    logging.debug("Trade monitoring paused - outside trading hours")
+                    last_active_state = None
             
             time.sleep(TRADE_STATUS_CHECK_INTERVAL)
         except Exception as e:
@@ -2450,6 +2580,8 @@ def create_tray_icon():
     menu = (
         item('Start', start_scheduler),
         item('Stop', stop_scheduler),
+        item('Reload Config', lambda icon, item: reload_config()),
+        item('Refresh Market Context', lambda icon, item: refresh_market_context()),
         item('Set Position', pystray.Menu(
             item('None', lambda icon, item: set_position('none')),
             item('Long', lambda icon, item: set_position('long')),
@@ -2507,6 +2639,126 @@ def test_active_trades():
     has_active_trades = check_active_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
     logging.info(f"Test result: Active positions = {has_active_trades}")
 
+def reload_config():
+    """Reload configuration from config.ini without restarting the application."""
+    global config, INTERVAL_MINUTES, TRADE_STATUS_CHECK_INTERVAL, BEGIN_TIME, END_TIME
+    global NO_NEW_TRADES_TIME, NO_NEW_TRADES_END_TIME, FORCE_CLOSE_TIME
+    global WINDOW_TITLE, TOP_OFFSET, BOTTOM_OFFSET, SAVE_FOLDER
+    global ENABLE_LLM, ENABLE_TRADING, EXECUTE_TRADES, ENABLE_SAVE_SCREENSHOTS
+    global SYMBOL, DISPLAY_SYMBOL, POSITION_TYPE, NO_POSITION_PROMPT
+    global LONG_POSITION_PROMPT, SHORT_POSITION_PROMPT, MODEL
+    global TOPSTEP_CONFIG, OPENAI_API_KEY, OPENAI_API_URL, TELEGRAM_CONFIG
+    
+    try:
+        logging.info("=" * 80)
+        logging.info("RELOADING CONFIGURATION")
+        logging.info("=" * 80)
+        
+        # Reload config file
+        config = configparser.ConfigParser()
+        config.read('config.ini')
+        
+        # Reload General settings
+        INTERVAL_MINUTES = int(config.get('General', 'interval_minutes', fallback='5'))
+        TRADE_STATUS_CHECK_INTERVAL = int(config.get('General', 'trade_status_check_interval', fallback='10'))
+        BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
+        END_TIME = config.get('General', 'end_time', fallback='23:59')
+        NO_NEW_TRADES_TIME = config.get('General', 'no_new_trades_time', fallback='23:59')
+        NO_NEW_TRADES_END_TIME = config.get('General', 'no_new_trades_end_time', fallback='23:59')
+        FORCE_CLOSE_TIME = config.get('General', 'force_close_time', fallback='23:59')
+        WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
+        TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
+        BOTTOM_OFFSET = int(config.get('General', 'bottom_offset', fallback='0'))
+        SAVE_FOLDER = config.get('General', 'save_folder', fallback=None)
+        ENABLE_LLM = config.getboolean('General', 'enable_llm', fallback=True)
+        ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
+        EXECUTE_TRADES = config.getboolean('General', 'execute_trades', fallback=False)
+        ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
+        
+        # Reload LLM settings
+        SYMBOL = config.get('LLM', 'symbol', fallback='ES')
+        DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')
+        POSITION_TYPE = config.get('LLM', 'position_type', fallback='none')
+        NO_POSITION_PROMPT = config.get('LLM', 'no_position_prompt', fallback='')
+        LONG_POSITION_PROMPT = config.get('LLM', 'long_position_prompt', fallback='')
+        SHORT_POSITION_PROMPT = config.get('LLM', 'short_position_prompt', fallback='')
+        MODEL = config.get('LLM', 'model', fallback='gpt-4o')
+        
+        # Reload Topstep settings
+        TOPSTEP_CONFIG.update({
+            'user_name': config.get('Topstep', 'user_name', fallback=''),
+            'api_key': config.get('Topstep', 'api_key', fallback=''),
+            'api_secret': config.get('Topstep', 'api_secret', fallback=''),
+            'account_id': config.get('Topstep', 'account_id', fallback=''),
+            'contract_id': config.get('Topstep', 'contract_id', fallback=''),
+            'quantity': config.get('Topstep', 'quantity', fallback='1'),
+            'contract_to_search': config.get('Topstep', 'contract_to_search', fallback='ES'),
+            'max_risk_per_contract': config.get('Topstep', 'max_risk_per_contract', fallback=''),
+            'max_profit_per_contract': config.get('Topstep', 'max_profit_per_contract', fallback=''),
+            'enable_stop_loss': config.getboolean('Topstep', 'enable_stop_loss', fallback=True),
+            'enable_take_profit': config.getboolean('Topstep', 'enable_take_profit', fallback=True),
+            'tick_size': config.getfloat('Topstep', 'tick_size', fallback=0.25)
+        })
+        
+        # Reload OpenAI settings
+        OPENAI_API_KEY = config.get('OpenAI', 'api_key', fallback='')
+        OPENAI_API_URL = config.get('OpenAI', 'api_url', fallback='https://api.openai.com/v1/chat/completions')
+        
+        # Reload Telegram settings
+        TELEGRAM_CONFIG.update({
+            'api_key': config.get('Telegram', 'telegram_api_key', fallback=''),
+            'chat_id': config.get('Telegram', 'telegram_chat_id', fallback='')
+        })
+        
+        logging.info("Configuration reloaded successfully:")
+        logging.info(f"  INTERVAL_MINUTES={INTERVAL_MINUTES}")
+        logging.info(f"  BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}")
+        logging.info(f"  NO_NEW_TRADES_TIME={NO_NEW_TRADES_TIME}, NO_NEW_TRADES_END_TIME={NO_NEW_TRADES_END_TIME}")
+        logging.info(f"  FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}")
+        logging.info(f"  ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}")
+        logging.info(f"  ACCOUNT_ID={TOPSTEP_CONFIG['account_id']}, CONTRACT_ID={TOPSTEP_CONFIG['contract_id']}")
+        logging.info("=" * 80)
+        
+        # Clear and reschedule jobs with new interval
+        schedule.clear()
+        schedule.every(INTERVAL_MINUTES).minutes.do(
+            job, 
+            window_title=WINDOW_TITLE, 
+            top_offset=TOP_OFFSET, 
+            bottom_offset=BOTTOM_OFFSET, 
+            save_folder=SAVE_FOLDER, 
+            begin_time=BEGIN_TIME, 
+            end_time=END_TIME,
+            symbol=SYMBOL,
+            position_type=POSITION_TYPE,
+            no_position_prompt=NO_POSITION_PROMPT,
+            long_position_prompt=LONG_POSITION_PROMPT,
+            short_position_prompt=SHORT_POSITION_PROMPT,
+            model=MODEL,
+            topstep_config=TOPSTEP_CONFIG,
+            enable_llm=ENABLE_LLM,
+            enable_trading=ENABLE_TRADING,
+            openai_api_url=OPENAI_API_URL,
+            openai_api_key=OPENAI_API_KEY,
+            enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
+            auth_token=AUTH_TOKEN,
+            execute_trades=EXECUTE_TRADES,
+            telegram_config=TELEGRAM_CONFIG,
+            no_new_trades_time=NO_NEW_TRADES_TIME,
+            no_new_trades_end_time=NO_NEW_TRADES_END_TIME,
+            force_close_time=FORCE_CLOSE_TIME
+        )
+        
+        logging.info(f"Scheduler rescheduled with interval: {INTERVAL_MINUTES} minute(s)")
+        logging.info("Config reload complete - changes will take effect on next job run")
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error reloading configuration: {e}")
+        logging.exception("Full traceback:")
+        return False
+
 def list_all_contracts():
     """Manually fetch and log all available contracts from Topstep API."""
     logging.info("Manually fetching all available contracts...")
@@ -2535,6 +2787,42 @@ def list_all_contracts():
     else:
         logging.warning("Failed to fetch all available contracts")
 
+def refresh_market_context():
+    """Manually refresh market context by fetching fresh data from Yahoo Finance."""
+    try:
+        logging.info("=" * 80)
+        logging.info("MANUALLY REFRESHING MARKET CONTEXT")
+        logging.info("=" * 80)
+        
+        analyzer = MarketDataAnalyzer()
+        market_context = analyzer.generate_market_context(force_refresh=True)
+        
+        # Save the generated context to today's file (without after-hours notice)
+        context_folder = 'context'
+        os.makedirs(context_folder, exist_ok=True)
+        today = datetime.datetime.now().strftime("%y%m%d")
+        context_file = os.path.join(context_folder, f"{today}.txt")
+        
+        with open(context_file, 'w', encoding='utf-8') as f:
+            f.write(market_context)
+        
+        # Add after-hours notice for display (but don't save it to file)
+        display_context = market_context
+        if is_after_hours():
+            display_context += "\n\n⚠️ PLEASE NOTE: THIS IS AFTER HOURS TRADING (Outside Regular Trading Hours 8:30 AM - 3:00 PM CT)"
+        
+        logging.info("=" * 80)
+        logging.info("UPDATED MARKET CONTEXT:")
+        logging.info("=" * 80)
+        logging.info(display_context)
+        logging.info("=" * 80)
+        logging.info(f"Market context saved to {context_file}")
+        logging.info("Context will be used in next trading job")
+        
+    except Exception as e:
+        logging.error(f"Error refreshing market context: {e}")
+        logging.exception("Full traceback:")
+
 def manual_job():
     logging.info("Manual screenshot triggered.")
     job(
@@ -2560,6 +2848,7 @@ def manual_job():
         execute_trades=EXECUTE_TRADES,
         telegram_config=TELEGRAM_CONFIG,
         no_new_trades_time=NO_NEW_TRADES_TIME,
+        no_new_trades_end_time=NO_NEW_TRADES_END_TIME,
         force_close_time=FORCE_CLOSE_TIME
     )
     logging.info("Manual job completed.")

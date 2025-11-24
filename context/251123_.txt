@@ -1,0 +1,23 @@
+Market Context (Nov 23, 2025):
+ES: Open 6654.75, Current 6653.25 (-1.50, -0.02%), Range 6652.75-6666.50
+5-Day Trend: UPTREND (+0.20%)
+VWAP (5-day): 6634.77 | Price is 18.48 pts BULLISH of VWAP
+VIX: 23.43 (-11.3%) - Elevated volatility
+
+Volume Profile (Top 5 levels from past 5 days):
+  1. 6685.29 pts (POC - Point of Control)
+  2. 6658.12 pts
+  3. 6609.22 pts
+  4. 6592.92 pts
+  5. 6576.62 pts
+
+Intraday 15m Volume Profile (Past 5 days, 276 bars):
+Intraday VWAP: 6642.20 | Price is 11.05 pts BULLISH
+Top 5 High Volume Zones:
+  1. 6658.12 pts (4.5% of volume) (Intraday POC)
+  2. 6652.69 pts (5.0% of volume)
+  3. 6647.26 pts (4.7% of volume)
+  4. 6641.82 pts (5.2% of volume)
+  5. 6636.39 pts (4.7% of volume)
+
+Key Levels: Support 6652.75, Resistance 6666.50

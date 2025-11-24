@@ -240,30 +240,16 @@ class MarketDataAnalyzer:
         
         Args:
             force_refresh: If True, fetch fresh data. If False, use cached data if available today.
+                          Note: Caching is now handled by screenshot_uploader.py, not here.
             
         Returns:
             str: Formatted market context string
         """
         try:
-            # Check if we have today's data already
-            today = datetime.now().strftime('%Y%m%d')
-            cache_file = os.path.join(self.data_folder, f"context_{today}.txt")
-            
-            if not force_refresh and os.path.exists(cache_file):
-                self.logger.info("Using cached market context")
-                with open(cache_file, 'r') as f:
-                    return f.read()
-            
             # Fetch ES data
             es_data = self.fetch_data(self.es_ticker)
             if es_data is None or es_data.empty:
-                # Try to use previous day's cached context if available
-                yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
-                yesterday_cache = os.path.join(self.data_folder, f"context_{yesterday}.txt")
-                if os.path.exists(yesterday_cache):
-                    self.logger.warning("Using yesterday's cached market context due to fetch failure")
-                    with open(yesterday_cache, 'r') as f:
-                        return f.read() + "\n\n[Note: Using previous day's data - current data unavailable]"
+                self.logger.error("Failed to fetch ES data from Yahoo Finance")
                 return "Market data unavailable - Yahoo Finance connection failed. Continue with manual analysis."
             
             # Fetch VIX data
@@ -286,6 +272,20 @@ class MarketDataAnalyzer:
             # High/Low for the day
             daily_high = float(es_data['High'].iloc[-1])
             daily_low = float(es_data['Low'].iloc[-1])
+            
+            # Gap detection (compare today's open to previous close)
+            gap_info = ""
+            if len(es_data) >= 2:
+                prev_close = float(es_data['Close'].iloc[-2])
+                gap_size = open_price - prev_close
+                gap_pct = (gap_size / prev_close) * 100
+                
+                if abs(gap_size) >= 5:  # Significant gap threshold (5 points)
+                    gap_direction = "GAP UP" if gap_size > 0 else "GAP DOWN"
+                    gap_info = f"{gap_direction}: {abs(gap_size):.2f} pts ({abs(gap_pct):.2f}%) from previous close {prev_close:.2f}"
+                elif abs(gap_size) >= 2:  # Minor gap
+                    gap_direction = "Minor gap up" if gap_size > 0 else "Minor gap down"
+                    gap_info = f"{gap_direction}: {abs(gap_size):.2f} pts ({abs(gap_pct):.2f}%)"
             
             # VWAP (using focus period)
             vwap = float(self.calculate_vwap(focus_data))
@@ -327,7 +327,13 @@ class MarketDataAnalyzer:
             
             # Format context
             context = f"""Market Context ({datetime.now().strftime('%b %d, %Y')}):
-ES: Open {open_price:.2f}, Current {current_price:.2f} ({daily_change:+.2f}, {daily_change_pct:+.2f}%), Range {daily_low:.2f}-{daily_high:.2f}
+ES: Open {open_price:.2f}, Current {current_price:.2f} ({daily_change:+.2f}, {daily_change_pct:+.2f}%), Range {daily_low:.2f}-{daily_high:.2f}"""
+            
+            # Add gap info if present
+            if gap_info:
+                context += f"\n{gap_info}"
+            
+            context += f"""
 5-Day Trend: {trend.upper()} ({five_day_pct:+.2f}%)
 VWAP ({self.focus_days}-day): {vwap:.2f} | Price is {abs(vwap_diff):.2f} pts {vwap_bias.upper()} of VWAP
 {vix_info}
@@ -367,10 +373,6 @@ Volume Profile (Top {self.volume_nodes} levels from past {self.focus_days} days)
             
             # Add key levels
             context += f"\n\nKey Levels: Support {daily_low:.2f}, Resistance {daily_high:.2f}"
-            
-            # Cache the context
-            with open(cache_file, 'w') as f:
-                f.write(context)
             
             self.logger.info("Generated market context successfully")
             return context

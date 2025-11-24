@@ -7,7 +7,7 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 
 ### Core Components
 
-1. **screenshot_uploader.py** (2544 lines)
+1. **screenshot_uploader.py** (2800+ lines)
    - Main trading bot that orchestrates the entire system
    - Runs as a Windows system tray application with scheduler
    - Captures screenshots of Bookmap chart at configurable intervals
@@ -16,21 +16,28 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
    - Handles both entry signals and position management (adjust/scale/close)
    - Logs all trades to monthly CSV files with full details
    - Sends Telegram notifications for all trade events
+   - Hot-reload configuration without restarting
+   - After-hours trading detection (RTH vs ETH)
+   - Overnight session support (handles time windows crossing midnight)
+   - API query optimization (only during trading hours)
 
-2. **market_data.py** (422 lines)
+2. **market_data.py** (420 lines)
    - Fetches ES futures and VIX data from Yahoo Finance
    - Calculates daily and intraday (15-minute) VWAP
    - Generates Volume Profile analysis (top 5 price levels)
+   - Detects gap-ups and gap-downs (2+ point threshold)
    - Creates formatted market context for LLM prompts
-   - Caches data to minimize API calls
+   - Pure data generation (caching handled by screenshot_uploader.py)
    - Can be run standalone or integrated into main system
 
-3. **config.ini** (136 lines)
+3. **config.ini** (142 lines)
    - Centralized configuration for all system components
    - Contains LLM prompts for different market scenarios
    - TopstepX API credentials and settings
    - Trading parameters (risk limits, contract size, etc.)
    - Market data settings (tickers, intervals, analysis parameters)
+   - Time window controls (no_new_trades_time, force_close_time)
+   - Hot-reloadable without restarting the application
 
 ### PowerShell Scripts
 
@@ -49,14 +56,19 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 
 ### 2. Market Context Integration
 - Automatically fetches daily market data before trading
+- Detects and reports gap-ups/gap-downs (2+ points significant)
 - Provides LLM with comprehensive context including:
   - Current ES price, daily range, 5-day trend
+  - Gap detection (previous close comparison)
   - VWAP (5-day) and current price relationship
   - VIX volatility level and change
   - Volume Profile top 5 levels (Point of Control)
   - Intraday 15-minute volume profile and VWAP
   - Key support/resistance levels
+  - After-hours trading notice (outside RTH: 9:30 AM - 4:00 PM ET)
 - Context updates dynamically throughout the day based on LLM observations
+- Unified storage in `context/YYMMDD.txt` (single source of truth)
+- On-demand refresh via tray menu
 
 ### 3. Robust Position Management
 - Tracks active positions with unique trade IDs
@@ -100,11 +112,14 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 - Windows system tray icon with menu
 - Functions accessible via right-click:
   - Start/Stop scheduler
+  - **Reload Config** - Hot-reload config.ini without restart
+  - **Refresh Market Context** - Fetch latest market data on demand
   - Take manual screenshot
-  - Set position type
+  - Set position type (None/Long/Short)
   - Toggle LLM/Trading
-  - Test API connections
-  - View contract info
+  - Select account
+  - Test API connections (positions, orders)
+  - List all available contracts
   - Exit application
 
 ## Configuration Highlights
@@ -112,7 +127,10 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 ### General Settings
 - `interval_minutes`: How often to take screenshots (default: 1)
 - `trade_status_check_interval`: How often to check positions (default: 15s)
-- `begin_time`/`end_time`: Trading hours window
+- `begin_time`/`end_time`: Trading hours window (supports overnight sessions)
+- `no_new_trades_time`: Stop opening new positions at this time
+- `no_new_trades_end_time`: Resume trading after this time
+- `force_close_time`: Force close all positions at this time (only if within session)
 - `window_title`: thinkorswim window to capture
 - `enable_llm`: Enable/disable AI analysis
 - `enable_trading`: Enable/disable actual trade execution
@@ -144,19 +162,21 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 
 ### Morning (Before Market Open)
 1. System starts via `start_trading.ps1`
-2. Checks for today's market context in `market_data/context_YYYYMMDD.txt`
+2. Checks for today's market context in `context/YYMMDD.txt`
 3. If missing, automatically fetches from Yahoo Finance:
    - 30 days ES daily data
    - 5 days ES 15-minute intraday data
    - 5 days VIX data
-4. Calculates VWAP and Volume Profile
+4. Calculates VWAP, Volume Profile, and gap analysis
 5. Generates and caches market context
 6. Authenticates with TopstepX API
+7. Detects if trading during after-hours (ETH) and adds notice
 
 ### During Trading Hours
 1. Every minute (configurable):
    - Captures screenshot of Bookmap window
-   - Queries current position status via API
+   - Queries current position status via API (only during trading hours)
+   - Appends after-hours notice to context if outside RTH
    - If no position: Analyzes for entry opportunities
    - If position exists: Manages position (adjust stops, scale, or close)
 2. Sends screenshot + market context + prompt to GPT-4o
@@ -165,6 +185,7 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 5. Logs trade event to CSV and daily log
 6. Sends Telegram notification
 7. Updates market context if LLM provides new insights
+8. No-new-trades window respected (stops entries between configured times)
 
 ### Position Management Cycle (Every 15s)
 - Checks if position is still active
@@ -173,13 +194,17 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 - LLM can recommend: hold, adjust stops/targets, scale out, or close
 - System executes recommended actions
 
-### After Hours
-- System stops taking screenshots (outside time range)
+### After Hours / Outside Trading Window
+- System stops taking screenshots (outside configured time range)
+- API queries paused (no unnecessary position checks)
 - All data preserved in folders:
   - `logs/` - Daily execution logs
   - `trades/` - Monthly CSV files
   - `screenshots/` - Captured images
-  - `market_data/` - Historical price data and context cache
+  - `context/` - Daily market context
+  - `market_data/` - Historical price data cache
+- Config can be modified and hot-reloaded via tray menu
+- Market context can be refreshed on demand for next session
 
 ## Data Storage Structure
 
@@ -201,12 +226,13 @@ ESTrader/
 ├── trades/                      # Trade logs and active trade tracking
 │   ├── active_trade.json       # Current position info
 │   └── trades_YYYYMM.csv       # Monthly trade journal
-├── market_data/                 # Yahoo Finance data cache
+├── context/                     # Daily market context (unified storage)
+│   ├── 251123.txt              # Today's context (YYMMDD format)
+│   └── ...
+├── market_data/                 # Yahoo Finance raw data cache
 │   ├── ES_F_YYYYMMDD.csv       # Daily ES data
 │   ├── ES_F_15m_YYYYMMDD.csv   # Intraday 15m ES data
-│   ├── VIX_YYYYMMDD.csv        # VIX data
-│   └── context_YYYYMMDD.txt    # Generated market context
-├── context/                     # Active context (legacy folder)
+│   └── VIX_YYYYMMDD.csv        # VIX data
 └── venv/                        # Python virtual environment
 ```
 
@@ -275,21 +301,51 @@ All stored in `config.ini` (already configured).
 
 ## Current Status
 
-Based on git status:
-- Modified: config.ini, requirements.txt, screenshot_uploader.py
-- New files: Market data integration (market_data.py, MARKET_DATA_GUIDE.md, etc.)
+Based on recent changes:
+- Core files: screenshot_uploader.py (2800+ lines), market_data.py (420 lines), config.ini (142 lines)
+- Market data integration: Fully operational with gap detection
+- Context storage: Unified in `context/YYMMDD.txt` directory
 - Trading account: TopstepX account #14664776
 - Contract: ES December 2025 (CON.F.US.EP.Z25)
 - Position size: 2 contracts
-- Currently not tracking any active position (context/ is empty)
+- Features: Hot-reload, after-hours detection, overnight sessions, API optimization
+- Menu: Enhanced tray icon with config reload and context refresh options
+
+## Recent Enhancements (November 2025)
+
+### Context Management Improvements
+- **Unified storage**: Single source of truth in `context/YYMMDD.txt`
+- **Gap detection**: Automatically identifies gap-ups/gap-downs (2+ point threshold)
+- **After-hours notices**: Automatically appended when trading outside RTH (9:30 AM - 4:00 PM ET)
+- **On-demand refresh**: Tray menu option to fetch latest market data anytime
+- **Fallback logic**: Uses yesterday's context if current fetch fails
+
+### Configuration & Control
+- **Hot-reload**: Modify config.ini and reload via tray menu without restart
+- **Time windows**: Support for no-new-trades windows with resume time
+- **Overnight sessions**: Properly handles trading windows that cross midnight (e.g., 18:00-23:59)
+- **Force close logic**: Only applies if within the current trading session
+
+### Performance Optimizations
+- **Smart API queries**: Position/order checks only run during trading hours
+- **Reduced overhead**: No unnecessary API calls outside configured windows
+- **Trade monitoring**: Background thread respects trading hours
+
+### Enhanced Menu
+- New tray menu items for config reload and market context refresh
+- All system controls accessible without restart
+- Quick access to testing and diagnostic functions
 
 ## Notes for Future Sessions
 
 1. The system has been enhanced with comprehensive market data integration
-2. LLM now receives rich market context (VWAP, volume profile, VIX, trend)
+2. LLM now receives rich market context (VWAP, volume profile, VIX, trend, gaps)
 3. Both daily and intraday (15m) analysis is provided
 4. Context updates dynamically as LLM observes intraday changes
 5. All trades are logged to CSV with full details for analysis
 6. System can run fully automated during configured trading hours
 7. Telegram notifications keep you informed of all trade activity
+8. Hot-reload capability allows config changes without downtime
+9. After-hours trading is automatically detected and communicated to LLM
+10. Context management is unified with fallback mechanisms for reliability
 

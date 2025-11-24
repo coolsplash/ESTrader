@@ -1,0 +1,144 @@
+[General]
+interval_minutes = 1
+; Interval in seconds to check trade status (how often to check if trades are still active)
+trade_status_check_interval = 15
+begin_time = 00:00
+end_time = 23:59
+; Stop opening new positions at this time (format: HH:MM)
+no_new_trades_time = 15:45
+no_new_trades_end_time = 18:00
+; Force close all open positions at this time (format: HH:MM)
+force_close_time = 15:50
+window_title = Main@thinkorswim
+top_offset = 85
+bottom_offset = 0
+save_folder = screenshots
+log_folder = logs
+enable_llm = true
+enable_trading = true
+execute_trades = true
+enable_save_screenshots = true
+
+[LLM]
+symbol = CON.F.US.EP.Z25
+display_symbol = ES
+position_type = none
+no_position_prompt = You are an elite ES futures trader specializing in high-probability entries using Bookmap heatmap, order flow, and volume. Your task is to analyze the attached Bookmap screenshot and determine the optimal action: buy, sell, or hold.
+	Your analysis must consider:
+	- Liquidity zones and heatmap absorption/icebergs
+	- Order book imbalance
+	- Volume delta and sweeps
+	- Momentum shifts and exhaustion
+	- Retests of key liquidity levels
+	- Market structure eg. higher/lower highs/lows
+    - We are looking for a trade that we can hold for up to several hours and ride for 20+ points if possible. If you can get a better entry by waiting a few minutes, wait for the better entry.
+    - We need to place a market order, so only give us a buy or sell signal if its ready right now.  
+	- The following is context for the day.
+
+	{Context}
+
+	Your response must ALWAYS be valid JSON in this exact format:
+	
+	""action"": ""buy"" | ""sell"" | ""hold"",
+	""entry_price"": number,
+	""price_target"": number,
+	""stop_loss"": number,
+	""confidence"": 0-100,
+	""reasoning"": ""Short explanation summarizing the order flow evidence""
+	""context"": ""Short explanation summarizing the market context. Keep original context sent above, but modify as needed with relevant up-to-date information as you see fit""
+	
+	Additional rules:
+	- Keep tight stops and try to maximize profits. Aim for 4-6 point max stop and 20+ points for take profit as long as that is reasonable from the data.
+    - Keep the reasoning to 1 to 3 sentences max.
+	- Use the screenshot only. Do not hallucinate data.
+	- For hold set entry_price, price_target, and stop_loss to null.
+	- You do not have to trade. Only trade when there is a clear and confident opportunity.
+
+position_prompt = You are an expert ES futures trader. I am currently in a {position_type} position. Position details: Size={size} contracts, Entry Price={average_price}, Current Stop Loss={current_stop_loss}, Current Take Profit={current_take_profit}, Unrealized P&L={unrealized_pnl}. The following is context for the day. Return it back to me updated with adding or removing relevant up-to-date information as you see fit.
+	{Context}
+
+	Analyze the attached Bookmap screenshot for {symbol} futures and advise: hold, adjust, scale, or close. Actions: 'hold' (keep position as-is), 'adjust' (modify stop loss and/or price target), 'scale' (partially close position), 'close' (exit entire position). Always provide price_target and stop_loss numbers even if you recommend holding. Move stops to break even or into profit once those options make sense, but dont be super aggressive and lose the trade. We dont want to hold unnecessary risk. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/adjust/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text", "context": "Short explanation summarizing the market context. Keep original context sent above, but modify as needed"}}Analyze the attached Bookmap screenshot for {symbol} futures and advise: hold, adjust, scale, or close. Actions: 'hold' (keep position as-is), 'adjust' (modify stop loss and/or price target), 'scale' (partially close position), 'close' (exit entire position). Always provide price_target and stop_loss numbers even if you recommend holding. If we have made significant progress and there is risk of giving back our profits and going green to red, move stops to break even or into profit if that is sensible, but dont be very aggressive as often we lose by adjusting too early. Regarding your overall analyis, explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/adjust/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text", "context": "Short explanation summarizing the market context. Keep original context sent above, but modify as needed"}}
+
+long_position_prompt = You are an expert ES futures trader. I am currently in a long position. Analyze this Bookmap screenshot for a long position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}
+short_position_prompt = You are an expert ES futures trader and can make millions by analyzing a chart. Analyze this Bookmap screenshot for a short position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}
+model = gpt-4o
+
+[Topstep]
+api_key = YOUR_TOPSTEP_EMAIL
+user_name = YOUR_TOPSTEP_EMAIL
+api_secret = YOUR_TOPSTEP_API_SECRET
+; API Base URL
+base_url = https://api.topstepx.com
+; Endpoint for authentication (POST with userName and apiKey)
+login_endpoint = /api/Auth/loginKey
+; Endpoint for placing orders (POST with accountId, contractId, type, side, size, brackets)
+; type: 2 = Market order (immediate execution at current market price)
+buy_endpoint = /api/Order/place
+sell_endpoint = /api/Order/place
+; Endpoint for flattening all positions
+flatten_endpoint = /positions/flatten
+; Endpoint for getting open positions (POST with accountId)
+positions_endpoint = /api/Position/searchOpen
+; Endpoint for getting working orders (POST with accountId)
+working_orders_endpoint = /api/Order/searchOpen
+; Endpoint for canceling an order (POST with orderId)
+cancel_order_endpoint = /api/Order/cancel
+; Endpoint for modifying an order (POST with accountId, orderId, stopPrice or limitPrice)
+modify_order_endpoint = /api/Order/modify
+; Endpoint for searching accounts (POST with onlyActiveAccounts)
+accounts_endpoint = /api/Account/search
+; Endpoint for searching contracts (POST with searchText and live)
+contracts_endpoint = /api/Contract/search
+; Endpoint for getting all available contracts (POST with live)
+contracts_available_endpoint = /api/Contract/available
+; Endpoint for searching trades (POST with accountId, startTimestamp, endTimestamp)
+trade_search_endpoint = /api/Trade/search
+account_id = YOUR_ACCOUNT_ID
+contract_id = CON.F.US.EP.Z25
+quantity = 2
+contract_to_search = E-Mini S&P 500
+; Maximum risk per contract in points/ticks (leave empty to use LLM suggestions)
+max_risk_per_contract = 8
+; Maximum profit target per contract in points/ticks (leave empty to use LLM suggestions)
+max_profit_per_contract = 30
+; Enable stop loss orders (true/false)
+enable_stop_loss = false
+; Enable take profit orders (true/false)
+enable_take_profit = false
+; Tick size for the contract (e.g., 0.25 for ES)
+tick_size = 0.25
+
+[OpenAI]
+api_key = YOUR_OPENAI_API_KEY
+api_url = https://api.openai.com/v1/chat/completions
+
+[Telegram]
+telegram_api_key = YOUR_TELEGRAM_BOT_TOKEN
+telegram_chat_id = YOUR_TELEGRAM_CHAT_ID
+
+[MarketData]
+; Yahoo Finance ticker for ES futures
+es_ticker = ES=F
+; Yahoo Finance ticker for VIX
+vix_ticker = ^VIX
+; Number of historical days to fetch
+historical_days = 30
+; Number of recent days to focus on for volume profile
+focus_days = 5
+; Number of top volume levels to identify
+volume_nodes = 5
+; Folder to store market data
+data_folder = market_data
+; Enable automatic market data fetch at start of trading day
+enable_auto_fetch = true
+; Time to fetch market data (HH:MM format, before market open)
+fetch_time = 08:00
+; Enable intraday 15-minute data and volume profile
+enable_intraday = true
+; Intraday interval (5m, 15m, 30m, 1h)
+intraday_interval = 15m
+; Number of intraday days to fetch (max 60 for 15m intervals)
+intraday_days = 5
+; Number of intraday volume nodes to identify
+intraday_volume_nodes = 5
+

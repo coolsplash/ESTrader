@@ -1,1 +1,0 @@
-Market data unavailable - Yahoo Finance connection failed. Continue with manual analysis.

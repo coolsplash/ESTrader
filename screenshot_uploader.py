@@ -24,18 +24,13 @@ import sys
 import ctypes
 import urllib.parse  # For Telegram URL encoding
 import csv
-import uuid
 from market_data import MarketDataAnalyzer
-
-def generate_trade_id():
-    """Generate a unique trade ID."""
-    return str(uuid.uuid4())[:8]
 
 def get_active_trade_info():
     """Get the current active trade info from file.
     
     Returns:
-        dict: {'trade_id': str, 'entry_price': float, 'position_type': str} or None
+        dict: {'order_id': int, 'entry_price': float, 'position_type': str, 'entry_timestamp': str} or None
     """
     try:
         trade_info_file = os.path.join('trades', 'active_trade.json')
@@ -47,21 +42,29 @@ def get_active_trade_info():
         logging.error(f"Error reading active trade info: {e}")
         return None
 
-def get_active_trade_id():
-    """Get the current active trade ID from file."""
+def get_active_order_id():
+    """Get the current active order ID from file."""
     info = get_active_trade_info()
-    return info['trade_id'] if info else None
+    return info['order_id'] if info else None
 
-def save_active_trade_info(trade_id, entry_price, position_type):
-    """Save the active trade info to file."""
+def save_active_trade_info(order_id, entry_price, position_type, entry_timestamp=None):
+    """Save the active trade info to file.
+    
+    Args:
+        order_id: TopstepX order ID
+        entry_price: Entry price
+        position_type: 'long' or 'short'
+        entry_timestamp: ISO timestamp of entry (defaults to now)
+    """
     try:
         trades_folder = 'trades'
         os.makedirs(trades_folder, exist_ok=True)
         trade_info_file = os.path.join(trades_folder, 'active_trade.json')
         trade_info = {
-            'trade_id': trade_id,
+            'order_id': order_id,
             'entry_price': float(entry_price),
-            'position_type': position_type
+            'position_type': position_type,
+            'entry_timestamp': entry_timestamp or datetime.datetime.now().isoformat()
         }
         with open(trade_info_file, 'w') as f:
             json.dump(trade_info, f)
@@ -81,7 +84,7 @@ def clear_active_trade_info():
 
 def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=None, take_profit=None, 
                     reasoning=None, confidence=None, profit_loss=None, profit_loss_points=None, 
-                    balance=None, market_context=None, trade_id=None, entry_price=None):
+                    balance=None, market_context=None, order_id=None, entry_price=None):
     """Log a trade event to the monthly CSV file.
     
     Args:
@@ -98,24 +101,24 @@ def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=No
         profit_loss_points: P&L in points
         balance: Account balance after event
         market_context: Market context at time of event
-        trade_id: Trade ID (will be generated if None for ENTRY events)
+        order_id: TopstepX order ID (required for ENTRY, retrieved from file for other events)
         entry_price: Original entry price (for calculating P&L on exit)
     
     Returns:
-        str: The trade_id used
+        int: The order_id used
     """
     try:
-        # Generate or get trade ID
+        # Get or use order ID
         if event_type == "ENTRY":
-            if trade_id is None:
-                trade_id = generate_trade_id()
-            save_active_trade_info(trade_id, price, position_type)
+            if order_id is None:
+                logging.error("No order ID provided for ENTRY event")
+                order_id = "UNKNOWN"
         else:
-            if trade_id is None:
-                trade_id = get_active_trade_id()
-                if trade_id is None:
-                    logging.error("No active trade ID found for non-ENTRY event")
-                    trade_id = "UNKNOWN"
+            if order_id is None:
+                order_id = get_active_order_id()
+                if order_id is None:
+                    logging.error("No active order ID found for non-ENTRY event")
+                    order_id = "UNKNOWN"
         
         # Prepare timestamp info
         now = datetime.datetime.now()
@@ -134,7 +137,7 @@ def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=No
         
         # Prepare row data
         row = {
-            'trade_id': trade_id,
+            'order_id': order_id,
             'timestamp': timestamp,
             'date': date,
             'time': time_str,
@@ -157,7 +160,7 @@ def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=No
         
         # Write to CSV
         with open(csv_file, 'a', newline='', encoding='utf-8') as f:
-            fieldnames = ['trade_id', 'timestamp', 'date', 'time', 'event_type', 'symbol', 'position_type', 
+            fieldnames = ['order_id', 'timestamp', 'date', 'time', 'event_type', 'symbol', 'position_type', 
                          'size', 'price', 'entry_price', 'stop_loss', 'take_profit', 'reasoning', 'confidence',
                          'profit_loss', 'profit_loss_points', 'balance', 'success', 'market_context']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -168,13 +171,13 @@ def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=No
             
             writer.writerow(row)
         
-        logging.info(f"Logged {event_type} event to {csv_file}: trade_id={trade_id}, price={price}")
+        logging.info(f"Logged {event_type} event to {csv_file}: order_id={order_id}, price={price}")
         
         # Clear trade info if position fully closed
         if event_type == "CLOSE":
             clear_active_trade_info()
         
-        return trade_id
+        return order_id
         
     except Exception as e:
         logging.error(f"Error logging trade event: {e}")
@@ -631,47 +634,84 @@ def close_position(position_details, topstep_config, enable_trading, auth_token=
             # Get updated account balance
             balance = get_account_balance(account_id, topstep_config, True, auth_token)
             
-            # Get trade info to calculate P&L
+            # Get trade info to fetch actual P&L from API
             trade_info = get_active_trade_info()
-            exit_price = 0  # We don't know exact fill price from market order, estimate from avg_price or use 0
-            profit_loss = None
-            profit_loss_points = None
+            
+            # Fetch actual trade results from API
+            net_pnl = None
+            total_fees = None
+            pnl_points = None
+            entry_price = None
             
             if trade_info:
                 entry_price = trade_info.get('entry_price')
-                if entry_price and avg_price:
-                    # Calculate P&L
-                    if position_type == 'long':
-                        profit_loss_points = float(exit_price if exit_price else avg_price) - float(entry_price)
-                    else:  # short
-                        profit_loss_points = float(entry_price) - float(exit_price if exit_price else avg_price)
+                entry_timestamp = trade_info.get('entry_timestamp')
+                
+                # Fetch trade results from API
+                if entry_timestamp:
+                    start_time = entry_timestamp
+                else:
+                    # Fallback to today's start if no timestamp
+                    start_time = datetime.datetime.now().replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+                
+                end_time = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+                
+                trades = fetch_trade_results(
+                    account_id,
+                    topstep_config,
+                    True,
+                    auth_token,
+                    start_time,
+                    end_time
+                )
+                
+                if trades:
+                    # Calculate net P&L from all fills
+                    total_pnl = sum(trade.get('profitAndLoss', 0) for trade in trades)
+                    total_fees = sum(trade.get('fees', 0) for trade in trades)
+                    net_pnl = total_pnl - total_fees
                     
-                    # Assuming ES multiplier of $50 per point
-                    profit_loss = profit_loss_points * 50 * size
+                    # Calculate P&L in points (assuming ES multiplier of $50 per point)
+                    pnl_points = net_pnl / 50 if net_pnl else 0
+                    
+                    logging.info(f"Fetched actual trade results: Net P&L=${net_pnl:.2f}, Fees=${total_fees:.2f}, Points={pnl_points:+.2f}")
             
-            # Log CLOSE event to CSV
+            # Log CLOSE event to CSV with actual P&L
             log_trade_event(
                 event_type="CLOSE",
                 symbol=symbol,
                 position_type=position_type,
                 size=size,
-                price=exit_price if exit_price else avg_price,
+                price=0,  # Exit price not available from close order
                 reasoning=reasoning,
-                profit_loss=profit_loss,
-                profit_loss_points=profit_loss_points,
+                profit_loss=net_pnl,
+                profit_loss_points=pnl_points,
                 balance=balance,
                 market_context=market_context,
-                entry_price=trade_info.get('entry_price') if trade_info else None
+                order_id=trade_info.get('order_id') if trade_info else None,
+                entry_price=entry_price
             )
             
-            # Send Telegram notification
+            # Build Telegram notification with P&L
+            is_success = net_pnl > 0 if net_pnl is not None else None
+            emoji = "✅" if is_success else "❌" if is_success is False else "🔴"
+            result_text = "PROFIT" if is_success else "LOSS" if is_success is False else "CLOSED"
+            
             telegram_msg = (
-                f"🔴 <b>POSITION CLOSED</b>\n"
+                f"{emoji} <b>POSITION {result_text}</b>\n"
                 f"Type: {position_type.upper()}\n"
                 f"Size: {size} contract(s)\n"
                 f"Symbol: {symbol}\n"
-                f"Entry Price: {avg_price}\n"
             )
+            
+            if entry_price:
+                telegram_msg += f"Entry Price: {entry_price}\n"
+            
+            if net_pnl is not None:
+                telegram_msg += f"P&L: ${net_pnl:+,.2f} ({pnl_points:+.2f} pts)\n"
+            
+            if total_fees is not None:
+                telegram_msg += f"Fees: ${total_fees:.2f}\n"
             
             if balance is not None:
                 telegram_msg += f"💰 Balance: ${balance:,.2f}\n"
@@ -861,6 +901,8 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
                 logging.warning("No take profit order ID found - cannot modify")
         
         # Log ADJUSTMENT event to CSV
+        # Get order_id from active trade info
+        trade_info = get_active_trade_info()
         log_trade_event(
             event_type="ADJUSTMENT",
             symbol=symbol,
@@ -870,7 +912,8 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
             stop_loss=new_stop_loss,
             take_profit=new_price_target,
             reasoning=reasoning,
-            market_context=market_context
+            market_context=market_context,
+            order_id=trade_info.get('order_id') if trade_info else None
         )
         
         logging.info("=" * 80)
@@ -883,6 +926,8 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
 
 def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_time='23:59', no_new_trades_end_time='23:59', force_close_time='23:59'):
     """The main job to run periodically."""
+    global PREVIOUS_POSITION_TYPE
+    
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
         return
@@ -907,6 +952,99 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 symbol, topstep_config, enable_trading, auth_token, return_details=True
             )
             logging.info(f"Determined current position_type: {current_position_type}")
+            
+            # Detect if position changed from active to closed
+            if PREVIOUS_POSITION_TYPE in ['long', 'short'] and current_position_type == 'none':
+                logging.info(f"Position changed from {PREVIOUS_POSITION_TYPE} to none - Fetching trade results")
+                trade_info = get_active_trade_info()
+                if trade_info:
+                    # Fetch trade results from API
+                    entry_timestamp = trade_info.get('entry_timestamp')
+                    if entry_timestamp:
+                        start_time = entry_timestamp
+                    else:
+                        # Fallback to today's start if no timestamp
+                        start_time = datetime.datetime.now().replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    
+                    end_time = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    
+                    trades = fetch_trade_results(
+                        topstep_config['account_id'],
+                        topstep_config,
+                        enable_trading,
+                        auth_token,
+                        start_time,
+                        end_time
+                    )
+                    
+                    if trades:
+                        # Calculate net P&L from all fills
+                        total_pnl = sum(trade.get('profitAndLoss', 0) for trade in trades)
+                        total_fees = sum(trade.get('fees', 0) for trade in trades)
+                        net_pnl = total_pnl - total_fees
+                        
+                        # Get entry price and position details
+                        entry_price = trade_info.get('entry_price', 0)
+                        trade_position_type = trade_info.get('position_type', PREVIOUS_POSITION_TYPE)
+                        
+                        # Calculate P&L in points (assuming ES multiplier of $50 per point)
+                        pnl_points = net_pnl / 50 if net_pnl else 0
+                        
+                        # Determine success/failure
+                        is_success = net_pnl > 0
+                        emoji = "✅" if is_success else "❌"
+                        result_text = "PROFIT" if is_success else "LOSS"
+                        
+                        logging.info(f"="*80)
+                        logging.info(f"TRADE CLOSED - {result_text}")
+                        logging.info(f"Position: {trade_position_type.upper()}")
+                        logging.info(f"Entry Price: {entry_price}")
+                        logging.info(f"Net P&L: ${net_pnl:.2f} ({pnl_points:+.2f} pts)")
+                        logging.info(f"Fees: ${total_fees:.2f}")
+                        logging.info(f"Total Fills: {len(trades)}")
+                        logging.info(f"="*80)
+                        
+                        # Get updated balance
+                        balance = get_account_balance(topstep_config['account_id'], topstep_config, enable_trading, auth_token)
+                        
+                        # Log CLOSE event with actual P&L
+                        log_trade_event(
+                            event_type="CLOSE",
+                            symbol=symbol,
+                            position_type=trade_position_type,
+                            size=topstep_config.get('quantity', 0),
+                            price=0,  # Exit price not available from trade results
+                            reasoning="Position closed - fetched actual results from API",
+                            profit_loss=net_pnl,
+                            profit_loss_points=pnl_points,
+                            balance=balance,
+                            market_context=daily_context,
+                            order_id=trade_info.get('order_id'),
+                            entry_price=entry_price
+                        )
+                        
+                        # Send Telegram notification
+                        telegram_msg = (
+                            f"{emoji} <b>TRADE CLOSED - {result_text}</b>\n"
+                            f"Position: {trade_position_type.upper()}\n"
+                            f"Entry Price: {entry_price}\n"
+                            f"P&L: ${net_pnl:+,.2f} ({pnl_points:+.2f} pts)\n"
+                            f"Fees: ${total_fees:.2f}\n"
+                        )
+                        
+                        if balance is not None:
+                            telegram_msg += f"💰 Balance: ${balance:,.2f}\n"
+                        
+                        telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        
+                        send_telegram_message(telegram_msg, telegram_config)
+                    else:
+                        logging.warning("Could not fetch trade results from API")
+                else:
+                    logging.warning("No active trade info found for closed position")
+            
+            # Update previous position type
+            PREVIOUS_POSITION_TYPE = current_position_type
         else:
             # Outside trading hours - assume no position and skip API queries
             logging.info(f"Outside trading hours ({begin_time}-{end_time}) - Skipping position queries")
@@ -1176,17 +1314,10 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
     
     Args:
         return_details: If True, returns (position_type, position_details, working_orders) tuple instead of just position_type
-    """
-    # Fetch working orders if return_details is True
-    working_orders = None
-    if return_details:
-        logging.info(f"get_current_position called with return_details=True, enable_trading={enable_trading}, auth_token={'present' if auth_token else 'None'}")
-        if enable_trading and auth_token:
-            logging.info("Fetching working orders alongside position...")
-            working_orders = get_working_orders(topstep_config, enable_trading, auth_token)
-        else:
-            logging.warning(f"Skipping working orders fetch - enable_trading={enable_trading}, auth_token={'present' if auth_token else 'None'}")
     
+    Note:
+        Working orders are only fetched if an active position exists (optimization to reduce API calls)
+    """
     if not enable_trading:
         logging.info("Trading disabled - Mock positions query: Returning 'none'")
         return ('none', None, None) if return_details else 'none'
@@ -1239,13 +1370,13 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
         # Handle different response formats
         if isinstance(positions, str):
             logging.error(f"Unexpected string response from positions API: {positions}")
-            return ('none', None, working_orders) if return_details else 'none'
+            return ('none', None, None) if return_details else 'none'
         
         # If response is a list of positions
         if isinstance(positions, list):
             if len(positions) == 0:
                 logging.info("No positions found (empty list)")
-                return ('none', None, working_orders) if return_details else 'none'
+                return ('none', None, None) if return_details else 'none'
             
             for pos in positions:
                 if not isinstance(pos, dict):
@@ -1260,12 +1391,12 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                     if quantity > 0:
                         return ('long', None) if return_details else 'long'
                     elif quantity < 0:
-                        return ('short', None) if return_details else 'short'
+                        return ('short', None, None) if return_details else 'short'
                     else:
-                        return ('none', None, working_orders) if return_details else 'none'
+                        return ('none', None, None) if return_details else 'none'
             
             logging.info(f"No matching position found for symbol {symbol}")
-            return ('none', None, working_orders) if return_details else 'none'
+            return ('none', None, None) if return_details else 'none'
         
         # If response is a single dict (not a list)
         elif isinstance(positions, dict):
@@ -1276,7 +1407,7 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                 
                 if len(positions_list) == 0:
                     logging.info("No positions found (empty positions list)")
-                    return ('none', None, working_orders) if return_details else 'none'
+                    return ('none', None, None) if return_details else 'none'
                 
                 # Log all positions for debugging
                 logging.info("DEBUG: All positions in response:")
@@ -1331,17 +1462,24 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                         }
                         
                         logging.info(f"Returning '{position_type_str}' (type={position_type_code}, size={abs(quantity)})")
+                        
+                        # Fetch working orders only if position exists and details requested
+                        working_orders = None
+                        if return_details and enable_trading and auth_token:
+                            logging.info("Active position detected - fetching working orders")
+                            working_orders = get_working_orders(topstep_config, enable_trading, auth_token)
+                        
                         return (position_type_str, position_details, working_orders) if return_details else position_type_str
                 
                 logging.info(f"No matching position found for symbol {symbol} in positions list")
-                return ('none', None, working_orders) if return_details else 'none'
+                return ('none', None, None) if return_details else 'none'
             
             # Check if it's a wrapper with a 'data' key
             elif 'data' in positions and isinstance(positions['data'], list):
                 positions_list = positions['data']
                 if len(positions_list) == 0:
                     logging.info("No positions found (empty data list)")
-                    return ('none', None, working_orders) if return_details else 'none'
+                    return ('none', None, None) if return_details else 'none'
                 
                 for pos in positions_list:
                     if not isinstance(pos, dict):
@@ -1380,10 +1518,16 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                             'rawPosition': pos
                         }
                         
+                        # Fetch working orders only if position exists and details requested
+                        working_orders = None
+                        if return_details and enable_trading and auth_token:
+                            logging.info("Active position detected - fetching working orders")
+                            working_orders = get_working_orders(topstep_config, enable_trading, auth_token)
+                        
                         return (position_type_str, position_details, working_orders) if return_details else position_type_str
                 
                 logging.info(f"No matching position found for symbol {symbol} in data list")
-                return ('none', None, working_orders) if return_details else 'none'
+                return ('none', None, None) if return_details else 'none'
             
             # Check if it's a single position object
             else:
@@ -1421,31 +1565,37 @@ def get_current_position(symbol, topstep_config, enable_trading, auth_token=None
                         'rawPosition': positions
                     }
                     
-                    return (position_type_str, position_details) if return_details else position_type_str
+                    # Fetch working orders only if position exists and details requested
+                    working_orders = None
+                    if return_details and enable_trading and auth_token:
+                        logging.info("Active position detected - fetching working orders")
+                        working_orders = get_working_orders(topstep_config, enable_trading, auth_token)
+                    
+                    return (position_type_str, position_details, working_orders) if return_details else position_type_str
                 else:
                     logging.info(f"No positions found - response indicates no open positions")
-                    return ('none', None, working_orders) if return_details else 'none'
+                    return ('none', None, None) if return_details else 'none'
         
         else:
             logging.error(f"Unexpected positions response type: {type(positions)}")
-            return ('none', None, working_orders) if return_details else 'none'
+            return ('none', None, None) if return_details else 'none'
             
     except requests.exceptions.Timeout:
         logging.error("Positions query timed out")
-        return ('none', None, working_orders) if return_details else 'none'
+        return ('none', None, None) if return_details else 'none'
     except requests.exceptions.RequestException as e:
         logging.error(f"Error querying positions: {e}")
         if hasattr(e, 'response') and e.response is not None:
             logging.error(f"Error response: {e.response.text}")
-        return ('none', None, working_orders) if return_details else 'none'
+        return ('none', None, None) if return_details else 'none'
     except json.JSONDecodeError as e:
         logging.error(f"Failed to parse positions response as JSON: {e}")
         logging.error(f"Raw response: {response.text}")
-        return ('none', None, working_orders) if return_details else 'none'
+        return ('none', None, None) if return_details else 'none'
     except Exception as e:
         logging.error(f"Unexpected error querying positions: {e}")
         logging.exception("Full traceback:")
-        return ('none', None, working_orders) if return_details else 'none'
+        return ('none', None, None) if return_details else 'none'
 
 def check_active_trades(topstep_config, enable_trading, auth_token=None):
     """Check if there are any active open positions - returns True if positions are active."""
@@ -1465,9 +1615,6 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
         return False
     
     logging.debug(f"DEBUG: Checking active trades for account {account_id}")
-    
-    # Also fetch and log working orders
-    working_orders = get_working_orders(topstep_config, enable_trading, auth_token)
 
     headers = {
         "Authorization": f"Bearer {auth_token}",
@@ -1479,7 +1626,7 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
     }
 
     try:
-        # Check for active positions
+        # Check for active positions FIRST
         positions_endpoint = topstep_config.get('positions_endpoint', '/positions')
         positions_url = base_url + positions_endpoint
         
@@ -1503,6 +1650,9 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
             logging.error(f"Unexpected string response from positions API: {positions}")
             return False
         
+        # Track if we found any active positions
+        has_active_position = False
+        
         # If positions is a list and has any items with non-zero quantity, we have active trades
         if isinstance(positions, list) and len(positions) > 0:
             for pos in positions:
@@ -1514,7 +1664,8 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
                 if quantity != 0:
                     symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract', 'Unknown')
                     logging.info(f"Active position found: {symbol} with quantity {quantity}")
-                    return True
+                    has_active_position = True
+                    break
         
         # If response is a single dict with positions data
         elif isinstance(positions, dict):
@@ -1532,7 +1683,8 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
                     
                     if quantity != 0:
                         logging.info(f"Active position found: {symbol} with quantity {quantity}")
-                        return True
+                        has_active_position = True
+                        break
             # Check for 'data' key
             elif 'data' in positions and isinstance(positions['data'], list):
                 for pos in positions['data']:
@@ -1542,7 +1694,14 @@ def check_active_trades(topstep_config, enable_trading, auth_token=None):
                     if quantity != 0:
                         symbol = pos.get('symbol') or pos.get('contractId') or pos.get('contract', 'Unknown')
                         logging.info(f"Active position found: {symbol} with quantity {quantity}")
-                        return True
+                        has_active_position = True
+                        break
+        
+        # Only fetch working orders if we have an active position
+        if has_active_position:
+            logging.info("Active position detected - Fetching working orders")
+            working_orders = get_working_orders(topstep_config, enable_trading, auth_token)
+            return True
         
         # DISABLED: Check for working orders (uncomment to re-enable)
         # orders_endpoint = topstep_config.get('working_orders_endpoint', '/api/Order/searchWorking')
@@ -1845,6 +2004,13 @@ def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_
         
         logging.info(f"Trade executed successfully: {action}")
         
+        # Extract orderId from response if available
+        order_id = None
+        if isinstance(trade_response, dict):
+            order_id = trade_response.get('orderId') or trade_response.get('id')
+            if order_id:
+                logging.info(f"Order ID from response: {order_id}")
+        
         # Get updated account balance
         balance = get_account_balance(account_id, topstep_config, enable_trading, auth_token)
         
@@ -1853,6 +2019,8 @@ def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_
             # Entry event
             event_type = "ENTRY"
             trade_position_type = 'long' if action == 'buy' else 'short'
+            
+            # Log the entry with order_id
             log_trade_event(
                 event_type=event_type,
                 symbol=contract_id,
@@ -1864,7 +2032,16 @@ def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_
                 reasoning=reasoning,
                 confidence=confidence,
                 balance=balance,
-                market_context=market_context
+                market_context=market_context,
+                order_id=order_id
+            )
+            
+            # Save order ID and timestamp for later retrieval
+            save_active_trade_info(
+                order_id=order_id,
+                entry_price=entry_price if entry_price else 0,
+                position_type=trade_position_type,
+                entry_timestamp=datetime.datetime.now().isoformat()
             )
         elif action == 'scale':
             # Scale event (partial exit)
@@ -1893,6 +2070,7 @@ def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_
                     profit_loss_points=profit_loss_points,
                     balance=balance,
                     market_context=market_context,
+                    order_id=trade_info.get('order_id'),
                     entry_price=scale_entry_price
                 )
         
@@ -2122,6 +2300,79 @@ def get_available_contracts(topstep_config, auth_token=None, symbol=None):
             logging.error(f"Error fetching contracts: {e}")
             return None
 
+def fetch_trade_results(account_id, topstep_config, enable_trading, auth_token=None, start_timestamp=None, end_timestamp=None):
+    """Fetch trade results from TopstepX Trade/search API.
+    
+    Args:
+        account_id: Account ID
+        topstep_config: Topstep configuration dict
+        enable_trading: Whether trading is enabled
+        auth_token: Auth token
+        start_timestamp: Start time in ISO format (default: today 00:00)
+        end_timestamp: End time in ISO format (default: now)
+        
+    Returns:
+        list: List of trade objects or None on error
+    """
+    if not enable_trading:
+        logging.debug("Trading disabled - Skipping trade results query")
+        return None
+    
+    if not auth_token:
+        logging.error("No auth token available for trade results query")
+        return None
+    
+    if not account_id:
+        logging.error("No account_id provided for trade results query")
+        return None
+    
+    try:
+        # Default timestamps: today 00:00 to now
+        if not start_timestamp:
+            start_timestamp = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if not end_timestamp:
+            end_timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        base_url = topstep_config['base_url']
+        trade_search_endpoint = topstep_config.get('trade_search_endpoint', '/api/Trade/search')
+        url = base_url + trade_search_endpoint
+        
+        headers = {
+            'Authorization': f'Bearer {auth_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            "accountId": int(account_id),
+            "startTimestamp": start_timestamp,
+            "endTimestamp": end_timestamp
+        }
+        
+        logging.info("=== FETCHING TRADE RESULTS ===")
+        logging.info(f"Trade Search URL: {url}")
+        logging.info(f"Payload: {json.dumps(payload, indent=2)}")
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        
+        logging.info("="*80)
+        logging.info("TRADE RESULTS API RESPONSE:")
+        logging.info(f"Status Code: {response.status_code}")
+        logging.info(json.dumps(result, indent=2))
+        logging.info("="*80)
+        
+        if result.get('success', True) and 'trades' in result:
+            return result['trades']
+        else:
+            logging.warning(f"Trade search returned no trades or error: {result.get('errorMessage')}")
+            return []
+        
+    except Exception as e:
+        logging.error(f"Error fetching trade results: {e}")
+        logging.exception("Full traceback:")
+        return None
+
 def get_account_balance(account_id, topstep_config, enable_trading, auth_token=None):
     """Query API for account balance for a specific account ID."""
     if not enable_trading:
@@ -2286,6 +2537,7 @@ TOPSTEP_CONFIG = {
     'accounts_endpoint': config.get('Topstep', 'accounts_endpoint', fallback='/api/Account/search'),
     'contracts_endpoint': config.get('Topstep', 'contracts_endpoint', fallback='/api/Contract/search'),
     'contracts_available_endpoint': config.get('Topstep', 'contracts_available_endpoint', fallback='/api/Contract/available'),
+    'trade_search_endpoint': config.get('Topstep', 'trade_search_endpoint', fallback='/api/Trade/search'),
     'account_id': config.get('Topstep', 'account_id', fallback=''),
     'contract_id': config.get('Topstep', 'contract_id', fallback=''),
     'quantity': config.get('Topstep', 'quantity', fallback='1'),
@@ -2317,6 +2569,9 @@ else:
 
 # Global auth token for Topstep API
 AUTH_TOKEN = None
+
+# Track previous position state to detect changes
+PREVIOUS_POSITION_TYPE = 'none'
 
 # Login to TopstepX and get auth token
 if ENABLE_TRADING:
@@ -2421,6 +2676,7 @@ logging.info(f"Contract Search URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG
 logging.info(f"Order Place URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['buy_endpoint']}")
 logging.info(f"Positions URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['positions_endpoint']}")
 logging.info(f"Working Orders URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['working_orders_endpoint']}")
+logging.info(f"Trade Search URL: {TOPSTEP_CONFIG['base_url'] + TOPSTEP_CONFIG['trade_search_endpoint']}")
 
 # Example payloads for different endpoints
 logging.info("Example POST Payloads:")
@@ -2693,6 +2949,7 @@ def reload_config():
             'contract_id': config.get('Topstep', 'contract_id', fallback=''),
             'quantity': config.get('Topstep', 'quantity', fallback='1'),
             'contract_to_search': config.get('Topstep', 'contract_to_search', fallback='ES'),
+            'trade_search_endpoint': config.get('Topstep', 'trade_search_endpoint', fallback='/api/Trade/search'),
             'max_risk_per_contract': config.get('Topstep', 'max_risk_per_contract', fallback=''),
             'max_profit_per_contract': config.get('Topstep', 'max_profit_per_contract', fallback=''),
             'enable_stop_loss': config.getboolean('Topstep', 'enable_stop_loss', fallback=True),

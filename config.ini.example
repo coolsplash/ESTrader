@@ -4,9 +4,10 @@ interval_minutes = 1
 trade_status_check_interval = 15
 begin_time = 00:00
 end_time = 23:59
-; Stop opening new positions at this time (format: HH:MM)
-no_new_trades_time = 15:45
-no_new_trades_end_time = 18:00
+; Time windows where no new trades should be opened (format: HH:MM-HH:MM, comma separated)
+; Example: 09:30-09:35,15:45-18:00 (no trades from 9:30-9:35 and 3:45pm-6:00pm)
+; Leave empty to allow trading at all times during begin_time and end_time
+no_new_trades_windows = 15:45-18:00
 ; Force close all open positions at this time (format: HH:MM)
 force_close_time = 15:50
 window_title = Main@thinkorswim
@@ -37,6 +38,9 @@ no_position_prompt = You are an elite ES futures trader specializing in high-pro
 
 	{Context}
 
+	Your previous observations:
+	{LLM_Context}
+
 	Your response must ALWAYS be valid JSON in this exact format:
 	
 	""action"": ""buy"" | ""sell"" | ""hold"",
@@ -54,10 +58,13 @@ no_position_prompt = You are an elite ES futures trader specializing in high-pro
 	- For hold set entry_price, price_target, and stop_loss to null.
 	- You do not have to trade. Only trade when there is a clear and confident opportunity.
 
-position_prompt = You are an expert ES futures trader. I am currently in a {position_type} position. Position details: Size={size} contracts, Entry Price={average_price}, Current Stop Loss={current_stop_loss}, Current Take Profit={current_take_profit}, Unrealized P&L={unrealized_pnl}. The following is context for the day. Return it back to me updated with adding or removing relevant up-to-date information as you see fit.
+position_prompt = You are an expert ES futures trader. I am currently in a {position_type} position. Position details: Size={size} contracts, Entry Price={average_price}, Current Stop Loss={current_stop_loss}, Current Take Profit={current_take_profit}, Unrealized P&L={unrealized_pnl}. The following is context for the day.
 	{Context}
 
-	Analyze the attached Bookmap screenshot for {symbol} futures and advise: hold, adjust, scale, or close. Actions: 'hold' (keep position as-is), 'adjust' (modify stop loss and/or price target), 'scale' (partially close position), 'close' (exit entire position). Always provide price_target and stop_loss numbers even if you recommend holding. Move stops to break even or into profit once those options make sense, but dont be super aggressive and lose the trade. We dont want to hold unnecessary risk. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/adjust/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text", "context": "Short explanation summarizing the market context. Keep original context sent above, but modify as needed"}}Analyze the attached Bookmap screenshot for {symbol} futures and advise: hold, adjust, scale, or close. Actions: 'hold' (keep position as-is), 'adjust' (modify stop loss and/or price target), 'scale' (partially close position), 'close' (exit entire position). Always provide price_target and stop_loss numbers even if you recommend holding. If we have made significant progress and there is risk of giving back our profits and going green to red, move stops to break even or into profit if that is sensible, but dont be very aggressive as often we lose by adjusting too early. Regarding your overall analyis, explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/adjust/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text", "context": "Short explanation summarizing the market context. Keep original context sent above, but modify as needed"}}
+	Your previous observations:
+	{LLM_Context}
+
+	Analyze the attached Bookmap screenshot for {symbol} futures and advise: hold, adjust, scale, or close. Actions: 'hold' (keep position as-is), 'adjust' (modify stop loss and/or price target), 'scale' (partially close position), 'close' (exit entire position). Always provide price_target and stop_loss numbers even if you recommend holding. Move stops to break even or into profit once those options make sense, but dont be super aggressive and lose the trade. We dont want to hold unnecessary risk. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/adjust/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text", "context": "Update with any new observations or insights you've learned throughout the trading session."}}
 
 long_position_prompt = You are an expert ES futures trader. I am currently in a long position. Analyze this Bookmap screenshot for a long position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}
 short_position_prompt = You are an expert ES futures trader and can make millions by analyzing a chart. Analyze this Bookmap screenshot for a short position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}

@@ -87,11 +87,12 @@ Update the following in `config.ini`:
 
 ### Trading Hours
 ```ini
-begin_time = 00:00              # Start of trading session
-end_time = 23:59                # End of trading session
-no_new_trades_time = 15:45      # Stop opening new positions
-no_new_trades_end_time = 18:00  # Resume trading after break
-force_close_time = 15:50        # Force close all positions
+begin_time = 00:00                      # Start of trading session
+end_time = 23:59                        # End of trading session
+no_new_trades_windows = 15:45-18:00     # Time ranges when no new trades allowed
+                                        # Format: HH:MM-HH:MM, comma separated for multiple windows
+                                        # Example: 09:30-09:35,15:45-18:00
+force_close_time = 15:50                # Force close all positions at this time
 ```
 
 ### Safety Flags
@@ -149,6 +150,8 @@ Right-click the tray icon for quick access:
 **Logs:**
 - `logs/YYYYMMDD.txt` - Daily execution logs
 - `trades/YYYY_MM.csv` - Monthly trade journal with P&L
+- `context/YYMMDD.txt` - Original market data context (from Yahoo Finance)
+- `context/YYMMDD_LLM.txt` - LLM's evolving context (updated with each trade)
 
 **Telegram Notifications:**
 - New position opened with reasoning and confidence

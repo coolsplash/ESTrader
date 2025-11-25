@@ -82,6 +82,61 @@ def clear_active_trade_info():
     except Exception as e:
         logging.error(f"Error clearing active trade info: {e}")
 
+def log_llm_interaction(request_prompt, response_text, action=None, entry_price=None, 
+                        price_target=None, stop_loss=None, confidence=None, reasoning=None, context=None):
+    """Log LLM request and response to daily CSV file.
+    
+    Args:
+        request_prompt: The full prompt sent to the LLM
+        response_text: The raw response from the LLM
+        action: Parsed action from response (e.g., 'buy', 'sell', 'hold')
+        entry_price: Parsed entry price
+        price_target: Parsed price target
+        stop_loss: Parsed stop loss
+        confidence: Parsed confidence level
+        reasoning: Parsed reasoning
+        context: Market context used in the request
+    """
+    try:
+        log_folder = 'logs'
+        os.makedirs(log_folder, exist_ok=True)
+        
+        today = datetime.datetime.now().strftime("%y%m%d")
+        csv_file = os.path.join(log_folder, f"{today}_LLM.csv")
+        
+        # Check if file exists to determine if we need to write header
+        file_exists = os.path.exists(csv_file)
+        
+        with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            # Write header if new file
+            if not file_exists:
+                writer.writerow([
+                    'date_time', 'request', 'response', 'action', 'entry_price', 
+                    'price_target', 'stop_loss', 'confidence', 'reasoning', 'context'
+                ])
+            
+            # Write the log entry
+            writer.writerow([
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                request_prompt[:1000] if request_prompt else '',  # Truncate long prompts
+                response_text[:1000] if response_text else '',     # Truncate long responses
+                action or '',
+                entry_price or '',
+                price_target or '',
+                stop_loss or '',
+                confidence or '',
+                reasoning[:500] if reasoning else '',              # Truncate reasoning
+                context[:500] if context else ''                   # Truncate context
+            ])
+        
+        logging.info(f"LLM interaction logged to {csv_file}")
+        
+    except Exception as e:
+        logging.error(f"Error logging LLM interaction: {e}")
+        logging.exception("Full traceback:")
+
 def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=None, take_profit=None, 
                     reasoning=None, confidence=None, profit_loss=None, profit_loss_points=None, 
                     balance=None, market_context=None, order_id=None, entry_price=None):
@@ -205,27 +260,41 @@ def is_after_hours():
     return is_eth
 
 def get_daily_context():
-    """Read today's market context from context/YYMMDD.txt file.
-    If no context exists, generate it from market data.
+    """Read today's base market context from context/YYMMDD.txt file.
+    
+    This returns ONLY the original market data context from Yahoo Finance.
+    LLM observations are retrieved separately via get_llm_observations() and
+    passed as a separate parameter when formatting prompts.
+    
+    File structure:
+    - context/YYMMDD.txt - Original market data (returned by this function)
+    - context/YYMMDD_LLM.txt - LLM's observations (retrieved via get_llm_observations())
+    
     Appends after-hours notice if trading outside RTH.
     
     Returns:
-        str: The context text, or empty string if file doesn't exist
+        str: The base context text, or empty string if file doesn't exist
     """
     try:
         context_folder = 'context'
         os.makedirs(context_folder, exist_ok=True)
         today = datetime.datetime.now().strftime("%y%m%d")
-        context_file = os.path.join(context_folder, f"{today}.txt")
+        
+        # File paths
+        llm_context_file = os.path.join(context_folder, f"{today}_LLM.txt")
+        base_context_file = os.path.join(context_folder, f"{today}.txt")
         
         context = ""
         
-        if os.path.exists(context_file):
-            with open(context_file, 'r', encoding='utf-8') as f:
+        # Always try to load base context first (original market data)
+        if os.path.exists(base_context_file):
+            with open(base_context_file, 'r', encoding='utf-8') as f:
                 context = f.read().strip()
-                logging.info(f"Loaded context from {context_file}: {context[:100]}..." if len(context) > 100 else f"Loaded context from {context_file}: {context}")
+                logging.info(f"Loaded base context from {base_context_file}")
+        
+        # If base context doesn't exist, generate it
         else:
-            logging.info(f"No context file found for today ({context_file})")
+            logging.info(f"No context file found for today")
             # Try to generate market context from Yahoo Finance data
             try:
                 logging.info("Attempting to generate market context from Yahoo Finance data...")
@@ -245,10 +314,10 @@ def get_daily_context():
                         logging.error("No yesterday context available either")
                         return context  # Return the unavailable message
                 
-                # Save the generated context for today
-                with open(context_file, 'w', encoding='utf-8') as f:
+                # Save the generated context as base context (never overwritten)
+                with open(base_context_file, 'w', encoding='utf-8') as f:
                     f.write(context)
-                logging.info(f"Generated and saved market context to {context_file}")
+                logging.info(f"Generated and saved base market context to {base_context_file}")
             except Exception as e:
                 logging.error(f"Could not generate market context: {e}")
                 # Try yesterday's context as final fallback
@@ -261,6 +330,9 @@ def get_daily_context():
                 else:
                     return ""
         
+        # Note: LLM observations are NOT merged here - they are passed separately 
+        # to prompt formatting to avoid nested placeholder issues
+        
         # Append after-hours notice if outside RTH
         if is_after_hours():
             context += "\n\n⚠️ PLEASE NOTE: THIS IS AFTER HOURS TRADING (Outside Regular Trading Hours 8:30 AM - 3:00 PM CT)"
@@ -272,8 +344,34 @@ def get_daily_context():
         logging.error(f"Error reading daily context: {e}")
         return ""
 
+def get_llm_observations():
+    """Get LLM's previous observations from context/YYMMDD_LLM.txt file.
+    
+    Returns:
+        str: LLM observations or default message if file doesn't exist
+    """
+    try:
+        context_folder = 'context'
+        today = datetime.datetime.now().strftime("%y%m%d")
+        llm_context_file = os.path.join(context_folder, f"{today}_LLM.txt")
+        
+        if os.path.exists(llm_context_file):
+            with open(llm_context_file, 'r', encoding='utf-8') as f:
+                observations = f.read().strip()
+                logging.debug(f"Loaded LLM observations from {llm_context_file}")
+                return observations
+        else:
+            logging.debug("No LLM context file found - using default message")
+            return "No previous observations yet - first analysis of the day."
+    except Exception as e:
+        logging.error(f"Error reading LLM observations: {e}")
+        return "Error loading previous observations."
+
 def save_daily_context(new_context, old_context):
-    """Save updated market context to context/YYMMDD.txt file.
+    """Save LLM's updated market context to context/YYMMDD_LLM.txt file.
+    
+    This preserves the original market data context in YYMMDD.txt and stores
+    the LLM's evolving understanding separately in YYMMDD_LLM.txt.
     
     Only saves if the context has changed.
     
@@ -284,24 +382,25 @@ def save_daily_context(new_context, old_context):
     try:
         # Only update if context changed
         if new_context == old_context:
-            logging.debug("Context unchanged, not updating file")
+            logging.debug("LLM context unchanged, not updating file")
             return
         
         context_folder = 'context'
         today = datetime.datetime.now().strftime("%y%m%d")
-        context_file = os.path.join(context_folder, f"{today}.txt")
+        llm_context_file = os.path.join(context_folder, f"{today}_LLM.txt")
         
         # Create folder if it doesn't exist
         os.makedirs(context_folder, exist_ok=True)
         
-        # Write the new context
-        with open(context_file, 'w', encoding='utf-8') as f:
+        # Write the LLM's updated context
+        with open(llm_context_file, 'w', encoding='utf-8') as f:
             f.write(new_context)
         
-        logging.info(f"Updated context in {context_file}: {new_context[:100]}..." if len(new_context) > 100 else f"Updated context in {context_file}: {new_context}")
+        logging.info(f"Updated LLM context in {llm_context_file}")
+        logging.debug(f"LLM context preview: {new_context[:100]}..." if len(new_context) > 100 else f"LLM context: {new_context}")
         
     except Exception as e:
-        logging.error(f"Error saving daily context: {e}")
+        logging.error(f"Error saving LLM context: {e}")
         logging.exception("Full traceback:")
 
 def send_telegram_message(message, telegram_config):
@@ -455,7 +554,12 @@ def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_fo
 
 def upload_to_llm(image_base64, prompt, model, enable_llm, api_url, api_key):
     """Upload the screenshot to OpenAI API with custom prompt and model, and get a response (or mock if disabled)."""
-    logging.info(f"Uploading screenshot with prompt: {prompt}")
+    try:
+        # Safely log prompt (truncate if too long, handle Unicode errors)
+        prompt_preview = prompt[:200] + "..." if len(prompt) > 200 else prompt
+        logging.info(f"Uploading screenshot with prompt: {prompt_preview}")
+    except UnicodeEncodeError:
+        logging.info("Uploading screenshot with prompt (contains special characters)")
     if not enable_llm:
         mock_response = '{"action": "mock_action", "price_target": 0, "stop_loss": 0, "reasoning": "Mock response for testing"}'
         logging.info(f"LLM upload disabled - Mock Response: {mock_response}")
@@ -494,6 +598,52 @@ def is_within_time_range(begin_time, end_time):
     begin = datetime.datetime.strptime(begin_time, "%H:%M").time()
     end = datetime.datetime.strptime(end_time, "%H:%M").time()
     return begin <= now <= end
+
+def is_in_no_new_trades_window(no_new_trades_windows_str):
+    """Check if current time is within any of the no-new-trades windows.
+    
+    Args:
+        no_new_trades_windows_str: Comma-separated time ranges (e.g., "09:30-09:35,15:45-18:00")
+        
+    Returns:
+        tuple: (is_blocked, window_str) - Whether trading is blocked and which window
+    """
+    if not no_new_trades_windows_str or no_new_trades_windows_str.strip() == '':
+        return (False, None)
+    
+    current_time = datetime.datetime.now().time()
+    
+    # Parse comma-separated windows
+    windows = [w.strip() for w in no_new_trades_windows_str.split(',') if w.strip()]
+    
+    for window in windows:
+        try:
+            # Parse start-end times
+            if '-' not in window:
+                logging.warning(f"Invalid no_new_trades_window format: '{window}' (expected HH:MM-HH:MM)")
+                continue
+            
+            start_str, end_str = window.split('-', 1)
+            start_time = datetime.datetime.strptime(start_str.strip(), "%H:%M").time()
+            end_time = datetime.datetime.strptime(end_str.strip(), "%H:%M").time()
+            
+            # Check if we're in this window (handle overnight windows)
+            in_window = False
+            if start_time < end_time:
+                # Same-day window (e.g., 09:30 to 18:00)
+                in_window = start_time <= current_time < end_time
+            else:
+                # Overnight window (e.g., 23:00 to 02:00)
+                in_window = current_time >= start_time or current_time < end_time
+            
+            if in_window:
+                return (True, window)
+                
+        except Exception as e:
+            logging.error(f"Error parsing no_new_trades_window '{window}': {e}")
+            continue
+    
+    return (False, None)
 
 def show_error_dialog(error_message, error_code):
     """Show Windows native error dialog with Continue/Exit options."""
@@ -927,7 +1077,7 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
         logging.error(f"Error modifying stops and targets: {e}")
         logging.exception("Full traceback:")
 
-def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_time='23:59', no_new_trades_end_time='23:59', force_close_time='23:59'):
+def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
     """The main job to run periodically."""
     global PREVIOUS_POSITION_TYPE
     
@@ -1056,27 +1206,16 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
             position_details = None
             working_orders = None
         
+        # Check if we're in any no-new-trades window
+        in_no_trades_window, current_window = is_in_no_new_trades_window(no_new_trades_windows)
+        
         # Check if it's time to force close all positions
-        # Force close should only apply within the no-new-trades window (between no_new_trades_time and no_new_trades_end_time)
-        # After no_new_trades_end_time, trading resumes and force close no longer applies
+        # Force close should only apply if we're in a no-new-trades window AND past the force_close_time
         should_force_close = False
         
-        no_new_trades = datetime.datetime.strptime(no_new_trades_time, "%H:%M").time()
-        no_new_trades_end = datetime.datetime.strptime(no_new_trades_end_time, "%H:%M").time()
-        
-        # Determine if we're in the no-new-trades window
-        in_no_trades_window = False
-        if no_new_trades < no_new_trades_end:
-            # Same-day window (e.g., 15:45 to 18:00)
-            in_no_trades_window = no_new_trades <= current_time < no_new_trades_end
-        else:
-            # Overnight window (e.g., 23:00 to 02:00)
-            in_no_trades_window = current_time >= no_new_trades or current_time < no_new_trades_end
-        
-        # Only apply force close if we're in the no-new-trades window AND past the force_close_time
         if in_no_trades_window and current_time >= force_close:
             should_force_close = True
-            logging.debug(f"In no-new-trades window and past force close time - should_force_close={should_force_close}")
+            logging.debug(f"In no-new-trades window '{current_window}' and past force close time - should_force_close={should_force_close}")
         
         if should_force_close:
             if current_position_type in ['long', 'short'] and position_details:
@@ -1133,7 +1272,8 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 unrealized_pnl=position_details.get('unrealized_pnl', 0),
                 current_stop_loss=current_stop_loss,
                 current_take_profit=current_take_profit,
-                Context=daily_context
+                Context=daily_context,
+                LLM_Context=get_llm_observations()
             )
             
             logging.info(f"Using position management prompt")
@@ -1160,6 +1300,19 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                     reasoning = advice.get('reasoning')
                     new_context = advice.get('context', '')
                     logging.info(f"Position Management Advice: Action={action}, Target={price_target}, Stop={stop_loss}, Reasoning={reasoning}")
+                    
+                    # Log LLM interaction to CSV
+                    log_llm_interaction(
+                        request_prompt=position_prompt,
+                        response_text=llm_response,
+                        action=action,
+                        entry_price=None,  # Not applicable for position management
+                        price_target=price_target,
+                        stop_loss=stop_loss,
+                        confidence=None,  # Not provided in position management
+                        reasoning=reasoning,
+                        context=daily_context
+                    )
                     
                     # Save updated context if it changed
                     if new_context:
@@ -1194,7 +1347,7 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
         
         # No position - check if we can still enter new trades (reuse in_no_trades_window from above)
         if in_no_trades_window:
-            logging.info(f"In no-new-trades window ({no_new_trades_time} to {no_new_trades_end_time}) - Skipping entry analysis")
+            logging.info(f"In no-new-trades window '{current_window}' - Skipping entry analysis")
             return
         
         # No position - look for new entry opportunities
@@ -1203,12 +1356,13 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
 
         image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
         # Select and format prompt based on current_position_type
+        llm_observations = get_llm_observations()
         if current_position_type == 'none':
-            prompt = no_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context)
+            prompt = no_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context, LLM_Context=llm_observations)
         elif current_position_type == 'long':
-            prompt = long_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context)
+            prompt = long_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context, LLM_Context=llm_observations)
         elif current_position_type == 'short':
-            prompt = short_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context)
+            prompt = short_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context, LLM_Context=llm_observations)
         else:
             logging.error(f"Invalid position_type: {current_position_type}")
             raise ValueError(f"Invalid position_type: {current_position_type}")
@@ -1234,6 +1388,19 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                 confidence = advice.get('confidence')
                 new_context = advice.get('context', '')
                 logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}")
+
+                # Log LLM interaction to CSV
+                log_llm_interaction(
+                    request_prompt=prompt,
+                    response_text=llm_response,
+                    action=action,
+                    entry_price=entry_price,
+                    price_target=price_target,
+                    stop_loss=stop_loss,
+                    confidence=confidence,
+                    reasoning=reasoning,
+                    context=daily_context
+                )
 
                 # Save updated context if it changed
                 if new_context:
@@ -2483,19 +2650,24 @@ def get_accounts(topstep_config, enable_trading, auth_token=None):
 config = configparser.ConfigParser()
 config.read('config.ini')
 
-# Logging setup
+# Logging setup with UTF-8 encoding
 LOG_FOLDER = config.get('General', 'log_folder', fallback='logs')
 os.makedirs(LOG_FOLDER, exist_ok=True)
 today = datetime.datetime.now().strftime("%Y%m%d")
 log_file = os.path.join(LOG_FOLDER, f"{today}.txt")
 
-file_handler = logging.FileHandler(log_file)
+# File handler with UTF-8 encoding
+file_handler = logging.FileHandler(log_file, encoding='utf-8')
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 
-console_handler = logging.StreamHandler()
+# Console handler with UTF-8 encoding and error handling
+console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+# Ensure console can handle UTF-8 on Windows
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
 
@@ -2505,8 +2677,7 @@ INTERVAL_MINUTES = int(config.get('General', 'interval_minutes', fallback='5'))
 TRADE_STATUS_CHECK_INTERVAL = int(config.get('General', 'trade_status_check_interval', fallback='10'))
 BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
 END_TIME = config.get('General', 'end_time', fallback='23:59')
-NO_NEW_TRADES_TIME = config.get('General', 'no_new_trades_time', fallback='23:59')
-NO_NEW_TRADES_END_TIME = config.get('General', 'no_new_trades_end_time', fallback='23:59')
+NO_NEW_TRADES_WINDOWS = config.get('General', 'no_new_trades_windows', fallback='')
 FORCE_CLOSE_TIME = config.get('General', 'force_close_time', fallback='23:59')
 WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
 TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
@@ -2517,7 +2688,7 @@ ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
 EXECUTE_TRADES = config.getboolean('General', 'execute_trades', fallback=False)
 ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
 
-logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_TIME={NO_NEW_TRADES_TIME}, NO_NEW_TRADES_END_TIME={NO_NEW_TRADES_END_TIME}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
+logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_WINDOWS={NO_NEW_TRADES_WINDOWS}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
 
 SYMBOL = config.get('LLM', 'symbol', fallback='ES')
 DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')  # Symbol for LLM communications and human readable formats
@@ -2704,6 +2875,34 @@ if TOPSTEP_CONFIG['account_id']:
     logging.info(f"  Order payload example: {json.dumps(order_payload, indent=2)}")
 logging.info(f"Headers Template: {{'Authorization': 'Bearer [auth_token]', 'Content-Type': 'application/json'}}")
 
+# Helper function for scheduled context refresh
+def refresh_base_context():
+    """Refresh BASE market context from Yahoo Finance and save to YYMMDD.txt.
+    
+    This is called on a schedule (every 30 minutes) to keep market data current.
+    It does NOT affect the LLM's observations (YYMMDD_LLM.txt).
+    """
+    try:
+        logging.info("Scheduled context refresh - Fetching latest market data from Yahoo Finance")
+        
+        analyzer = MarketDataAnalyzer()
+        market_context = analyzer.generate_market_context(force_refresh=True)
+        
+        # Save to base context file (YYMMDD.txt)
+        context_folder = 'context'
+        os.makedirs(context_folder, exist_ok=True)
+        today = datetime.datetime.now().strftime("%y%m%d")
+        context_file = os.path.join(context_folder, f"{today}.txt")
+        
+        with open(context_file, 'w', encoding='utf-8') as f:
+            f.write(market_context)
+        
+        logging.info(f"Base market context updated successfully in {context_file}")
+        
+    except Exception as e:
+        logging.error(f"Error during scheduled context refresh: {e}")
+        logging.exception("Full traceback:")
+
 # Schedule the job every INTERVAL_MINUTES minutes
 schedule.every(INTERVAL_MINUTES).minutes.do(
     job, 
@@ -2712,14 +2911,14 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     bottom_offset=BOTTOM_OFFSET, 
     save_folder=SAVE_FOLDER, 
     begin_time=BEGIN_TIME, 
-    end_time=END_TIME,
-    symbol=SYMBOL,
-    position_type=POSITION_TYPE,
-    no_position_prompt=NO_POSITION_PROMPT,
-    long_position_prompt=LONG_POSITION_PROMPT,
-    short_position_prompt=SHORT_POSITION_PROMPT,
-    model=MODEL,
-    topstep_config=TOPSTEP_CONFIG,
+    end_time=END_TIME, 
+    symbol=SYMBOL, 
+    position_type=POSITION_TYPE, 
+    no_position_prompt=NO_POSITION_PROMPT, 
+    long_position_prompt=LONG_POSITION_PROMPT, 
+    short_position_prompt=SHORT_POSITION_PROMPT, 
+    model=MODEL, 
+    topstep_config=TOPSTEP_CONFIG, 
     enable_llm=ENABLE_LLM,
     enable_trading=ENABLE_TRADING,
     openai_api_url=OPENAI_API_URL,
@@ -2728,10 +2927,13 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     auth_token=AUTH_TOKEN,
     execute_trades=EXECUTE_TRADES,
     telegram_config=TELEGRAM_CONFIG,
-    no_new_trades_time=NO_NEW_TRADES_TIME,
-    no_new_trades_end_time=NO_NEW_TRADES_END_TIME,
+    no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
     force_close_time=FORCE_CLOSE_TIME
 )
+
+# Schedule base context refresh every 30 minutes to keep market data current
+schedule.every(30).minutes.do(refresh_base_context)
+logging.info("Scheduled base context refresh every 30 minutes")
 
 # Run the first job immediately on startup (before entering the scheduler loop)
 logging.info("Running initial screenshot job immediately on startup...")
@@ -2741,14 +2943,14 @@ job(
     bottom_offset=BOTTOM_OFFSET, 
     save_folder=SAVE_FOLDER, 
     begin_time=BEGIN_TIME, 
-    end_time=END_TIME,
-    symbol=SYMBOL,
-    position_type=POSITION_TYPE,
-    no_position_prompt=NO_POSITION_PROMPT,
-    long_position_prompt=LONG_POSITION_PROMPT,
-    short_position_prompt=SHORT_POSITION_PROMPT,
-    model=MODEL,
-    topstep_config=TOPSTEP_CONFIG,
+    end_time=END_TIME, 
+    symbol=SYMBOL, 
+    position_type=POSITION_TYPE, 
+    no_position_prompt=NO_POSITION_PROMPT, 
+    long_position_prompt=LONG_POSITION_PROMPT, 
+    short_position_prompt=SHORT_POSITION_PROMPT, 
+    model=MODEL, 
+    topstep_config=TOPSTEP_CONFIG, 
     enable_llm=ENABLE_LLM,
     enable_trading=ENABLE_TRADING,
     openai_api_url=OPENAI_API_URL,
@@ -2757,8 +2959,7 @@ job(
     auth_token=AUTH_TOKEN,
     execute_trades=EXECUTE_TRADES,
     telegram_config=TELEGRAM_CONFIG,
-    no_new_trades_time=NO_NEW_TRADES_TIME,
-    no_new_trades_end_time=NO_NEW_TRADES_END_TIME,
+    no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
     force_close_time=FORCE_CLOSE_TIME
 )
 
@@ -2906,7 +3107,7 @@ def test_active_trades():
 def reload_config():
     """Reload configuration from config.ini without restarting the application."""
     global config, INTERVAL_MINUTES, TRADE_STATUS_CHECK_INTERVAL, BEGIN_TIME, END_TIME
-    global NO_NEW_TRADES_TIME, NO_NEW_TRADES_END_TIME, FORCE_CLOSE_TIME
+    global NO_NEW_TRADES_WINDOWS, FORCE_CLOSE_TIME
     global WINDOW_TITLE, TOP_OFFSET, BOTTOM_OFFSET, SAVE_FOLDER
     global ENABLE_LLM, ENABLE_TRADING, EXECUTE_TRADES, ENABLE_SAVE_SCREENSHOTS
     global SYMBOL, DISPLAY_SYMBOL, POSITION_TYPE, NO_POSITION_PROMPT
@@ -2927,8 +3128,7 @@ def reload_config():
         TRADE_STATUS_CHECK_INTERVAL = int(config.get('General', 'trade_status_check_interval', fallback='10'))
         BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
         END_TIME = config.get('General', 'end_time', fallback='23:59')
-        NO_NEW_TRADES_TIME = config.get('General', 'no_new_trades_time', fallback='23:59')
-        NO_NEW_TRADES_END_TIME = config.get('General', 'no_new_trades_end_time', fallback='23:59')
+        NO_NEW_TRADES_WINDOWS = config.get('General', 'no_new_trades_windows', fallback='')
         FORCE_CLOSE_TIME = config.get('General', 'force_close_time', fallback='23:59')
         WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
         TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
@@ -2978,7 +3178,7 @@ def reload_config():
         logging.info("Configuration reloaded successfully:")
         logging.info(f"  INTERVAL_MINUTES={INTERVAL_MINUTES}")
         logging.info(f"  BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}")
-        logging.info(f"  NO_NEW_TRADES_TIME={NO_NEW_TRADES_TIME}, NO_NEW_TRADES_END_TIME={NO_NEW_TRADES_END_TIME}")
+        logging.info(f"  NO_NEW_TRADES_WINDOWS={NO_NEW_TRADES_WINDOWS}")
         logging.info(f"  FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}")
         logging.info(f"  ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}")
         logging.info(f"  ACCOUNT_ID={TOPSTEP_CONFIG['account_id']}, CONTRACT_ID={TOPSTEP_CONFIG['contract_id']}")
@@ -3009,12 +3209,15 @@ def reload_config():
             auth_token=AUTH_TOKEN,
             execute_trades=EXECUTE_TRADES,
             telegram_config=TELEGRAM_CONFIG,
-            no_new_trades_time=NO_NEW_TRADES_TIME,
-            no_new_trades_end_time=NO_NEW_TRADES_END_TIME,
+            no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
             force_close_time=FORCE_CLOSE_TIME
         )
         
+        # Reschedule context refresh
+        schedule.every(30).minutes.do(refresh_base_context)
+        
         logging.info(f"Scheduler rescheduled with interval: {INTERVAL_MINUTES} minute(s)")
+        logging.info("Base context refresh rescheduled every 30 minutes")
         logging.info("Config reload complete - changes will take effect on next job run")
         
         return True
@@ -3053,16 +3256,21 @@ def list_all_contracts():
         logging.warning("Failed to fetch all available contracts")
 
 def refresh_market_context():
-    """Manually refresh market context by fetching fresh data from Yahoo Finance."""
+    """Manually refresh BASE market context by fetching fresh data from Yahoo Finance.
+    
+    This regenerates the original market data context (YYMMDD.txt) from Yahoo Finance.
+    It does NOT affect the LLM's updated context (YYMMDD_LLM.txt).
+    """
     try:
         logging.info("=" * 80)
-        logging.info("MANUALLY REFRESHING MARKET CONTEXT")
+        logging.info("MANUALLY REFRESHING BASE MARKET CONTEXT FROM YAHOO FINANCE")
         logging.info("=" * 80)
         
         analyzer = MarketDataAnalyzer()
         market_context = analyzer.generate_market_context(force_refresh=True)
         
-        # Save the generated context to today's file (without after-hours notice)
+        # Save the generated context to base context file (YYMMDD.txt)
+        # This does NOT overwrite the LLM's updated context (YYMMDD_LLM.txt)
         context_folder = 'context'
         os.makedirs(context_folder, exist_ok=True)
         today = datetime.datetime.now().strftime("%y%m%d")
@@ -3112,8 +3320,7 @@ def manual_job():
         auth_token=AUTH_TOKEN,
         execute_trades=EXECUTE_TRADES,
         telegram_config=TELEGRAM_CONFIG,
-        no_new_trades_time=NO_NEW_TRADES_TIME,
-        no_new_trades_end_time=NO_NEW_TRADES_END_TIME,
+        no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
         force_close_time=FORCE_CLOSE_TIME
     )
     logging.info("Manual job completed.")

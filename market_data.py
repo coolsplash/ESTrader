@@ -346,27 +346,37 @@ Volume Profile (Top {self.volume_nodes} levels from past {self.focus_days} days)
                 if i == 1:
                     context += " (POC - Point of Control)"
             
-            # Intraday Volume Profile (15-minute)
+            # Intraday Volume Profile (15-minute) - TODAY ONLY
             if self.enable_intraday:
-                intraday_data = self.fetch_intraday_data(self.es_ticker, self.intraday_days, self.intraday_interval)
+                # Fetch only today's intraday data (1 day)
+                intraday_data = self.fetch_intraday_data(self.es_ticker, days=1, interval=self.intraday_interval)
                 if intraday_data is not None and not intraday_data.empty:
-                    # Save intraday data
-                    self.save_intraday_data(self.es_ticker, intraday_data, self.intraday_interval)
+                    # Filter to only today's date to ensure we don't include yesterday's late session
+                    today = datetime.now().date()
+                    intraday_data_today = intraday_data[intraday_data.index.date == today]
                     
-                    # Calculate intraday VWAP
-                    intraday_vwap = float(self.calculate_vwap(intraday_data))
+                    # If no data for today yet, use the most recent day available
+                    if intraday_data_today.empty:
+                        self.logger.warning("No intraday data for today yet, using most recent available data")
+                        intraday_data_today = intraday_data
+                    
+                    # Save intraday data
+                    self.save_intraday_data(self.es_ticker, intraday_data_today, self.intraday_interval)
+                    
+                    # Calculate intraday VWAP (today only)
+                    intraday_vwap = float(self.calculate_vwap(intraday_data_today))
                     intraday_vwap_diff = current_price - intraday_vwap
                     intraday_vwap_bias = "bullish" if current_price > intraday_vwap else "bearish"
                     
-                    # Calculate intraday volume profile
-                    intraday_volume_profile = self.calculate_volume_profile(intraday_data, self.intraday_volume_nodes)
+                    # Calculate intraday volume profile (today only)
+                    intraday_volume_profile = self.calculate_volume_profile(intraday_data_today, self.intraday_volume_nodes)
                     
-                    context += f"\n\nIntraday {self.intraday_interval} Volume Profile (Past {self.intraday_days} days, {len(intraday_data)} bars):"
+                    context += f"\n\nIntraday {self.intraday_interval} Volume Profile (TODAY ONLY, {len(intraday_data_today)} bars):"
                     context += f"\nIntraday VWAP: {intraday_vwap:.2f} | Price is {abs(intraday_vwap_diff):.2f} pts {intraday_vwap_bias.upper()}"
                     context += f"\nTop {self.intraday_volume_nodes} High Volume Zones:"
                     
                     for i, (price, volume) in enumerate(intraday_volume_profile, 1):
-                        volume_pct = (volume / intraday_data['Volume'].sum()) * 100
+                        volume_pct = (volume / intraday_data_today['Volume'].sum()) * 100
                         context += f"\n  {i}. {price:.2f} pts ({volume_pct:.1f}% of volume)"
                         if i == 1:
                             context += " (Intraday POC)"

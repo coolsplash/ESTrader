@@ -11,13 +11,14 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 
 ## How It Works
 1. Every minute: Capture Bookmap screenshot from thinkorswim window
-2. Query TopstepX API for current position status
-3. Send screenshot + market context to GPT-4o with appropriate prompt:
+2. Every 30 minutes: Refresh base market context from Yahoo Finance (VWAP, volume profile, VIX)
+3. Query TopstepX API for current position status
+4. Send screenshot + market context to GPT-4o with appropriate prompt:
    - **No position**: Look for buy/sell/hold opportunities
    - **Has position**: Manage it (hold/adjust/scale/close)
-4. Parse JSON response and execute trades
-5. Log everything to daily logs and monthly CSV trade journal
-6. Send Telegram notifications
+5. Parse JSON response and execute trades
+6. Log everything to daily logs and monthly CSV trade journal
+7. Send Telegram notifications
 
 ## Market Context Provided to LLM
 - ES price, daily range, 5-day trend
@@ -41,15 +42,15 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - `execute_trades` - Actually execute trades (true/false)
 - `interval_minutes` - Screenshot frequency (default: 1)
 - `begin_time`/`end_time` - Trading hours window
-- `no_new_trades_time` - Stop opening new positions at this time
-- `no_new_trades_end_time` - Resume trading after this time
+- `no_new_trades_windows` - Time ranges when no new trades allowed (e.g., "09:30-09:35,15:45-18:00")
 - `force_close_time` - Force close all positions at this time
 
 ## Data Storage
 - `logs/YYYYMMDD.txt` - Daily execution logs
 - `trades/trades_YYYYMM.csv` - Monthly trade journal with P&L
 - `trades/active_trade.json` - Current position tracking
-- `context/YYMMDD.txt` - Daily market context (unified storage)
+- `context/YYMMDD.txt` - Original market data context (never overwritten)
+- `context/YYMMDD_LLM.txt` - LLM's updated context (evolves throughout day)
 - `market_data/` - Cached Yahoo Finance raw data (CSV files)
 - `screenshots/` - Captured images (timestamped)
 

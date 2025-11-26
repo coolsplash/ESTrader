@@ -63,11 +63,14 @@ position_prompt = You are an expert ES futures trader. I am currently in a {posi
 
 	Your previous observations:
 	{LLM_Context}
+	
+	Your initial reason to enter the trade was:
+	{Reason}
 
-	Analyze the attached Bookmap screenshot for {symbol} futures and advise: hold, adjust, scale, or close. Actions: 'hold' (keep position as-is), 'adjust' (modify stop loss and/or price target), 'scale' (partially close position), 'close' (exit entire position). Always provide price_target and stop_loss numbers even if you recommend holding. Move stops to break even or into profit once those options make sense, but dont be super aggressive and lose the trade. We dont want to hold unnecessary risk. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/adjust/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text", "context": "Update with any new observations or insights you've learned throughout the trading session."}}
+	Analyze the attached Bookmap screenshot for {symbol} futures and advise: hold, adjust, scale, or close. Actions: 'hold' (keep position as-is), 'adjust' (modify stop loss and/or price target), 'scale' (partially close position), 'close' (exit entire position). Always provide price_target and stop_loss numbers even if you recommend holding. Move stops to break even or into profit once those options make sense, but dont be super aggressive and lose the trade. We dont want to hold unnecessary risk. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{{{""action"": ""hold/adjust/scale/close"", ""price_target"": number, ""stop_loss"": number, ""reasoning"": ""text"", ""context"": ""Update with any new observations or insights you've learned throughout the trading session.""}}}}
 
-long_position_prompt = You are an expert ES futures trader. I am currently in a long position. Analyze this Bookmap screenshot for a long position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}
-short_position_prompt = You are an expert ES futures trader and can make millions by analyzing a chart. Analyze this Bookmap screenshot for a short position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}
+long_position_prompt = You are an expert ES futures trader. I am currently in a long position. Analyze this Bookmap screenshot for a long position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{{{""action"": ""hold/scale/close"", ""price_target"": number, ""stop_loss"": number, ""reasoning"": ""text""}}}}
+short_position_prompt = You are an expert ES futures trader and can make millions by analyzing a chart. Analyze this Bookmap screenshot for a short position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{{{""action"": ""hold/scale/close"", ""price_target"": number, ""stop_loss"": number, ""reasoning"": ""text""}}}}
 model = gpt-4o
 
 [Topstep]

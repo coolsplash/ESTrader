@@ -26,6 +26,14 @@ import urllib.parse  # For Telegram URL encoding
 import csv
 from market_data import MarketDataAnalyzer
 
+# Supabase integration
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+    logging.warning("Supabase package not installed - database logging disabled")
+
 def get_active_trade_info():
     """Get the current active trade info from file.
     
@@ -162,6 +170,28 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
         
         logging.info(f"LLM interaction logged to {csv_file}")
         
+        # Also log to Supabase if enabled
+        if SUPABASE_CLIENT:
+            try:
+                supabase_data = {
+                    'account_id': TOPSTEP_CONFIG.get('account_id', ''),
+                    'order_id': None,  # Will be set if available
+                    'timestamp': datetime.datetime.now().isoformat(),
+                    'request': LATEST_LLM_DATA['request'],
+                    'response': LATEST_LLM_DATA['response'],
+                    'action': LATEST_LLM_DATA['action'],
+                    'entry_price': float(LATEST_LLM_DATA['entry_price']) if LATEST_LLM_DATA['entry_price'] else None,
+                    'price_target': float(LATEST_LLM_DATA['price_target']) if LATEST_LLM_DATA['price_target'] else None,
+                    'stop_loss': float(LATEST_LLM_DATA['stop_loss']) if LATEST_LLM_DATA['stop_loss'] else None,
+                    'confidence': int(LATEST_LLM_DATA['confidence']) if LATEST_LLM_DATA['confidence'] else None,
+                    'reasoning': LATEST_LLM_DATA['reasoning'],
+                    'context': LATEST_LLM_DATA['context']
+                }
+                SUPABASE_CLIENT.table('llm_interactions').insert(supabase_data).execute()
+                logging.debug("LLM interaction also logged to Supabase")
+            except Exception as supabase_error:
+                logging.error(f"Error logging to Supabase (non-critical): {supabase_error}")
+        
     except Exception as e:
         logging.error(f"Error logging LLM interaction: {e}")
         logging.exception("Full traceback:")
@@ -256,6 +286,33 @@ def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=No
             writer.writerow(row)
         
         logging.info(f"Logged {event_type} event to {csv_file}: order_id={order_id}, price={price}")
+        
+        # Also log to Supabase if enabled
+        if SUPABASE_CLIENT:
+            try:
+                supabase_data = {
+                    'account_id': TOPSTEP_CONFIG.get('account_id', ''),
+                    'order_id': str(order_id),
+                    'timestamp': timestamp,
+                    'event_type': event_type,
+                    'symbol': symbol,
+                    'position_type': position_type,
+                    'size': int(size),
+                    'price': float(price) if price else None,
+                    'entry_price': float(entry_price) if entry_price else None,
+                    'stop_loss': float(stop_loss) if stop_loss else None,
+                    'take_profit': float(take_profit) if take_profit else None,
+                    'reasoning': reasoning if reasoning else None,
+                    'confidence': int(confidence) if confidence else None,
+                    'profit_loss': float(profit_loss) if profit_loss else None,
+                    'profit_loss_points': float(profit_loss_points) if profit_loss_points else None,
+                    'balance': float(balance) if balance else None,
+                    'market_context': market_context[:1000] if market_context else None  # Truncate for database
+                }
+                SUPABASE_CLIENT.table('trades').insert(supabase_data).execute()
+                logging.debug(f"Trade event also logged to Supabase: {event_type}")
+            except Exception as supabase_error:
+                logging.error(f"Error logging trade to Supabase (non-critical): {supabase_error}")
         
         # Clear trade info if position fully closed
         if event_type == "CLOSE":
@@ -1099,6 +1156,19 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
             order_id=trade_info.get('order_id') if trade_info else None
         )
         
+        # Update active_trade.json with new stop loss and price target
+        if trade_info:
+            save_active_trade_info(
+                order_id=trade_info.get('order_id'),
+                entry_price=trade_info.get('entry_price'),
+                position_type=position_type,
+                entry_timestamp=trade_info.get('entry_timestamp'),
+                stop_loss=new_stop_loss,
+                price_target=new_price_target,
+                reasoning=trade_info.get('reasoning')  # Keep original entry reasoning
+            )
+            logging.info(f"Updated active_trade.json with new values: Stop={new_stop_loss}, Target={new_price_target}")
+        
         logging.info("=" * 80)
         logging.info("STOP LOSS AND TAKE PROFIT MODIFICATION COMPLETE")
         logging.info("=" * 80)
@@ -1157,7 +1227,10 @@ def show_dashboard(root=None):
             # Being called at startup or refresh with existing root
             dashboard = root
             DASHBOARD_WINDOW = dashboard
-            dashboard.deiconify()  # Show the window if it was hidden
+            # Only deiconify if the window is actually withdrawn (hidden)
+            # Don't call it on every update to prevent taskbar flashing
+            if dashboard.state() == 'withdrawn':
+                dashboard.deiconify()
         
         dashboard.title("ES Trader Dashboard")
         if is_initial_build:
@@ -1246,6 +1319,10 @@ def show_dashboard(root=None):
                 if trade_info:
                     actual_stop = trade_info.get('stop_loss')
                     actual_target = trade_info.get('price_target')
+                
+                # Debug logging
+                logging.debug(f"Dashboard price display - LLM: Target={llm_data.get('price_target')}, Stop={llm_data.get('stop_loss')}")
+                logging.debug(f"Dashboard price display - Actual: Target={actual_target}, Stop={actual_stop}")
                 
                 target_value = actual_target if actual_target else llm_data.get('price_target')
                 if target_value:
@@ -1409,6 +1486,10 @@ def show_dashboard(root=None):
             if trade_info:
                 actual_stop = trade_info.get('stop_loss')
                 actual_target = trade_info.get('price_target')
+            
+            # Debug logging
+            logging.debug(f"Dashboard price display (initial) - LLM: Target={llm_data.get('price_target')}, Stop={llm_data.get('stop_loss')}")
+            logging.debug(f"Dashboard price display (initial) - Actual: Target={actual_target}, Stop={actual_stop}")
             
             target_value = actual_target if actual_target else llm_data.get('price_target')
             if target_value:
@@ -1989,10 +2070,12 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                             if actual_stop_loss or actual_price_target:
                                 global LATEST_LLM_DATA
                                 if LATEST_LLM_DATA:
+                                    logging.info(f"BEFORE UPDATE - LATEST_LLM_DATA: Target={LATEST_LLM_DATA.get('price_target')}, Stop={LATEST_LLM_DATA.get('stop_loss')}")
                                     if actual_stop_loss:
                                         LATEST_LLM_DATA['stop_loss'] = actual_stop_loss
                                     if actual_price_target:
                                         LATEST_LLM_DATA['price_target'] = actual_price_target
+                                    logging.info(f"AFTER UPDATE - LATEST_LLM_DATA: Target={LATEST_LLM_DATA.get('price_target')}, Stop={LATEST_LLM_DATA.get('stop_loss')}")
                                     logging.info(f"Updated LLM data with final values - Stop: {actual_stop_loss}, Target: {actual_price_target}")
                                     
                                     # Also update active_trade.json with final values
@@ -3312,6 +3395,9 @@ ACCOUNT_BALANCE = None
 LATEST_LLM_DATA = None  # Store the most recent LLM response for immediate dashboard updates
 DASHBOARD_WIDGETS = {}  # Store references to dashboard widgets for updates without rebuild
 
+# Global Supabase client
+SUPABASE_CLIENT = None
+
 # Load configuration from config.ini
 config = configparser.ConfigParser()
 config.read('config.ini')
@@ -3411,6 +3497,43 @@ if TELEGRAM_CONFIG['api_key'] and TELEGRAM_CONFIG['chat_id']:
     logging.info(f"Loaded Telegram config: Notifications enabled for chat ID {TELEGRAM_CONFIG['chat_id']}")
 else:
     logging.info("Telegram config not found or incomplete - notifications disabled")
+
+# Initialize Supabase client
+SUPABASE_CONFIG = {
+    'url': config.get('Supabase', 'supabase_url', fallback=''),
+    'key': config.get('Supabase', 'supabase_anon_key', fallback=''),
+    'enabled': config.getboolean('Supabase', 'enable_supabase_logging', fallback=True)
+}
+
+if SUPABASE_AVAILABLE and SUPABASE_CONFIG['enabled'] and SUPABASE_CONFIG['url'] and SUPABASE_CONFIG['key']:
+    try:
+        SUPABASE_CLIENT = create_client(SUPABASE_CONFIG['url'], SUPABASE_CONFIG['key'])
+        logging.info("Supabase client initialized successfully")
+        
+        # Register account if it doesn't exist
+        try:
+            account_id = TOPSTEP_CONFIG.get('account_id', '')
+            if account_id:
+                response = SUPABASE_CLIENT.table('accounts').select('*').eq('account_id', account_id).execute()
+                if not response.data:
+                    account_data = {
+                        'account_id': account_id,
+                        'account_name': f'TopstepX Account {account_id}',
+                        'broker': 'TopstepX'
+                    }
+                    SUPABASE_CLIENT.table('accounts').insert(account_data).execute()
+                    logging.info(f"Registered account {account_id} in Supabase")
+        except Exception as e:
+            logging.error(f"Error registering account in Supabase: {e}")
+    except Exception as e:
+        logging.error(f"Failed to initialize Supabase client: {e}")
+        SUPABASE_CLIENT = None
+elif not SUPABASE_AVAILABLE:
+    logging.info("Supabase logging disabled - package not installed")
+elif not SUPABASE_CONFIG['enabled']:
+    logging.info("Supabase logging disabled in config")
+else:
+    logging.info("Supabase configuration incomplete - database logging disabled")
 
 # Global auth token for Topstep API
 AUTH_TOKEN = None

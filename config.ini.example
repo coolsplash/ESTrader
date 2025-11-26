@@ -152,3 +152,11 @@ intraday_days = 5
 ; Number of intraday volume nodes to identify
 intraday_volume_nodes = 5
 
+[Supabase]
+; Supabase project URL
+supabase_url = YOUR_SUPABASE_URL
+; Supabase anon/public key
+supabase_anon_key = YOUR_SUPABASE_ANON_KEY
+; Enable logging to Supabase (in addition to CSV files)
+enable_supabase_logging = true
+

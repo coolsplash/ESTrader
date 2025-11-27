@@ -40,6 +40,15 @@ Choose buy, sell, or hold. Only take a trade if:
 News Rule:
 If a liquidity vacuum appears with sudden acceleration, assume news risk and return ""hold"".
 
+Economic Calendar Awareness:
+You will receive upcoming economic events in the Market Data JSON under "UpcomingEconomicEvents". These events can cause significant volatility:
+- High severity events (Fed, CPI, NFP, etc.): Often trigger 20-50+ point moves
+- Medium severity events: Can cause 10-20 point swings
+- Avoid new entries within 5-15 minutes before High severity events unless you have an extremely clear directional bias and can set appropriate stops
+- After major releases: Wait for clear directional commitment and structure before entering (typically 5-10 minutes)
+- If an event is imminent (< 5 minutes) and you see unusual liquidity behavior or acceleration, default to "hold"
+- You may take trades knowing an event is approaching IF the setup is pristine and your stop placement protects against news-driven spikes
+
 {Context}
 
 Your response MUST be valid JSON in the following structure:

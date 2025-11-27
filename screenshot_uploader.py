@@ -26,6 +26,7 @@ import ctypes
 import urllib.parse  # For Telegram URL encoding
 import csv
 from market_data import MarketDataAnalyzer
+import economic_calendar
 
 # Supabase integration
 try:
@@ -1820,6 +1821,32 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
     # Load daily market context
     daily_context = get_daily_context()
     
+    # Load economic calendar and get upcoming events (if enabled)
+    upcoming_events = []
+    try:
+        if CONFIG.has_section('EconomicCalendar') and CONFIG.getboolean('EconomicCalendar', 'enable_economic_calendar', fallback=False):
+            calendar_file = CONFIG.get('EconomicCalendar', 'data_file', fallback='market_data/economic_calendar.json')
+            minutes_before = CONFIG.getint('EconomicCalendar', 'minutes_before_event', fallback=15)
+            minutes_after = CONFIG.getint('EconomicCalendar', 'minutes_after_event', fallback=15)
+            severity_threshold_str = CONFIG.get('EconomicCalendar', 'severity_threshold', fallback='High,Medium')
+            severity_filter = [s.strip() for s in severity_threshold_str.split(',')]
+            
+            upcoming_events = economic_calendar.get_upcoming_events(
+                calendar_file,
+                minutes_before,
+                minutes_after,
+                severity_filter
+            )
+            
+            if upcoming_events:
+                logging.info(f"Found {len(upcoming_events)} upcoming economic events:")
+                for event in upcoming_events:
+                    logging.info(f"  - {event['name']} ({event['severity']}) in {event['minutes_until']:.1f} minutes")
+    except Exception as e:
+        logging.error(f"Error loading economic calendar: {e}")
+        logging.exception("Full traceback:")
+        upcoming_events = []
+    
     try:
         # Get current position status and details (only query API during trading hours)
         if is_within_time_range(begin_time, end_time):
@@ -2000,7 +2027,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                     current_position_type,
                     position_details,
                     working_orders,
-                    contract_id
+                    contract_id,
+                    upcoming_events=upcoming_events
                 )
                 
                 # TEMPORARY: Send only JSON format (disabled text blob market context)
@@ -2149,7 +2177,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 current_position_type,
                 position_details,
                 working_orders,
-                contract_id
+                contract_id,
+                upcoming_events=upcoming_events
             )
             
             # TEMPORARY: Send only JSON format (disabled text blob market context)
@@ -3842,7 +3871,7 @@ def calculate_overnight_metrics(bars):
         logging.exception("Full traceback:")
         return {'onh': None, 'onl': None, 'globex_vwap': None}
 
-def generate_market_data_json(bars, yahoo_context_text, position_type, position_details=None, working_orders=None, contract_id='', num_bars=36):
+def generate_market_data_json(bars, yahoo_context_text, position_type, position_details=None, working_orders=None, contract_id='', num_bars=36, upcoming_events=None):
     """Generate structured JSON market data combining Yahoo Finance and TopstepX bars.
     
     Args:
@@ -3853,6 +3882,7 @@ def generate_market_data_json(bars, yahoo_context_text, position_type, position_
         working_orders: Working orders dict
         contract_id: Contract ID for parsing working orders
         num_bars: Number of bars to include (default 36)
+        upcoming_events: List of upcoming economic events (default None)
     
     Returns:
         str: JSON string with structured market data
@@ -3947,6 +3977,19 @@ def generate_market_data_json(bars, yahoo_context_text, position_type, position_
                 "stop": round(stop, 2) if stop else None,
                 "target": round(target, 2) if target else None
             }
+        
+        # Include upcoming economic events if provided
+        if upcoming_events:
+            market_data["UpcomingEconomicEvents"] = []
+            for event in upcoming_events:
+                event_data = {
+                    "name": event.get('name', ''),
+                    "datetime": event.get('datetime', ''),
+                    "minutes_until": event.get('minutes_until', 0),
+                    "severity": event.get('severity', 'Medium'),
+                    "market_impact": event.get('market_impact_description', '')
+                }
+                market_data["UpcomingEconomicEvents"].append(event_data)
         
         # Convert to formatted JSON string
         json_string = json.dumps(market_data, indent=2)
@@ -4469,6 +4512,9 @@ SUPABASE_CLIENT = None
 config = configparser.ConfigParser()
 config.read('config.ini')
 
+# Make config globally accessible
+CONFIG = config
+
 # Logging setup with UTF-8 encoding
 LOG_FOLDER = config.get('General', 'log_folder', fallback='logs')
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -4822,6 +4868,62 @@ try:
 except Exception as e:
     logging.error(f"Error checking/generating startup market context: {e}")
     logging.exception("Full traceback:")
+
+# Check/fetch economic calendar data if enabled
+logging.info("=" * 80)
+logging.info("CHECKING ECONOMIC CALENDAR DATA")
+logging.info("=" * 80)
+try:
+    if config.has_section('EconomicCalendar') and config.getboolean('EconomicCalendar', 'enable_economic_calendar', fallback=False):
+        calendar_file = config.get('EconomicCalendar', 'data_file', fallback='market_data/economic_calendar.json')
+        classification_prompt = config.get('EconomicCalendar', 'classification_prompt', fallback='Analyze these economic calendar events and classify each by market impact severity (High/Medium/Low) for ES futures trading. For each event, provide expected market reaction and affected instruments. Return JSON format.')
+        
+        if not economic_calendar.has_current_week_data(calendar_file):
+            logging.info("No economic calendar data for current trading week - Fetching now...")
+            
+            # Fetch events from MarketWatch
+            raw_events = economic_calendar.fetch_marketwatch_calendar()
+            
+            if raw_events:
+                logging.info(f"Fetched {len(raw_events)} events from MarketWatch")
+                
+                # Classify events with LLM
+                openai_config = {
+                    'api_key': OPENAI_API_KEY,
+                    'api_url': OPENAI_API_URL
+                }
+                classified_events = economic_calendar.classify_events_with_llm(raw_events, openai_config, classification_prompt)
+                
+                # Save to file
+                if economic_calendar.save_calendar_data(classified_events, calendar_file):
+                    logging.info(f"Economic calendar data saved to {calendar_file}")
+                    logging.info("=" * 80)
+                    logging.info("ECONOMIC EVENTS FOR THIS WEEK:")
+                    logging.info("=" * 80)
+                    for event in classified_events[:10]:  # Show first 10 events
+                        logging.info(f"{event.get('datetime', 'Unknown time')}: {event.get('name', 'Unknown')} ({event.get('severity', 'Unknown')})")
+                    if len(classified_events) > 10:
+                        logging.info(f"... and {len(classified_events) - 10} more events")
+                    logging.info("=" * 80)
+                else:
+                    logging.error("Failed to save economic calendar data")
+            else:
+                logging.warning("No events fetched from MarketWatch")
+        else:
+            logging.info("Economic calendar data already exists for current trading week")
+            # Load and display summary
+            calendar_data = economic_calendar.load_calendar_data(calendar_file)
+            if calendar_data and 'events' in calendar_data:
+                events = calendar_data['events']
+                logging.info(f"Loaded {len(events)} events for week {calendar_data.get('week_start')} to {calendar_data.get('week_end')}")
+    else:
+        logging.info("Economic calendar integration disabled in config")
+except Exception as e:
+    logging.error(f"Error checking/fetching economic calendar: {e}")
+    logging.exception("Full traceback:")
+    logging.info("System will continue without economic calendar data")
+
+logging.info("=" * 80)
 
 # Log exact Topstep URLs and example POST requests for debug
 logging.info("Topstep Debug URLs (all POST requests):")

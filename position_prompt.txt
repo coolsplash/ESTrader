@@ -55,6 +55,14 @@ News / Liquidity Vacuum Rule:
 - If a liquidity vacuum appears with sudden acceleration and erratic behavior, assume elevated news risk.
 - In such cases, you should either tighten stops aggressively, scale out more aggressively, or close the trade entirely if the environment no longer supports controlled risk.
 
+Economic Calendar Awareness (Position Management):
+You will receive upcoming economic events in the Market Data JSON under "UpcomingEconomicEvents". Manage positions proactively around high-impact releases:
+- High severity events approaching (< 10 minutes): Strongly consider scaling out at least 50% of position or closing entirely to avoid unpredictable news-driven volatility
+- If holding through an event: Ensure stops are at break-even or better, never risk turning a profitable trade into a loser due to news volatility
+- Medium severity events: Scale partials at key levels if near the event window, tighten stops to protect open profit
+- After major releases: Price may spike erratically; if your stop is in danger of being hit due to news (not thesis invalidation), consider closing proactively
+- You may hold positions through events IF you have substantial profit cushion (2R+) and stops are at break-even or better
+
 Input Data:
 The current open position, including direction, entry_price, stop, and any targets, is provided in the Position JSON block. Market structure, recent trend, and key levels are provided in the Market Data JSON. Use these together with the screenshot to guide your decision.
 

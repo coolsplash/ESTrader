@@ -170,25 +170,25 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
         
         logging.info(f"LLM interaction logged to {csv_file}")
         
-        # Also log to Supabase if enabled
+        # Also log to Supabase if enabled (with FULL, untruncated data)
         if SUPABASE_CLIENT:
             try:
                 supabase_data = {
                     'account_id': TOPSTEP_CONFIG.get('account_id', ''),
                     'order_id': None,  # Will be set if available
                     'timestamp': datetime.datetime.now().isoformat(),
-                    'request': LATEST_LLM_DATA['request'],
-                    'response': LATEST_LLM_DATA['response'],
-                    'action': LATEST_LLM_DATA['action'],
-                    'entry_price': float(LATEST_LLM_DATA['entry_price']) if LATEST_LLM_DATA['entry_price'] else None,
-                    'price_target': float(LATEST_LLM_DATA['price_target']) if LATEST_LLM_DATA['price_target'] else None,
-                    'stop_loss': float(LATEST_LLM_DATA['stop_loss']) if LATEST_LLM_DATA['stop_loss'] else None,
-                    'confidence': int(LATEST_LLM_DATA['confidence']) if LATEST_LLM_DATA['confidence'] else None,
-                    'reasoning': LATEST_LLM_DATA['reasoning'],
-                    'context': LATEST_LLM_DATA['context']
+                    'request': request_prompt if request_prompt else '',  # Full prompt, not truncated
+                    'response': response_text if response_text else '',  # Full response, not truncated
+                    'action': action or '',
+                    'entry_price': float(entry_price) if entry_price else None,
+                    'price_target': float(price_target) if price_target else None,
+                    'stop_loss': float(stop_loss) if stop_loss else None,
+                    'confidence': int(confidence) if confidence else None,
+                    'reasoning': reasoning if reasoning else '',  # Full reasoning, not truncated
+                    'context': context if context else ''  # Full context, not truncated
                 }
                 SUPABASE_CLIENT.table('llm_interactions').insert(supabase_data).execute()
-                logging.debug("LLM interaction also logged to Supabase")
+                logging.debug("LLM interaction logged to Supabase (full message, not truncated)")
             except Exception as supabase_error:
                 logging.error(f"Error logging to Supabase (non-critical): {supabase_error}")
         
@@ -202,7 +202,7 @@ def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=No
     """Log a trade event to the monthly CSV file.
     
     Args:
-        event_type: "ENTRY", "ADJUSTMENT", "SCALE", "CLOSE"
+        event_type: "ENTRY", "ADJUSTMENT", "HOLD", "SCALE", "CLOSE"
         symbol: Trading symbol (e.g., "ES")
         position_type: "long" or "short"
         size: Number of contracts
@@ -389,31 +389,34 @@ def get_daily_context():
                 
                 # Check if data fetch failed
                 if "Market data unavailable" in context:
-                    # Try to use yesterday's context as fallback
+                    # Data fetch failed - do NOT save error message to file
+                    logging.error("Market data fetch failed - context file will not be created/updated")
+                    # Try to use yesterday's context as fallback (read-only, don't save)
                     yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%y%m%d")
                     yesterday_file = os.path.join(context_folder, f"{yesterday}.txt")
                     if os.path.exists(yesterday_file):
-                        logging.warning(f"Market data fetch failed, using yesterday's context from {yesterday_file}")
+                        logging.warning(f"Using yesterday's context from {yesterday_file} as fallback")
                         with open(yesterday_file, 'r', encoding='utf-8') as f:
-                            context = f.read() + "\n\n[Note: Using previous day's context - current market data unavailable]"
+                            context = f.read()
                     else:
-                        logging.error("No yesterday context available either")
-                        return context  # Return the unavailable message
-                
-                # Save the generated context as base context (never overwritten)
-                with open(base_context_file, 'w', encoding='utf-8') as f:
-                    f.write(context)
-                logging.info(f"Generated and saved base market context to {base_context_file}")
+                        logging.error("No yesterday context available either - returning empty context")
+                        return ""
+                else:
+                    # Data fetch successful - save the generated context
+                    with open(base_context_file, 'w', encoding='utf-8') as f:
+                        f.write(context)
+                    logging.info(f"Generated and saved base market context to {base_context_file}")
             except Exception as e:
                 logging.error(f"Could not generate market context: {e}")
-                # Try yesterday's context as final fallback
+                # Try yesterday's context as final fallback (read-only, don't save)
                 yesterday = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%y%m%d")
                 yesterday_file = os.path.join(context_folder, f"{yesterday}.txt")
                 if os.path.exists(yesterday_file):
-                    logging.warning(f"Exception occurred, using yesterday's context from {yesterday_file}")
+                    logging.warning(f"Exception occurred, using yesterday's context from {yesterday_file} as fallback")
                     with open(yesterday_file, 'r', encoding='utf-8') as f:
-                        context = f.read() + "\n\n[Note: Using previous day's context due to error]"
+                        context = f.read()
                 else:
+                    logging.error("No yesterday context available - returning empty context")
                     return ""
         
         # Note: LLM observations are NOT merged here - they are passed separately 
@@ -536,7 +539,7 @@ def get_window_by_partial_title(partial_title):
         return results[0]  # Return the first match
     return None
 
-def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_folder=None, enable_save_screenshots=False):
+def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, left_offset=0, right_offset=0, save_folder=None, enable_save_screenshots=False):
     """Capture the full screen or a specific window (by partial title) using Win32 PrintWindow without activating, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string."""
     logging.info("Capturing screenshot.")
     if window_title:
@@ -561,11 +564,15 @@ def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_fo
 
         logging.info(f"Window dimensions: {width}x{height}")
 
-        # Check if offsets would result in invalid height
+        # Check if offsets would result in invalid dimensions
+        effective_width = width - left_offset - right_offset
         effective_height = height - top_offset - bottom_offset
         if effective_height <= 0:
             logging.error(f"Offsets result in invalid effective height: {effective_height} (original height: {height}, top_offset: {top_offset}, bottom_offset: {bottom_offset})")
             raise ValueError("Offsets result in invalid effective height.")
+        if effective_width <= 0:
+            logging.error(f"Offsets result in invalid effective width: {effective_width} (original width: {width}, left_offset: {left_offset}, right_offset: {right_offset})")
+            raise ValueError("Offsets result in invalid effective width.")
 
         # Capture using Win32 PrintWindow (works without bringing to foreground)
         try:
@@ -617,9 +624,9 @@ def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, save_fo
             raise ValueError(f"Failed to capture window: {e}")
 
         # Apply crop for offsets
-        if top_offset > 0 or bottom_offset > 0:
-            screenshot = screenshot.crop((0, top_offset, width, height - bottom_offset))
-            logging.info(f"Applied offsets: top={top_offset}, bottom={bottom_offset}")
+        if top_offset > 0 or bottom_offset > 0 or left_offset > 0 or right_offset > 0:
+            screenshot = screenshot.crop((left_offset, top_offset, width - right_offset, height - bottom_offset))
+            logging.info(f"Applied offsets: top={top_offset}, bottom={bottom_offset}, left={left_offset}, right={right_offset}")
     else:
         logging.info("Capturing full screen.")
         screenshot = ImageGrab.grab()  # Full screen; offsets not applied
@@ -665,8 +672,8 @@ def upload_to_llm(image_base64, prompt, model, enable_llm, api_url, api_key):
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
                 ]
             }
-        ],
-        "max_tokens": 300  # Adjust as needed
+        ]#,
+        #"max_tokens": 300  # Adjust as needed
     }
     try:
         response = requests.post(api_url, headers=headers, json=payload)
@@ -1063,6 +1070,25 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
         order_ids = parse_working_orders(working_orders, contract_id)
         stop_loss_order_id = order_ids.get('stop_loss_order_id')
         take_profit_order_id = order_ids.get('take_profit_order_id')
+        current_stop_loss = order_ids.get('stop_loss_price')
+        current_take_profit = order_ids.get('take_profit_price')
+        
+        # Check if values actually changed (tolerance for floating point comparison)
+        tolerance = 0.01
+        stop_changed = False
+        target_changed = False
+        
+        if current_stop_loss and new_stop_loss:
+            stop_changed = abs(float(current_stop_loss) - float(new_stop_loss)) > tolerance
+        
+        if current_take_profit and new_price_target:
+            target_changed = abs(float(current_take_profit) - float(new_price_target)) > tolerance
+        
+        values_changed = stop_changed or target_changed
+        
+        logging.info(f"Current values - Stop: {current_stop_loss}, Target: {current_take_profit}")
+        logging.info(f"New values - Stop: {new_stop_loss}, Target: {new_price_target}")
+        logging.info(f"Values changed: Stop={stop_changed}, Target={target_changed}, Overall={values_changed}")
         
         # Set up headers for modify requests
         headers = {
@@ -1072,8 +1098,14 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
         
         modify_url = base_url + modify_order_endpoint
         
-        # Modify stop loss order if order ID found
-        if stop_loss_order_id and new_stop_loss:
+        # Only modify orders if values actually changed
+        if not values_changed:
+            logging.info("Stop loss and price target unchanged - skipping broker modifications")
+        else:
+            logging.info("Values changed - proceeding with broker modifications")
+        
+        # Modify stop loss order if order ID found AND value changed
+        if stop_loss_order_id and new_stop_loss and stop_changed:
             stop_loss_payload = {
                 "accountId": int(account_id),
                 "orderId": int(stop_loss_order_id),
@@ -1106,8 +1138,8 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
             if not stop_loss_order_id:
                 logging.warning("No stop loss order ID found - cannot modify")
         
-        # Modify take profit order if order ID found
-        if take_profit_order_id and new_price_target:
+        # Modify take profit order if order ID found AND value changed
+        if take_profit_order_id and new_price_target and target_changed:
             take_profit_payload = {
                 "accountId": int(account_id),
                 "orderId": int(take_profit_order_id),
@@ -1140,11 +1172,15 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
             if not take_profit_order_id:
                 logging.warning("No take profit order ID found - cannot modify")
         
-        # Log ADJUSTMENT event to CSV
+        # Log event to CSV - ADJUSTMENT if values changed, HOLD if they stayed the same
         # Get order_id from active trade info
         trade_info = get_active_trade_info()
+        event_type = "ADJUSTMENT" if values_changed else "HOLD"
+        
+        logging.info(f"Logging {event_type} event (values_changed={values_changed})")
+        
         log_trade_event(
-            event_type="ADJUSTMENT",
+            event_type=event_type,
             symbol=symbol,
             position_type=position_type,
             size=size,
@@ -1170,7 +1206,10 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
             logging.info(f"Updated active_trade.json with new values: Stop={new_stop_loss}, Target={new_price_target}")
         
         logging.info("=" * 80)
-        logging.info("STOP LOSS AND TAKE PROFIT MODIFICATION COMPLETE")
+        if values_changed:
+            logging.info("STOP LOSS AND TAKE PROFIT MODIFICATION COMPLETE")
+        else:
+            logging.info("POSITION MANAGEMENT - HOLD (NO CHANGES NEEDED)")
         logging.info("=" * 80)
             
     except Exception as e:
@@ -1585,7 +1624,7 @@ def _update_dashboard_widgets():
     except Exception as e:
         logging.error(f"Error updating dashboard widgets: {e}")
 
-def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
+def job(window_title, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
     """The main job to run periodically."""
     global PREVIOUS_POSITION_TYPE
     
@@ -1766,7 +1805,7 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
                         f"Unrealized P&L={position_details.get('unrealized_pnl')}")
             
             # Take screenshot for position management
-            image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
+            image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
             
             # Format prompt with position details
             position_prompt_template = config.get('LLM', 'position_prompt', fallback='')
@@ -1886,7 +1925,7 @@ def job(window_title, top_offset, bottom_offset, save_folder, begin_time, end_ti
         logging.info("No active position - analyzing for new entry opportunities")
         logging.info(f"Using context: {daily_context[:50]}..." if len(daily_context) > 50 else f"Using context: {daily_context}")
 
-        image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, save_folder, enable_save_screenshots)
+        image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
         # Select and format prompt based on current_position_type
         llm_observations = get_llm_observations()
         if current_position_type == 'none':
@@ -3434,13 +3473,15 @@ FORCE_CLOSE_TIME = config.get('General', 'force_close_time', fallback='23:59')
 WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
 TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
 BOTTOM_OFFSET = int(config.get('General', 'bottom_offset', fallback='0'))
+LEFT_OFFSET = int(config.get('General', 'left_offset', fallback='0'))
+RIGHT_OFFSET = int(config.get('General', 'right_offset', fallback='0'))
 SAVE_FOLDER = config.get('General', 'save_folder', fallback=None)
 ENABLE_LLM = config.getboolean('General', 'enable_llm', fallback=True)
 ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
 EXECUTE_TRADES = config.getboolean('General', 'execute_trades', fallback=False)
 ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
 
-logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_WINDOWS={NO_NEW_TRADES_WINDOWS}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
+logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_WINDOWS={NO_NEW_TRADES_WINDOWS}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, LEFT_OFFSET={LEFT_OFFSET}, RIGHT_OFFSET={RIGHT_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
 
 SYMBOL = config.get('LLM', 'symbol', fallback='ES')
 DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')  # Symbol for LLM communications and human readable formats
@@ -3640,16 +3681,25 @@ try:
         analyzer = MarketDataAnalyzer()
         market_context = analyzer.generate_market_context(force_refresh=True)
         
-        # Save the generated context
-        os.makedirs(context_folder, exist_ok=True)
-        with open(context_file, 'w', encoding='utf-8') as f:
-            f.write(market_context)
-        
-        logging.info("=" * 80)
-        logging.info("MARKET CONTEXT GENERATED:")
-        logging.info("=" * 80)
-        logging.info(market_context)
-        logging.info("=" * 80)
+        # Check if data fetch failed
+        if "Market data unavailable" in market_context:
+            logging.error("=" * 80)
+            logging.error("STARTUP MARKET DATA FETCH FAILED")
+            logging.error("Yahoo Finance data is unavailable")
+            logging.error("Context file will not be created")
+            logging.error("System will attempt to use yesterday's context if available")
+            logging.error("=" * 80)
+        else:
+            # Save the generated context only if successful
+            os.makedirs(context_folder, exist_ok=True)
+            with open(context_file, 'w', encoding='utf-8') as f:
+                f.write(market_context)
+            
+            logging.info("=" * 80)
+            logging.info("MARKET CONTEXT GENERATED:")
+            logging.info("=" * 80)
+            logging.info(market_context)
+            logging.info("=" * 80)
     else:
         logging.info(f"Market context already exists for today ({today})")
         with open(context_file, 'r', encoding='utf-8') as f:
@@ -3704,7 +3754,13 @@ def refresh_base_context():
         analyzer = MarketDataAnalyzer()
         market_context = analyzer.generate_market_context(force_refresh=True)
         
-        # Save to base context file (YYMMDD.txt)
+        # Check if data fetch failed
+        if "Market data unavailable" in market_context:
+            logging.error("Scheduled context refresh failed - Yahoo Finance data unavailable")
+            logging.error("Existing context file will not be overwritten")
+            return
+        
+        # Save to base context file (YYMMDD.txt) only if fetch was successful
         context_folder = 'context'
         os.makedirs(context_folder, exist_ok=True)
         today = datetime.datetime.now().strftime("%y%m%d")
@@ -3718,6 +3774,7 @@ def refresh_base_context():
     except Exception as e:
         logging.error(f"Error during scheduled context refresh: {e}")
         logging.exception("Full traceback:")
+        logging.error("Existing context file will not be overwritten")
 
 # Schedule the job every INTERVAL_MINUTES minutes
 schedule.every(INTERVAL_MINUTES).minutes.do(
@@ -3725,6 +3782,8 @@ schedule.every(INTERVAL_MINUTES).minutes.do(
     window_title=WINDOW_TITLE, 
     top_offset=TOP_OFFSET, 
     bottom_offset=BOTTOM_OFFSET, 
+    left_offset=LEFT_OFFSET, 
+    right_offset=RIGHT_OFFSET, 
     save_folder=SAVE_FOLDER, 
     begin_time=BEGIN_TIME, 
     end_time=END_TIME, 
@@ -3757,6 +3816,8 @@ job(
     window_title=WINDOW_TITLE, 
     top_offset=TOP_OFFSET, 
     bottom_offset=BOTTOM_OFFSET, 
+    left_offset=LEFT_OFFSET, 
+    right_offset=RIGHT_OFFSET, 
     save_folder=SAVE_FOLDER, 
     begin_time=BEGIN_TIME, 
     end_time=END_TIME, 
@@ -4117,7 +4178,7 @@ def reload_config():
     """Reload configuration from config.ini without restarting the application."""
     global config, INTERVAL_MINUTES, TRADE_STATUS_CHECK_INTERVAL, BEGIN_TIME, END_TIME
     global NO_NEW_TRADES_WINDOWS, FORCE_CLOSE_TIME
-    global WINDOW_TITLE, TOP_OFFSET, BOTTOM_OFFSET, SAVE_FOLDER
+    global WINDOW_TITLE, TOP_OFFSET, BOTTOM_OFFSET, LEFT_OFFSET, RIGHT_OFFSET, SAVE_FOLDER
     global ENABLE_LLM, ENABLE_TRADING, EXECUTE_TRADES, ENABLE_SAVE_SCREENSHOTS
     global SYMBOL, DISPLAY_SYMBOL, POSITION_TYPE, NO_POSITION_PROMPT
     global LONG_POSITION_PROMPT, SHORT_POSITION_PROMPT, MODEL
@@ -4142,6 +4203,8 @@ def reload_config():
         WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
         TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
         BOTTOM_OFFSET = int(config.get('General', 'bottom_offset', fallback='0'))
+        LEFT_OFFSET = int(config.get('General', 'left_offset', fallback='0'))
+        RIGHT_OFFSET = int(config.get('General', 'right_offset', fallback='0'))
         SAVE_FOLDER = config.get('General', 'save_folder', fallback=None)
         ENABLE_LLM = config.getboolean('General', 'enable_llm', fallback=True)
         ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
@@ -4200,6 +4263,8 @@ def reload_config():
             window_title=WINDOW_TITLE, 
             top_offset=TOP_OFFSET, 
             bottom_offset=BOTTOM_OFFSET, 
+            left_offset=LEFT_OFFSET, 
+            right_offset=RIGHT_OFFSET, 
             save_folder=SAVE_FOLDER, 
             begin_time=BEGIN_TIME, 
             end_time=END_TIME,
@@ -4278,7 +4343,16 @@ def refresh_market_context():
         analyzer = MarketDataAnalyzer()
         market_context = analyzer.generate_market_context(force_refresh=True)
         
-        # Save the generated context to base context file (YYMMDD.txt)
+        # Check if data fetch failed
+        if "Market data unavailable" in market_context:
+            logging.error("=" * 80)
+            logging.error("MARKET DATA FETCH FAILED")
+            logging.error("Yahoo Finance data is unavailable")
+            logging.error("Existing context file will not be overwritten")
+            logging.error("=" * 80)
+            return
+        
+        # Save the generated context to base context file (YYMMDD.txt) only if successful
         # This does NOT overwrite the LLM's updated context (YYMMDD_LLM.txt)
         context_folder = 'context'
         os.makedirs(context_folder, exist_ok=True)
@@ -4304,6 +4378,7 @@ def refresh_market_context():
     except Exception as e:
         logging.error(f"Error refreshing market context: {e}")
         logging.exception("Full traceback:")
+        logging.error("Existing context file will not be overwritten")
 
 def manual_job():
     logging.info("Manual screenshot triggered.")
@@ -4311,6 +4386,8 @@ def manual_job():
         window_title=WINDOW_TITLE, 
         top_offset=TOP_OFFSET, 
         bottom_offset=BOTTOM_OFFSET, 
+        left_offset=LEFT_OFFSET, 
+        right_offset=RIGHT_OFFSET, 
         save_folder=SAVE_FOLDER, 
         begin_time=BEGIN_TIME, 
         end_time=END_TIME,

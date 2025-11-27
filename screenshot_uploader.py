@@ -17,6 +17,7 @@ import logging
 import base64  # For Basic Auth
 import win32ui
 import win32con
+import win32process
 from ctypes import windll
 import tkinter as tk
 from tkinter import messagebox
@@ -33,6 +34,13 @@ try:
 except ImportError:
     SUPABASE_AVAILABLE = False
     logging.warning("Supabase package not installed - database logging disabled")
+
+# psutil for process filtering
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 def get_active_trade_info():
     """Get the current active trade info from file.
@@ -317,6 +325,8 @@ def log_trade_event(event_type, symbol, position_type, size, price, stop_loss=No
         # Clear trade info if position fully closed
         if event_type == "CLOSE":
             clear_active_trade_info()
+            # Disable monitoring since position is closed
+            disable_trade_monitoring("Position closed via log_trade_event")
         
         return order_id
         
@@ -526,27 +536,121 @@ def send_telegram_message(message, telegram_config):
         logging.error(f"Error sending Telegram notification: {e}")
         return False
 
-def get_window_by_partial_title(partial_title):
-    """Find a window handle by partial, case-insensitive title match."""
+def get_window_by_partial_title(partial_title, process_name=None):
+    """Find a window handle by partial, case-insensitive title match, optionally filtered by process name.
+    
+    Uses smart prioritization to select the main application window over child windows/panels.
+    
+    Args:
+        partial_title: Substring to search for in window title (case-insensitive)
+        process_name: Optional process name to filter by (e.g., 'Bookmap.exe')
+    
+    Returns:
+        Window handle (hwnd) or None if not found
+    """
     def callback(hwnd, results):
         if win32gui.IsWindowVisible(hwnd):
             title = win32gui.GetWindowText(hwnd)
             if partial_title.lower() in title.lower():
-                results.append(hwnd)
+                # Get process name if filtering is requested
+                proc_name = None
+                if process_name and PSUTIL_AVAILABLE:
+                    try:
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        proc = psutil.Process(pid)
+                        proc_name = proc.name()
+                    except:
+                        proc_name = "Unknown"
+                
+                # Get window properties for prioritization
+                try:
+                    rect = win32gui.GetWindowRect(hwnd)
+                    width = rect[2] - rect[0]
+                    height = rect[3] - rect[1]
+                    area = width * height
+                    
+                    # Check if this is a child window
+                    parent = win32gui.GetParent(hwnd)
+                    is_child = (parent != 0)
+                    
+                    # Get window style
+                    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                    # Check for main window characteristics
+                    has_caption = bool(style & win32con.WS_CAPTION)
+                    has_sysmenu = bool(style & win32con.WS_SYSMENU)
+                    
+                except:
+                    area = 0
+                    is_child = False
+                    has_caption = False
+                    has_sysmenu = False
+                
+                results.append({
+                    'hwnd': hwnd,
+                    'title': title,
+                    'proc_name': proc_name,
+                    'area': area,
+                    'is_child': is_child,
+                    'has_caption': has_caption,
+                    'has_sysmenu': has_sysmenu,
+                    'title_length': len(title)
+                })
+    
     results = []
     win32gui.EnumWindows(callback, results)
-    if results:
-        return results[0]  # Return the first match
-    return None
+    
+    if not results:
+        logging.error(f"No window found matching title: '{partial_title}'")
+        return None
+    
+    # Filter by process name if specified
+    if process_name:
+        if not PSUTIL_AVAILABLE:
+            logging.warning("psutil not available - cannot filter by process name, using title match only")
+        else:
+            original_count = len(results)
+            results = [r for r in results if r['proc_name'] and r['proc_name'].lower() == process_name.lower()]
+            if len(results) < original_count:
+                logging.info(f"Filtered {original_count} window(s) by process name '{process_name}' -> {len(results)} match(es)")
+    
+    if not results:
+        logging.error(f"No window found matching title '{partial_title}' and process '{process_name}'")
+        return None
+    
+    # Log all matches for debugging
+    if len(results) > 1:
+        logging.warning(f"Found {len(results)} matching windows:")
+        for r in results:
+            logging.warning(f"  - HWND={r['hwnd']}: '{r['title']}' "
+                          f"(Size={r['area']}, Child={r['is_child']}, Caption={r['has_caption']}, SysMenu={r['has_sysmenu']})")
+    
+    # Sort by priority to select main window:
+    # 1. Non-child windows first (parent=0)
+    # 2. Windows with caption and system menu (main window characteristics)
+    # 3. Larger windows (main windows are typically larger than panels)
+    # 4. Shorter titles (child windows often have longer descriptive titles)
+    results.sort(key=lambda r: (
+        r['is_child'],              # False < True, so non-child windows first
+        not r['has_caption'],       # Main windows have captions
+        not r['has_sysmenu'],       # Main windows have system menu
+        -r['area'],                 # Larger windows preferred (negative for descending)
+        r['title_length']           # Shorter titles preferred
+    ))
+    
+    selected = results[0]
+    logging.info(f"Selected window: '{selected['title']}' (Process: {selected['proc_name'] or 'N/A'}, "
+                f"HWND={selected['hwnd']}, Size={selected['area']}, Child={selected['is_child']})")
+    
+    return selected['hwnd']
 
-def capture_screenshot(window_title=None, top_offset=0, bottom_offset=0, left_offset=0, right_offset=0, save_folder=None, enable_save_screenshots=False):
+def capture_screenshot(window_title=None, window_process_name=None, top_offset=0, bottom_offset=0, left_offset=0, right_offset=0, save_folder=None, enable_save_screenshots=False):
     """Capture the full screen or a specific window (by partial title) using Win32 PrintWindow without activating, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string."""
     logging.info("Capturing screenshot.")
     if window_title:
-        hwnd = get_window_by_partial_title(window_title)
+        hwnd = get_window_by_partial_title(window_title, window_process_name)
         if not hwnd:
-            logging.error(f"No window found matching partial title '{window_title}'.")
-            raise ValueError(f"No window found matching partial title '{window_title}'.")
+            logging.error(f"No window found matching partial title '{window_title}'{' and process ' + window_process_name if window_process_name else ''}.")
+            raise ValueError(f"No window found matching partial title '{window_title}'{' and process ' + window_process_name if window_process_name else ''}.")
         logging.info(f"Window found: HWND={hwnd}, Title={win32gui.GetWindowText(hwnd)}")
 
         # Check if window is minimized and restore it without activating
@@ -1624,7 +1728,7 @@ def _update_dashboard_widgets():
     except Exception as e:
         logging.error(f"Error updating dashboard widgets: {e}")
 
-def job(window_title, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
+def job(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
     """The main job to run periodically."""
     global PREVIOUS_POSITION_TYPE
     
@@ -1805,7 +1909,7 @@ def job(window_title, top_offset, bottom_offset, left_offset, right_offset, save
                         f"Unrealized P&L={position_details.get('unrealized_pnl')}")
             
             # Take screenshot for position management
-            image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
+            image_base64 = capture_screenshot(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
             
             # Format prompt with position details
             position_prompt_template = config.get('LLM', 'position_prompt', fallback='')
@@ -1925,7 +2029,7 @@ def job(window_title, top_offset, bottom_offset, left_offset, right_offset, save
         logging.info("No active position - analyzing for new entry opportunities")
         logging.info(f"Using context: {daily_context[:50]}..." if len(daily_context) > 50 else f"Using context: {daily_context}")
 
-        image_base64 = capture_screenshot(window_title, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
+        image_base64 = capture_screenshot(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
         # Select and format prompt based on current_position_type
         llm_observations = get_llm_observations()
         if current_position_type == 'none':
@@ -2938,6 +3042,9 @@ def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_
                 reasoning=reasoning
             )
             
+            # Enable trade monitoring now that we have an active position
+            enable_trade_monitoring(f"Position opened: {trade_position_type.upper()}")
+            
             # Send Telegram notification for entry
             action_emoji = "🟢" if action == 'buy' else "🔴"
             telegram_msg = f"{action_emoji} <b>ORDER PLACED: {action.upper()}</b>\n"
@@ -3465,12 +3572,15 @@ logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler]
 logging.info("Application started.")
 
 INTERVAL_MINUTES = int(config.get('General', 'interval_minutes', fallback='5'))
+INTERVAL_SECONDS = int(config.get('General', 'interval_seconds', fallback=str(INTERVAL_MINUTES * 60)))
+INTERVAL_SCHEDULE = config.get('General', 'interval_schedule', fallback='')
 TRADE_STATUS_CHECK_INTERVAL = int(config.get('General', 'trade_status_check_interval', fallback='10'))
 BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
 END_TIME = config.get('General', 'end_time', fallback='23:59')
 NO_NEW_TRADES_WINDOWS = config.get('General', 'no_new_trades_windows', fallback='')
 FORCE_CLOSE_TIME = config.get('General', 'force_close_time', fallback='23:59')
 WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
+WINDOW_PROCESS_NAME = config.get('General', 'window_process_name', fallback=None)
 TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
 BOTTOM_OFFSET = int(config.get('General', 'bottom_offset', fallback='0'))
 LEFT_OFFSET = int(config.get('General', 'left_offset', fallback='0'))
@@ -3481,7 +3591,7 @@ ENABLE_TRADING = config.getboolean('General', 'enable_trading', fallback=False)
 EXECUTE_TRADES = config.getboolean('General', 'execute_trades', fallback=False)
 ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots', fallback=False)
 
-logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_WINDOWS={NO_NEW_TRADES_WINDOWS}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, LEFT_OFFSET={LEFT_OFFSET}, RIGHT_OFFSET={RIGHT_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
+logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, INTERVAL_SECONDS={INTERVAL_SECONDS}, INTERVAL_SCHEDULE={INTERVAL_SCHEDULE or 'Not set (using interval_seconds)'}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_WINDOWS={NO_NEW_TRADES_WINDOWS}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, WINDOW_PROCESS_NAME={WINDOW_PROCESS_NAME or 'Not set'}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, LEFT_OFFSET={LEFT_OFFSET}, RIGHT_OFFSET={RIGHT_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
 
 SYMBOL = config.get('LLM', 'symbol', fallback='ES')
 DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')  # Symbol for LLM communications and human readable formats
@@ -3776,44 +3886,20 @@ def refresh_base_context():
         logging.exception("Full traceback:")
         logging.error("Existing context file will not be overwritten")
 
-# Schedule the job every INTERVAL_MINUTES minutes
-schedule.every(INTERVAL_MINUTES).minutes.do(
-    job, 
-    window_title=WINDOW_TITLE, 
-    top_offset=TOP_OFFSET, 
-    bottom_offset=BOTTOM_OFFSET, 
-    left_offset=LEFT_OFFSET, 
-    right_offset=RIGHT_OFFSET, 
-    save_folder=SAVE_FOLDER, 
-    begin_time=BEGIN_TIME, 
-    end_time=END_TIME, 
-    symbol=SYMBOL, 
-    position_type=POSITION_TYPE, 
-    no_position_prompt=NO_POSITION_PROMPT, 
-    long_position_prompt=LONG_POSITION_PROMPT, 
-    short_position_prompt=SHORT_POSITION_PROMPT, 
-    model=MODEL, 
-    topstep_config=TOPSTEP_CONFIG, 
-    enable_llm=ENABLE_LLM,
-    enable_trading=ENABLE_TRADING,
-    openai_api_url=OPENAI_API_URL,
-    openai_api_key=OPENAI_API_KEY,
-    enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
-    auth_token=AUTH_TOKEN,
-    execute_trades=EXECUTE_TRADES,
-    telegram_config=TELEGRAM_CONFIG,
-    no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
-    force_close_time=FORCE_CLOSE_TIME
-)
+# NOTE: Job scheduling is now handled dynamically in run_scheduler() based on interval_seconds/interval_schedule
+# The old schedule.every(INTERVAL_MINUTES).minutes.do(job) approach has been replaced with dynamic interval checking
+# This allows for time-slot-based scheduling (e.g., different intervals for RTH vs after-hours)
 
 # Schedule base context refresh every 30 minutes to keep market data current
 schedule.every(30).minutes.do(refresh_base_context)
 logging.info("Scheduled base context refresh every 30 minutes")
+logging.info("Job scheduling uses dynamic intervals - see interval_seconds and interval_schedule in config.ini")
 
 # Run the first job immediately on startup (before entering the scheduler loop)
 logging.info("Running initial screenshot job immediately on startup...")
 job(
     window_title=WINDOW_TITLE, 
+    window_process_name=WINDOW_PROCESS_NAME, 
     top_offset=TOP_OFFSET, 
     bottom_offset=BOTTOM_OFFSET, 
     left_offset=LEFT_OFFSET, 
@@ -3845,25 +3931,174 @@ running = False
 scheduler_thread = None
 trade_monitor_thread = None
 
+# Global flag to control trade monitoring (smart monitoring - only when needed)
+monitoring_enabled = True  # Start as True for initial startup check
+monitoring_lock = threading.Lock()  # Thread-safe flag access
+
+def enable_trade_monitoring(reason=""):
+    """Enable trade monitoring (start checking for position changes)."""
+    global monitoring_enabled
+    with monitoring_lock:
+        if not monitoring_enabled:
+            monitoring_enabled = True
+            logging.info(f"✅ Trade monitoring ENABLED{': ' + reason if reason else ''}")
+
+def disable_trade_monitoring(reason=""):
+    """Disable trade monitoring (stop checking for position changes)."""
+    global monitoring_enabled
+    with monitoring_lock:
+        if monitoring_enabled:
+            monitoring_enabled = False
+            logging.info(f"⛔ Trade monitoring DISABLED{': ' + reason if reason else ''}")
+
+def get_current_interval():
+    """Get the interval_seconds for the current time based on interval_schedule.
+    
+    Returns:
+        int: interval_seconds for current time, or -1 if screenshots disabled
+    """
+    global INTERVAL_SCHEDULE, INTERVAL_SECONDS
+    
+    if not INTERVAL_SCHEDULE or INTERVAL_SCHEDULE.strip() == '':
+        # Fallback to interval_seconds if no schedule defined
+        return INTERVAL_SECONDS
+    
+    current_time = datetime.datetime.now().time()
+    
+    # Parse schedule: "00:00-08:30=1800,08:30-09:30=300,..." (times in seconds)
+    slots = [s.strip() for s in INTERVAL_SCHEDULE.split(',') if s.strip()]
+    
+    for slot in slots:
+        try:
+            # Parse: "HH:MM-HH:MM=seconds"
+            time_range, interval = slot.split('=')
+            start_str, end_str = time_range.split('-')
+            start_time = datetime.datetime.strptime(start_str.strip(), "%H:%M").time()
+            end_time = datetime.datetime.strptime(end_str.strip(), "%H:%M").time()
+            interval_seconds = int(interval)
+            
+            # Check if current time is in this slot (handle overnight)
+            in_slot = False
+            if start_time < end_time:
+                # Same-day slot (e.g., 09:30 to 16:00)
+                in_slot = start_time <= current_time < end_time
+            else:
+                # Overnight slot (e.g., 23:00 to 02:00)
+                in_slot = current_time >= start_time or current_time < end_time
+            
+            if in_slot:
+                logging.debug(f"Current time {current_time.strftime('%H:%M')} is in slot {slot} - interval={interval_seconds}s")
+                return interval_seconds
+                
+        except Exception as e:
+            logging.error(f"Error parsing interval_schedule slot '{slot}': {e}")
+            continue
+    
+    # Not in any defined slot - use fallback
+    logging.debug(f"Current time not in any interval_schedule slot - using fallback: {INTERVAL_SECONDS}s")
+    return INTERVAL_SECONDS
+
 def run_scheduler():
-    global running
+    """Scheduler with dynamic interval checking based on time slots."""
+    global running, WINDOW_TITLE, TOP_OFFSET, BOTTOM_OFFSET, LEFT_OFFSET, RIGHT_OFFSET, SAVE_FOLDER
+    global BEGIN_TIME, END_TIME, SYMBOL, POSITION_TYPE, NO_POSITION_PROMPT, LONG_POSITION_PROMPT
+    global SHORT_POSITION_PROMPT, MODEL, TOPSTEP_CONFIG, ENABLE_LLM, ENABLE_TRADING
+    global OPENAI_API_URL, OPENAI_API_KEY, ENABLE_SAVE_SCREENSHOTS, AUTH_TOKEN
+    global EXECUTE_TRADES, TELEGRAM_CONFIG, NO_NEW_TRADES_WINDOWS, FORCE_CLOSE_TIME
+    
+    last_run_time = None
+    last_interval_log = None
+    
     while running:
-        schedule.run_pending()
+        current_interval = get_current_interval()
+        
+        # Log interval changes (but not on every iteration)
+        current_minute = datetime.datetime.now().strftime("%H:%M")
+        if current_minute != last_interval_log:
+            logging.info(f"Current interval: {current_interval}s ({current_interval/60:.1f} minutes)")
+            last_interval_log = current_minute
+        
+        # Skip if disabled (-1)
+        if current_interval == -1:
+            logging.debug("Screenshots disabled for current time slot")
+            time.sleep(60)  # Check again in 1 minute
+            continue
+        
+        # Check if enough time has passed
+        current_time = datetime.datetime.now()
+        if last_run_time is None or (current_time - last_run_time).total_seconds() >= current_interval:
+            logging.info(f"Running scheduled job (interval: {current_interval}s)")
+            try:
+                # Call job directly instead of using schedule.run_pending()
+                job(
+                    window_title=WINDOW_TITLE,
+                    window_process_name=WINDOW_PROCESS_NAME,
+                    top_offset=TOP_OFFSET,
+                    bottom_offset=BOTTOM_OFFSET,
+                    left_offset=LEFT_OFFSET,
+                    right_offset=RIGHT_OFFSET,
+                    save_folder=SAVE_FOLDER,
+                    begin_time=BEGIN_TIME,
+                    end_time=END_TIME,
+                    symbol=SYMBOL,
+                    position_type=POSITION_TYPE,
+                    no_position_prompt=NO_POSITION_PROMPT,
+                    long_position_prompt=LONG_POSITION_PROMPT,
+                    short_position_prompt=SHORT_POSITION_PROMPT,
+                    model=MODEL,
+                    topstep_config=TOPSTEP_CONFIG,
+                    enable_llm=ENABLE_LLM,
+                    enable_trading=ENABLE_TRADING,
+                    openai_api_url=OPENAI_API_URL,
+                    openai_api_key=OPENAI_API_KEY,
+                    enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
+                    auth_token=AUTH_TOKEN,
+                    execute_trades=EXECUTE_TRADES,
+                    telegram_config=TELEGRAM_CONFIG,
+                    no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
+                    force_close_time=FORCE_CLOSE_TIME
+                )
+            except Exception as e:
+                logging.error(f"Error running scheduled job: {e}")
+                logging.exception("Full traceback:")
+            
+            last_run_time = current_time
+        
         time.sleep(1)
 
 def run_trade_monitor():
-    """Background thread to continuously monitor trade status."""
-    global running, ACCOUNT_BALANCE
+    """Background thread to continuously monitor trade status (smart monitoring - only when needed)."""
+    global running, ACCOUNT_BALANCE, monitoring_enabled
     last_active_state = None
     last_position_type = 'none'  # Track last known position
+    initial_check_done = False  # Track if we've done the initial startup check
     
     while running:
         try:
+            # Check if monitoring is enabled
+            with monitoring_lock:
+                is_monitoring = monitoring_enabled
+            
+            if not is_monitoring:
+                # Monitoring disabled - sleep longer and skip checks
+                if not initial_check_done:
+                    logging.debug("Trade monitoring disabled - waiting for trade execution or manual enable")
+                    initial_check_done = True  # Prevent repeated logs
+                time.sleep(60)  # Sleep 1 minute when disabled
+                continue
+            
             # Only check trades during trading hours
             if is_within_time_range(BEGIN_TIME, END_TIME):
                 # Get current position
                 current_position_type = get_current_position(SYMBOL, TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
                 is_active = current_position_type in ['long', 'short']
+                
+                # Initial startup check - disable monitoring if no position found
+                if not initial_check_done:
+                    initial_check_done = True
+                    if not is_active:
+                        disable_trade_monitoring("No positions found on startup")
+                        continue  # Skip to next iteration (will sleep 60s)
                 
                 # Detect position closure (was active, now none)
                 if last_position_type in ['long', 'short'] and current_position_type == 'none':
@@ -3972,10 +4207,17 @@ def run_trade_monitor():
                             # Update dashboard
                             update_dashboard_data()
                             logging.info("Dashboard updated with closed position results")
+                            
+                            # Disable monitoring now that position is closed
+                            disable_trade_monitoring("Position closed")
                         else:
                             logging.warning("Could not fetch trade results from API")
+                            # Still disable monitoring even if we couldn't fetch results
+                            disable_trade_monitoring("Position closed (results fetch failed)")
                     else:
                         logging.warning("No active trade info found for closed position")
+                        # Still disable monitoring
+                        disable_trade_monitoring("Position closed (no trade info found)")
                 
                 # Update last known position
                 last_position_type = current_position_type
@@ -4048,7 +4290,8 @@ def create_tray_icon():
         item('Stop', stop_scheduler),
         item('Reload Config', lambda icon, item: reload_config()),
         item('Refresh Market Context', lambda icon, item: refresh_market_context()),
-        item('Clear Active Trade', lambda icon, item: (clear_active_trade_info(), update_dashboard_data())),
+        item('Clear Active Trade', lambda icon, item: clear_trade_and_disable_monitoring()),
+        item('Enable Trade Monitoring', lambda icon, item: enable_trade_monitoring("Manual enable via tray menu")),
         item('Set Position', pystray.Menu(
             item('None', lambda icon, item: set_position('none')),
             item('Long', lambda icon, item: set_position('long')),
@@ -4106,6 +4349,12 @@ def test_active_trades():
     has_active_trades = check_active_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
     logging.info(f"Test result: Active positions = {has_active_trades}")
 
+def clear_trade_and_disable_monitoring():
+    """Helper function to clear active trade and disable monitoring (for tray menu)."""
+    clear_active_trade_info()
+    disable_trade_monitoring("Manual clear via tray menu")
+    update_dashboard_data()
+
 def create_tray_icon():
     # Use simple icons (green for running, red for stopped)
     green_image = Image.new('RGB', (64, 64), color=(0, 255, 0))
@@ -4116,7 +4365,8 @@ def create_tray_icon():
         item('Stop', stop_scheduler),
         item('Reload Config', lambda icon, item: reload_config()),
         item('Refresh Market Context', lambda icon, item: refresh_market_context()),
-        item('Clear Active Trade', lambda icon, item: (clear_active_trade_info(), update_dashboard_data())),
+        item('Clear Active Trade', lambda icon, item: clear_trade_and_disable_monitoring()),
+        item('Enable Trade Monitoring', lambda icon, item: enable_trade_monitoring("Manual enable via tray menu")),
         item('Set Position', pystray.Menu(
             item('None', lambda icon, item: set_position('none')),
             item('Long', lambda icon, item: set_position('long')),
@@ -4176,9 +4426,9 @@ def test_active_trades():
 
 def reload_config():
     """Reload configuration from config.ini without restarting the application."""
-    global config, INTERVAL_MINUTES, TRADE_STATUS_CHECK_INTERVAL, BEGIN_TIME, END_TIME
+    global config, INTERVAL_MINUTES, INTERVAL_SECONDS, INTERVAL_SCHEDULE, TRADE_STATUS_CHECK_INTERVAL, BEGIN_TIME, END_TIME
     global NO_NEW_TRADES_WINDOWS, FORCE_CLOSE_TIME
-    global WINDOW_TITLE, TOP_OFFSET, BOTTOM_OFFSET, LEFT_OFFSET, RIGHT_OFFSET, SAVE_FOLDER
+    global WINDOW_TITLE, WINDOW_PROCESS_NAME, TOP_OFFSET, BOTTOM_OFFSET, LEFT_OFFSET, RIGHT_OFFSET, SAVE_FOLDER
     global ENABLE_LLM, ENABLE_TRADING, EXECUTE_TRADES, ENABLE_SAVE_SCREENSHOTS
     global SYMBOL, DISPLAY_SYMBOL, POSITION_TYPE, NO_POSITION_PROMPT
     global LONG_POSITION_PROMPT, SHORT_POSITION_PROMPT, MODEL
@@ -4195,12 +4445,15 @@ def reload_config():
         
         # Reload General settings
         INTERVAL_MINUTES = int(config.get('General', 'interval_minutes', fallback='5'))
+        INTERVAL_SECONDS = int(config.get('General', 'interval_seconds', fallback=str(INTERVAL_MINUTES * 60)))
+        INTERVAL_SCHEDULE = config.get('General', 'interval_schedule', fallback='')
         TRADE_STATUS_CHECK_INTERVAL = int(config.get('General', 'trade_status_check_interval', fallback='10'))
         BEGIN_TIME = config.get('General', 'begin_time', fallback='00:00')
         END_TIME = config.get('General', 'end_time', fallback='23:59')
         NO_NEW_TRADES_WINDOWS = config.get('General', 'no_new_trades_windows', fallback='')
         FORCE_CLOSE_TIME = config.get('General', 'force_close_time', fallback='23:59')
         WINDOW_TITLE = config.get('General', 'window_title', fallback=None)
+        WINDOW_PROCESS_NAME = config.get('General', 'window_process_name', fallback=None)
         TOP_OFFSET = int(config.get('General', 'top_offset', fallback='0'))
         BOTTOM_OFFSET = int(config.get('General', 'bottom_offset', fallback='0'))
         LEFT_OFFSET = int(config.get('General', 'left_offset', fallback='0'))
@@ -4248,7 +4501,8 @@ def reload_config():
         })
         
         logging.info("Configuration reloaded successfully:")
-        logging.info(f"  INTERVAL_MINUTES={INTERVAL_MINUTES}")
+        logging.info(f"  INTERVAL_MINUTES={INTERVAL_MINUTES}, INTERVAL_SECONDS={INTERVAL_SECONDS}")
+        logging.info(f"  INTERVAL_SCHEDULE={INTERVAL_SCHEDULE or 'Not set (using interval_seconds)'}")
         logging.info(f"  BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}")
         logging.info(f"  NO_NEW_TRADES_WINDOWS={NO_NEW_TRADES_WINDOWS}")
         logging.info(f"  FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}")
@@ -4256,43 +4510,13 @@ def reload_config():
         logging.info(f"  ACCOUNT_ID={TOPSTEP_CONFIG['account_id']}, CONTRACT_ID={TOPSTEP_CONFIG['contract_id']}")
         logging.info("=" * 80)
         
-        # Clear and reschedule jobs with new interval
+        # Clear and reschedule only the context refresh (job scheduling is handled dynamically)
         schedule.clear()
-        schedule.every(INTERVAL_MINUTES).minutes.do(
-            job, 
-            window_title=WINDOW_TITLE, 
-            top_offset=TOP_OFFSET, 
-            bottom_offset=BOTTOM_OFFSET, 
-            left_offset=LEFT_OFFSET, 
-            right_offset=RIGHT_OFFSET, 
-            save_folder=SAVE_FOLDER, 
-            begin_time=BEGIN_TIME, 
-            end_time=END_TIME,
-            symbol=SYMBOL,
-            position_type=POSITION_TYPE,
-            no_position_prompt=NO_POSITION_PROMPT,
-            long_position_prompt=LONG_POSITION_PROMPT,
-            short_position_prompt=SHORT_POSITION_PROMPT,
-            model=MODEL,
-            topstep_config=TOPSTEP_CONFIG,
-            enable_llm=ENABLE_LLM,
-            enable_trading=ENABLE_TRADING,
-            openai_api_url=OPENAI_API_URL,
-            openai_api_key=OPENAI_API_KEY,
-            enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
-            auth_token=AUTH_TOKEN,
-            execute_trades=EXECUTE_TRADES,
-            telegram_config=TELEGRAM_CONFIG,
-            no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
-            force_close_time=FORCE_CLOSE_TIME
-        )
-        
-        # Reschedule context refresh
         schedule.every(30).minutes.do(refresh_base_context)
         
-        logging.info(f"Scheduler rescheduled with interval: {INTERVAL_MINUTES} minute(s)")
+        logging.info("Config reload complete - changes will take effect immediately")
+        logging.info(f"Dynamic scheduler will use: INTERVAL_SECONDS={INTERVAL_SECONDS}s or INTERVAL_SCHEDULE={INTERVAL_SCHEDULE or 'Not set'}")
         logging.info("Base context refresh rescheduled every 30 minutes")
-        logging.info("Config reload complete - changes will take effect on next job run")
         
         return True
         
@@ -4384,6 +4608,7 @@ def manual_job():
     logging.info("Manual screenshot triggered.")
     job(
         window_title=WINDOW_TITLE, 
+        window_process_name=WINDOW_PROCESS_NAME, 
         top_offset=TOP_OFFSET, 
         bottom_offset=BOTTOM_OFFSET, 
         left_offset=LEFT_OFFSET, 

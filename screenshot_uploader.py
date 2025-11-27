@@ -3512,11 +3512,12 @@ def get_cached_bars(date_str):
 
 def save_bars_to_cache(date_str, contract_id, bars, interval='5m'):
     """Save bars to cache file /cache/bars/YYYYMMDD.json.
+    Merges new bars with existing bars (avoiding duplicates by timestamp).
     
     Args:
         date_str: Date string in YYYYMMDD format
         contract_id: Contract symbol
-        bars: List of bar dicts
+        bars: List of bar dicts to add/merge
         interval: Bar interval (default '5m')
     """
     try:
@@ -3524,19 +3525,43 @@ def save_bars_to_cache(date_str, contract_id, bars, interval='5m'):
         os.makedirs(cache_folder, exist_ok=True)
         cache_file = os.path.join(cache_folder, f"{date_str}.json")
         
-        # Prepare cache data
+        # Read existing cache if it exists
+        existing_bars = []
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    existing_cache = json.load(f)
+                    existing_bars = existing_cache.get('bars', [])
+                    logging.debug(f"Loaded {len(existing_bars)} existing bars from cache")
+            except Exception as e:
+                logging.warning(f"Could not read existing cache file, will overwrite: {e}")
+                existing_bars = []
+        
+        # Merge bars - avoid duplicates by timestamp
+        existing_timestamps = {bar['t'] for bar in existing_bars}
+        new_count = 0
+        for bar in bars:
+            if bar['t'] not in existing_timestamps:
+                existing_bars.append(bar)
+                existing_timestamps.add(bar['t'])
+                new_count += 1
+        
+        # Sort by timestamp to maintain chronological order
+        existing_bars.sort(key=lambda x: x['t'])
+        
+        # Prepare cache data with merged bars
         cache_data = {
             'date': date_str,
             'contract_id': contract_id,
             'interval': interval,
-            'bars': bars,
+            'bars': existing_bars,
             'last_fetched': datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
         }
         
         with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, indent=2)
         
-        logging.info(f"Saved {len(bars)} bars to cache: {cache_file}")
+        logging.info(f"Saved cache: {len(existing_bars)} total bars ({new_count} new, {len(existing_bars)-new_count} existing) to {cache_file}")
         
     except Exception as e:
         logging.error(f"Error saving bars to cache: {e}")

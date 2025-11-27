@@ -1796,6 +1796,19 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
 
     logging.info(f"Starting job at {time.ctime()}")
     
+    # First, verify Bookmap is available before doing anything else
+    if window_title:
+        try:
+            hwnd = get_window_by_partial_title(window_title, window_process_name)
+            if not hwnd:
+                logging.warning(f"Bookmap window not found ('{window_title}'{' / process ' + window_process_name if window_process_name else ''}) - skipping all processing for this cycle")
+                return  # Exit early, scheduler will retry on next interval
+            logging.info(f"Bookmap window verified: HWND={hwnd}")
+        except Exception as e:
+            logging.error(f"Error checking for Bookmap window: {e}")
+            logging.warning("Bookmap not available - skipping all processing for this cycle")
+            return  # Exit early, scheduler will retry on next interval
+    
     current_time = datetime.datetime.now().time()
     begin = datetime.datetime.strptime(begin_time, "%H:%M").time()
     end = datetime.datetime.strptime(end_time, "%H:%M").time()
@@ -1967,7 +1980,12 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                         f"Unrealized P&L={position_details.get('unrealized_pnl')}")
             
             # Take screenshot for position management
-            image_base64 = capture_screenshot(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
+            try:
+                image_base64 = capture_screenshot(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
+            except (ValueError, Exception) as e:
+                logging.error(f"Failed to capture Bookmap screenshot: {e}")
+                logging.warning("Bookmap screenshot not available - skipping all LLM and trading processing for this cycle")
+                return  # Exit early, scheduler will retry on next interval
             
             # Fetch bar data and generate market data JSON
             try:
@@ -2110,7 +2128,12 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
         logging.info("No active position - analyzing for new entry opportunities")
         logging.info(f"Using context: {daily_context[:50]}..." if len(daily_context) > 50 else f"Using context: {daily_context}")
 
-        image_base64 = capture_screenshot(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
+        try:
+            image_base64 = capture_screenshot(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
+        except (ValueError, Exception) as e:
+            logging.error(f"Failed to capture Bookmap screenshot: {e}")
+            logging.warning("Bookmap screenshot not available - skipping all LLM and trading processing for this cycle")
+            return  # Exit early, scheduler will retry on next interval
         
         # Fetch bar data and generate market data JSON
         try:

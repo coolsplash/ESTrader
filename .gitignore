@@ -1,5 +1,7 @@
 # Configuration with sensitive credentials
 config.ini
+.env
+test_config.ini
 
 # Logs directory
 logs/

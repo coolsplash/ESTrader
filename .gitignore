@@ -18,8 +18,11 @@ market_data/
 cache/
 
 # Testing outputs
+testing/testing/
+testing/signalr_logs/
 testing/responses/
 testing/results.csv
+testing/test_llm.py
 
 # Python cache
 __pycache__/

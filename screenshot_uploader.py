@@ -2029,8 +2029,9 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 entry_reasoning = trade_info.get('reasoning', 'Not available')
             
             # Add position data to prompt
-            # Format the position prompt with available template variables
-            position_prompt = position_prompt_template.format(
+            # Format the position prompt with available template variables (using safe formatting)
+            position_prompt = safe_format_prompt(
+                position_prompt_template,
                 symbol=DISPLAY_SYMBOL,
                 size=position_details.get('size', 0),
                 average_price=position_details.get('average_price', 0),
@@ -2158,14 +2159,14 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             logging.warning(f"Error fetching bar data (non-critical): {e}")
             daily_context_with_bars = daily_context
         
-        # Select and format prompt based on current_position_type
+        # Select and format prompt based on current_position_type (using safe formatting)
         llm_observations = get_llm_observations()
         if current_position_type == 'none':
-            prompt = no_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
+            prompt = safe_format_prompt(no_position_prompt, symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
         elif current_position_type == 'long':
-            prompt = long_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
+            prompt = safe_format_prompt(long_position_prompt, symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
         elif current_position_type == 'short':
-            prompt = short_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
+            prompt = safe_format_prompt(short_position_prompt, symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
         else:
             logging.error(f"Invalid position_type: {current_position_type}")
             raise ValueError(f"Invalid position_type: {current_position_type}")
@@ -4488,12 +4489,91 @@ ENABLE_SAVE_SCREENSHOTS = config.getboolean('General', 'enable_save_screenshots'
 
 logging.info(f"Loaded config: INTERVAL_MINUTES={INTERVAL_MINUTES}, INTERVAL_SECONDS={INTERVAL_SECONDS}, INTERVAL_SCHEDULE={INTERVAL_SCHEDULE or 'Not set (using interval_seconds)'}, TRADE_STATUS_CHECK_INTERVAL={TRADE_STATUS_CHECK_INTERVAL}s, BEGIN_TIME={BEGIN_TIME}, END_TIME={END_TIME}, NO_NEW_TRADES_WINDOWS={NO_NEW_TRADES_WINDOWS}, FORCE_CLOSE_TIME={FORCE_CLOSE_TIME}, WINDOW_TITLE={WINDOW_TITLE}, WINDOW_PROCESS_NAME={WINDOW_PROCESS_NAME or 'Not set'}, TOP_OFFSET={TOP_OFFSET}, BOTTOM_OFFSET={BOTTOM_OFFSET}, LEFT_OFFSET={LEFT_OFFSET}, RIGHT_OFFSET={RIGHT_OFFSET}, SAVE_FOLDER={SAVE_FOLDER}, ENABLE_LLM={ENABLE_LLM}, ENABLE_TRADING={ENABLE_TRADING}, EXECUTE_TRADES={EXECUTE_TRADES}, ENABLE_SAVE_SCREENSHOTS={ENABLE_SAVE_SCREENSHOTS}")
 
+def load_prompt_from_config(config_value, fallback_text=''):
+    """
+    Load prompt text from config value.
+    If the config value ends with .txt, treat it as a file path and load the content.
+    Otherwise, return the config value as-is (for backward compatibility).
+    """
+    if not config_value:
+        return fallback_text
+    
+    # Check if it's a file path
+    if config_value.endswith('.txt'):
+        try:
+            with open(config_value, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            logging.error(f"Prompt file not found: {config_value}, using fallback")
+            return fallback_text
+        except Exception as e:
+            logging.error(f"Error reading prompt file {config_value}: {e}, using fallback")
+            return fallback_text
+    else:
+        # Return as-is for backward compatibility with inline prompts
+        return config_value
+
+def escape_format_string(text):
+    """
+    Escape curly braces in text to prevent issues with Python's .format() method.
+    Converts { to {{ and } to }} so they are treated as literals after formatting.
+    """
+    if text is None:
+        return ""
+    return str(text).replace('{', '{{').replace('}', '}}')
+
+def safe_format_prompt(prompt_template, **kwargs):
+    """
+    Safely format a prompt template by escaping special characters in replacement values.
+    This prevents issues when replacement text contains curly braces or quotes.
+    
+    Args:
+        prompt_template: The template string with placeholders like {Context}, {Symbol}, etc.
+        **kwargs: Keyword arguments for replacement values
+    
+    Returns:
+        Formatted prompt string with all placeholders replaced
+    """
+    try:
+        # Escape curly braces in all replacement values to prevent format string issues
+        escaped_kwargs = {key: escape_format_string(value) for key, value in kwargs.items()}
+        
+        # Format the prompt with escaped values
+        return prompt_template.format(**escaped_kwargs)
+    
+    except KeyError as e:
+        logging.error(f"Missing placeholder in prompt template: {e}")
+        logging.error(f"Available keys: {list(kwargs.keys())}")
+        raise
+    except Exception as e:
+        logging.error(f"Error formatting prompt: {e}")
+        logging.error(f"Template length: {len(prompt_template)}, Keys: {list(kwargs.keys())}")
+        raise
+
 SYMBOL = config.get('LLM', 'symbol', fallback='ES')
 DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')  # Symbol for LLM communications and human readable formats
 POSITION_TYPE = config.get('LLM', 'position_type', fallback='none')
-NO_POSITION_PROMPT = config.get('LLM', 'no_position_prompt', fallback='Analyze this Bookmap screenshot for {symbol} futures and advise: buy, hold, or sell. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "buy/hold/sell", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
-LONG_POSITION_PROMPT = config.get('LLM', 'long_position_prompt', fallback='Analyze this Bookmap screenshot for a long position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
-SHORT_POSITION_PROMPT = config.get('LLM', 'short_position_prompt', fallback='Analyze this Bookmap screenshot for a short position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
+
+# Load prompts (supports both file paths and inline text for backward compatibility)
+no_position_prompt_config = config.get('LLM', 'no_position_prompt', fallback='Analyze this Bookmap screenshot for {symbol} futures and advise: buy, hold, or sell. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "buy/hold/sell", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
+NO_POSITION_PROMPT = load_prompt_from_config(no_position_prompt_config, no_position_prompt_config)
+
+# For position prompts, check if separate long/short prompts exist, otherwise use unified position_prompt
+long_prompt_config = config.get('LLM', 'long_position_prompt', fallback=None)
+short_prompt_config = config.get('LLM', 'short_position_prompt', fallback=None)
+position_prompt_config = config.get('LLM', 'position_prompt', fallback='Analyze this Bookmap screenshot for a {position_type} position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{"action": "hold/scale/close", "price_target": number, "stop_loss": number, "reasoning": "text"}}')
+
+# If separate long/short prompts are defined, use those; otherwise use unified position_prompt for both
+if long_prompt_config:
+    LONG_POSITION_PROMPT = load_prompt_from_config(long_prompt_config, position_prompt_config)
+else:
+    LONG_POSITION_PROMPT = load_prompt_from_config(position_prompt_config, position_prompt_config)
+
+if short_prompt_config:
+    SHORT_POSITION_PROMPT = load_prompt_from_config(short_prompt_config, position_prompt_config)
+else:
+    SHORT_POSITION_PROMPT = load_prompt_from_config(position_prompt_config, position_prompt_config)
+
 MODEL = config.get('LLM', 'model', fallback='gpt-4o')
 
 logging.info(f"Loaded LLM config: SYMBOL={SYMBOL}, DISPLAY_SYMBOL={DISPLAY_SYMBOL}, POSITION_TYPE={POSITION_TYPE}, MODEL={MODEL}")
@@ -5363,9 +5443,25 @@ def reload_config():
         SYMBOL = config.get('LLM', 'symbol', fallback='ES')
         DISPLAY_SYMBOL = config.get('LLM', 'display_symbol', fallback='ES')
         POSITION_TYPE = config.get('LLM', 'position_type', fallback='none')
-        NO_POSITION_PROMPT = config.get('LLM', 'no_position_prompt', fallback='')
-        LONG_POSITION_PROMPT = config.get('LLM', 'long_position_prompt', fallback='')
-        SHORT_POSITION_PROMPT = config.get('LLM', 'short_position_prompt', fallback='')
+        
+        # Load prompts (supports both file paths and inline text)
+        no_position_prompt_config = config.get('LLM', 'no_position_prompt', fallback='')
+        NO_POSITION_PROMPT = load_prompt_from_config(no_position_prompt_config, no_position_prompt_config)
+        
+        long_prompt_config = config.get('LLM', 'long_position_prompt', fallback=None)
+        short_prompt_config = config.get('LLM', 'short_position_prompt', fallback=None)
+        position_prompt_config = config.get('LLM', 'position_prompt', fallback='')
+        
+        if long_prompt_config:
+            LONG_POSITION_PROMPT = load_prompt_from_config(long_prompt_config, position_prompt_config)
+        else:
+            LONG_POSITION_PROMPT = load_prompt_from_config(position_prompt_config, position_prompt_config)
+        
+        if short_prompt_config:
+            SHORT_POSITION_PROMPT = load_prompt_from_config(short_prompt_config, position_prompt_config)
+        else:
+            SHORT_POSITION_PROMPT = load_prompt_from_config(position_prompt_config, position_prompt_config)
+        
         MODEL = config.get('LLM', 'model', fallback='gpt-4o')
         
         # Reload Topstep settings

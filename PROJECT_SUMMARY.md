@@ -33,9 +33,9 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
    - Pure data generation (caching handled by screenshot_uploader.py)
    - Can be run standalone or integrated into main system
 
-3. **config.ini** (297 lines)
+3. **config.ini** (159 lines)
    - Centralized configuration for all system components
-   - Contains LLM prompts for different market scenarios
+   - **Points to external prompt files** (no_position_prompt.txt, position_prompt.txt)
    - TopstepX API credentials and settings
    - Trading parameters (risk limits, contract size, etc.)
    - Market data settings (tickers, intervals, analysis parameters)
@@ -44,6 +44,15 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
    - **Supabase configuration**: Database connection and logging settings
    - **TopstepX bars configuration**: Bar data fetching and caching settings
    - Hot-reloadable without restarting the application
+
+4. **Prompt Files** (New: External prompt management)
+   - **no_position_prompt.txt** - LLM prompt for identifying new trade entries (sweep/reclaim/retest setups)
+   - **position_prompt.txt** - LLM prompt for managing existing positions (risk management, scaling, exits)
+   - **position_variables.txt** - Documentation of all placeholder variables used in prompts:
+     - Common: {Context}, {Symbol}, {display_symbol}
+     - Position-specific: {position_type}, {size}, {average_price}, {current_stop_loss}, {current_take_profit}, {unrealized_pnl}, {Reason}
+   - Easier to edit and version control than inline config.ini text
+   - System automatically loads prompt content from files at startup and config reload
 
 ### PowerShell Scripts
 
@@ -154,9 +163,10 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 ### LLM Configuration
 - `symbol`: Contract ID (e.g., CON.F.US.EP.Z25)
 - `display_symbol`: Human-readable symbol (e.g., ES)
-- `no_position_prompt`: Prompt for finding new entries (sweep/reclaim/retest setups)
-- `position_prompt`: Prompt for managing existing positions (risk management)
+- `no_position_prompt`: File path to no-position prompt (e.g., no_position_prompt.txt)
+- `position_prompt`: File path to position management prompt (e.g., position_prompt.txt)
 - `model`: AI model to use (current: gpt-5.1-chat-latest)
+- **Note**: Prompts are now stored in external .txt files for easier editing and version control
 
 ### TopstepX Settings
 - Account credentials and endpoints
@@ -241,14 +251,18 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 
 ```
 ESTrader/
-├── screenshot_uploader.py       # Main trading bot (5553 lines)
+├── screenshot_uploader.py       # Main trading bot (5612 lines)
 ├── market_data.py               # Market data fetcher (433 lines)
-├── config.ini                   # All configuration (297 lines)
+├── config.ini                   # All configuration (159 lines)
+├── no_position_prompt.txt       # LLM prompt for new entries
+├── position_prompt.txt          # LLM prompt for position management
+├── position_variables.txt       # Documentation of prompt variables
 ├── backfill_supabase.py         # Import historical CSV data to Supabase
 ├── requirements.txt             # Python dependencies
 ├── start_trading.ps1            # Main launcher
 ├── fetch_market_data.ps1        # Pre-fetch market data
 ├── MARKET_DATA_GUIDE.md         # Market data documentation
+├── PROMPT_FORMATTING_GUIDE.md   # Prompt formatting and escaping documentation
 ├── EXAMPLE_INTRADAY_OUTPUT.txt  # Sample context output
 ├── PROJECT_SUMMARY.md           # This file
 ├── QUICK_CONTEXT.md             # Quick reference guide
@@ -375,7 +389,8 @@ All stored in `config.ini` (already configured).
 ## Current Status
 
 Based on recent changes:
-- Core files: screenshot_uploader.py (5553 lines), market_data.py (433 lines), config.ini (297 lines)
+- Core files: screenshot_uploader.py (5612 lines), market_data.py (433 lines), config.ini (159 lines)
+- **Prompt management**: External .txt files (no_position_prompt.txt, position_prompt.txt, position_variables.txt)
 - Market data integration: Fully operational with gap detection and 5m intraday data
 - Context storage: Dual storage (`context/YYMMDD.txt` base + `context/YYMMDD_LLM.txt` updated)
 - TopstepX bar data: 5m OHLCV bars cached in `cache/bars/` directory
@@ -386,15 +401,28 @@ Based on recent changes:
 - Supabase: Integrated for database logging and analytics
 - Features: 
   - Dynamic interval scheduling
-  - Hot-reload configuration
+  - Hot-reload configuration (including external prompt files)
   - After-hours detection
   - Overnight sessions
   - API optimization
   - Window process filtering
   - Database logging with analytics views
+  - External prompt file management
 - Menu: Enhanced tray icon with config reload and context refresh options
 
 ## Recent Enhancements (November 2025)
+
+### External Prompt Management (Latest)
+- **Prompt files**: LLM prompts moved to separate .txt files for easier editing
+- **no_position_prompt.txt**: Contains full prompt for identifying new trade entries
+- **position_prompt.txt**: Contains full prompt for managing existing positions
+- **position_variables.txt**: Comprehensive documentation of all placeholder variables
+- **Safe formatting**: Automatic escaping of special characters (curly braces, quotes) in replacement values
+- **Error handling**: Graceful handling of missing placeholders or format errors with detailed logging
+- **Benefits**: Easier version control, simpler editing, better organization, robust handling of complex data
+- **Automatic loading**: System loads prompt content from files at startup and reload
+- **Backward compatible**: Still supports inline prompts in config.ini if needed
+- **Documentation**: See PROMPT_FORMATTING_GUIDE.md for details on escaping and best practices
 
 ### Supabase Database Integration
 - **Dual logging**: All trades and LLM interactions logged to PostgreSQL database
@@ -455,7 +483,7 @@ Based on recent changes:
 5. All trades are logged to CSV **and** Supabase database for advanced analytics
 6. System can run fully automated during configured trading hours
 7. Telegram notifications keep you informed of all trade activity
-8. Hot-reload capability allows config changes without downtime
+8. Hot-reload capability allows config changes without downtime (including prompt files)
 9. After-hours trading is automatically detected and communicated to LLM
 10. Context management uses dual storage (base + LLM updates) for reliability
 11. Dynamic interval scheduling allows optimal screenshot frequency per time period
@@ -463,4 +491,5 @@ Based on recent changes:
 13. Supabase integration enables real-time analytics, win rate tracking, and performance views
 14. SignalR testing infrastructure in place for potential real-time event migration
 15. Current model is gpt-5.1-chat-latest with updated prompts focused on sweep/reclaim setups
+16. **LLM prompts now managed in external .txt files** for easier editing and version control (no_position_prompt.txt, position_prompt.txt, position_variables.txt)
 

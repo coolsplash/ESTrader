@@ -1,0 +1,105 @@
+PROMPT VARIABLE REFERENCE
+=========================
+
+This file documents all the placeholder variables used in the prompt template files
+(no_position_prompt.txt and position_prompt.txt). These variables are replaced at runtime
+with actual values from the trading system.
+
+COMMON VARIABLES (Used in both prompts)
+----------------------------------------
+
+{Context}
+    Description: Complete market context including technical levels, bar data, and market structure
+    Format: Multi-line JSON/text containing:
+        - Key price levels (ONH, ONL, PDH, PDL, VWAP, etc.)
+        - Recent bar data from TopstepX (OHLC, volume, delta)
+        - Current market structure and trend information
+        - Volume profile data and liquidity zones
+    Example: "Market Data:\n  Current Price: 6000.00\n  PDH: 6015.25\n  PDL: 5985.50..."
+
+{Symbol}
+    Description: The trading symbol/contract identifier
+    Format: String (e.g., "CON.F.US.EP.Z25")
+    Used in: System context (may be added to prompts as needed)
+    Example: "CON.F.US.EP.Z25"
+
+{display_symbol}
+    Description: Human-readable symbol name
+    Format: String (e.g., "ES")
+    Used in: System context (may be added to prompts as needed)
+    Example: "ES"
+
+
+POSITION-SPECIFIC VARIABLES (Used only in position_prompt.txt)
+---------------------------------------------------------------
+
+{position_type}
+    Description: The type/direction of the current open position
+    Format: String - "long" or "short"
+    Example: "long"
+
+{size}
+    Description: Number of contracts in the open position
+    Format: Integer
+    Example: "3"
+
+{average_price}
+    Description: The average entry price of the position
+    Format: Decimal number (price with 2 decimal places)
+    Example: "6000.25"
+
+{current_stop_loss}
+    Description: The current stop loss price level for the position
+    Format: Decimal number (price with 2 decimal places) or "None" if not set
+    Example: "5992.50"
+
+{current_take_profit}
+    Description: The current take profit / target price level for the position
+    Format: Decimal number (price with 2 decimal places) or "None" if not set
+    Example: "6025.75"
+
+{unrealized_pnl}
+    Description: Current unrealized profit/loss for the position
+    Format: Decimal number (currency value, can be positive or negative)
+    Example: "+250.00" or "-125.50"
+
+{Reason}
+    Description: The original trade reasoning/thesis from when the position was entered
+    Format: Multi-line text containing:
+        - The LLM's original reasoning for entering the trade
+        - The setup type identified (sweep/reclaim/continuation)
+        - Key levels and structure that supported the entry
+    Example: "ES showed a classic sweep of 6000 level with immediate reclaim.
+              Delta flipped positive +2500 with aggressive buying. Liquidity
+              stacked above supports continuation to 6025 target..."
+
+
+OPTIONAL/FUTURE VARIABLES
+--------------------------
+
+{LLM Context}
+    Description: Additional LLM-specific context (reserved for future use)
+    Format: Text or JSON
+    Status: Not currently used, but reserved for expanded context
+
+{timestamp}
+    Description: Current timestamp when analysis is performed
+    Format: ISO 8601 datetime string
+    Status: May be added to track analysis timing
+
+{market_session}
+    Description: Current market session (pre-market, RTH, after-hours)
+    Format: String
+    Status: May be added for session-aware logic
+
+
+USAGE NOTES
+-----------
+
+1. Variables are case-sensitive and must match exactly as shown (including braces)
+2. All variables should be present in the template, even if some may be null/None at runtime
+3. The system will replace variables before sending prompts to the LLM
+4. Missing variables will typically be replaced with "None" or empty string
+5. JSON-structured variables ({Context}) should maintain their formatting when replaced
+6. Numeric variables should maintain appropriate precision (2 decimals for prices, etc.)
+

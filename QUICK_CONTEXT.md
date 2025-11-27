@@ -4,9 +4,12 @@
 Automated ES futures trading system using GPT-4o vision to analyze Bookmap screenshots and execute trades via TopstepX API.
 
 ## Core Files
-- **screenshot_uploader.py** (5553 lines) - Main trading bot with system tray, scheduler, API integration, Supabase logging
+- **screenshot_uploader.py** (5612 lines) - Main trading bot with system tray, scheduler, API integration, Supabase logging
 - **market_data.py** (433 lines) - Fetches Yahoo Finance data, calculates VWAP/volume profile
-- **config.ini** (297 lines) - All settings, prompts, credentials, interval scheduling
+- **config.ini** (159 lines) - All settings, credentials, interval scheduling, prompt file pointers
+- **no_position_prompt.txt** - LLM prompt for identifying new trade entries
+- **position_prompt.txt** - LLM prompt for managing existing positions
+- **position_variables.txt** - Documentation of all prompt placeholder variables
 - **start_trading.ps1** - Launcher script
 - **backfill_supabase.py** - Import historical CSV data to Supabase database
 
@@ -119,6 +122,10 @@ Right-click the tray icon for quick access to:
 - Virtual environment: `venv/`
 
 ## Recent Changes
+- **External prompt management** (Latest): LLM prompts moved to .txt files (no_position_prompt.txt, position_prompt.txt, position_variables.txt) for easier editing and version control
+  - **Safe formatting**: Automatic escaping of special characters (curly braces, quotes) in replacement values
+  - **Error handling**: Graceful handling with detailed logging
+  - **Documentation**: See PROMPT_FORMATTING_GUIDE.md for details
 - **Supabase integration**: Dual logging to PostgreSQL database with analytics views
 - **TopstepX bar data**: 5m OHLCV bars fetched and cached for LLM context
 - **Dynamic interval scheduling**: Time-based screenshot intervals (configurable per time period)
@@ -134,13 +141,16 @@ Right-click the tray icon for quick access to:
 ## Important Notes
 - System runs as Windows system tray application
 - All credentials are in config.ini (already configured)
+- **LLM prompts stored in external .txt files** for easy editing (no_position_prompt.txt, position_prompt.txt)
+- Prompt variables documented in position_variables.txt
+- **Safe formatting**: Special characters (braces, quotes) in market data are automatically escaped
 - Position management happens every 20 seconds when in a trade
 - Screenshots taken based on dynamic interval schedule (not fixed 1-minute)
 - API queries only run during trading hours (saves API calls)
 - Trade IDs track positions across entry/adjustments/exit
 - Can run in mock mode with safety flags disabled for testing
 - After-hours trading automatically detected (RTH: 9:30 AM - 4:00 PM ET)
-- Hot-reload config without restarting via tray menu
+- Hot-reload config without restarting via tray menu (prompts reload automatically)
 - Overnight trading sessions supported (e.g., 00:00-23:59)
 - Stop/take profit orders disabled by default (LLM manages dynamically)
 - **Supabase logging runs in parallel** - CSV files remain primary, database is supplementary

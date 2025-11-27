@@ -13,6 +13,7 @@ trades/
 # Market data and context cache
 context/
 market_data/
+cache/
 
 # Testing outputs
 testing/responses/

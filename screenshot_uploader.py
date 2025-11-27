@@ -42,6 +42,64 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
+def get_eastern_utc_offset():
+    """Get the current UTC offset for Eastern Time (handles EST/EDT).
+    
+    Returns:
+        int: Hours to subtract from UTC to get Eastern Time (4 for EDT, 5 for EST)
+    """
+    # Check if we're in daylight saving time
+    # DST in US: Second Sunday in March to First Sunday in November
+    now = datetime.datetime.now()
+    
+    # Simple DST check for Eastern Time
+    # March: Find second Sunday
+    march_second_sunday = None
+    for day in range(8, 15):  # Second Sunday is between 8th-14th
+        if datetime.datetime(now.year, 3, day).weekday() == 6:  # Sunday
+            march_second_sunday = datetime.datetime(now.year, 3, day, 2, 0)  # 2 AM
+            break
+    
+    # November: Find first Sunday
+    november_first_sunday = None
+    for day in range(1, 8):  # First Sunday is between 1st-7th
+        if datetime.datetime(now.year, 11, day).weekday() == 6:  # Sunday
+            november_first_sunday = datetime.datetime(now.year, 11, day, 2, 0)  # 2 AM
+            break
+    
+    # Check if current time is in DST period
+    if march_second_sunday and november_first_sunday:
+        is_dst = march_second_sunday <= now < november_first_sunday
+    else:
+        # Fallback: Rough estimation
+        is_dst = 3 <= now.month <= 10
+    
+    return 4 if is_dst else 5  # EDT is UTC-4, EST is UTC-5
+
+def utc_to_eastern(utc_dt):
+    """Convert UTC datetime to Eastern Time.
+    
+    Args:
+        utc_dt: datetime object in UTC
+    
+    Returns:
+        datetime: Eastern Time datetime
+    """
+    offset_hours = get_eastern_utc_offset()
+    return utc_dt - datetime.timedelta(hours=offset_hours)
+
+def eastern_to_utc(et_dt):
+    """Convert Eastern Time datetime to UTC.
+    
+    Args:
+        et_dt: datetime object in Eastern Time
+    
+    Returns:
+        datetime: UTC datetime
+    """
+    offset_hours = get_eastern_utc_offset()
+    return et_dt + datetime.timedelta(hours=offset_hours)
+
 def get_active_trade_info():
     """Get the current active trade info from file.
     
@@ -1911,6 +1969,29 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             # Take screenshot for position management
             image_base64 = capture_screenshot(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
             
+            # Fetch bar data and generate market data JSON
+            try:
+                contract_id = topstep_config.get('contract_id', '')
+                bars_result = get_bars_for_llm(contract_id, topstep_config, auth_token)
+                raw_bars = bars_result.get('bars', [])
+                
+                # Generate structured JSON market data
+                market_data_json = generate_market_data_json(
+                    raw_bars,
+                    daily_context,
+                    current_position_type,
+                    position_details,
+                    working_orders,
+                    contract_id
+                )
+                
+                # TEMPORARY: Send only JSON format (disabled text blob market context)
+                json_section = f"\n\nMarket Data JSON:\n{market_data_json}\n"
+                daily_context_with_bars = json_section  # Temporarily disabled: daily_context + json_section
+            except Exception as e:
+                logging.warning(f"Error fetching bar data (non-critical): {e}")
+                daily_context_with_bars = daily_context
+            
             # Format prompt with position details
             position_prompt_template = config.get('LLM', 'position_prompt', fallback='')
             if not position_prompt_template:
@@ -1940,7 +2021,7 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 unrealized_pnl=position_details.get('unrealized_pnl', 0),
                 current_stop_loss=current_stop_loss,
                 current_take_profit=current_take_profit,
-                Context=daily_context,
+                Context=daily_context_with_bars,
                 LLM_Context=get_llm_observations(),
                 Reason=entry_reasoning
             )
@@ -2030,14 +2111,38 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
         logging.info(f"Using context: {daily_context[:50]}..." if len(daily_context) > 50 else f"Using context: {daily_context}")
 
         image_base64 = capture_screenshot(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, enable_save_screenshots)
+        
+        # Fetch bar data and generate market data JSON
+        try:
+            contract_id = topstep_config.get('contract_id', '')
+            bars_result = get_bars_for_llm(contract_id, topstep_config, auth_token)
+            raw_bars = bars_result.get('bars', [])
+            
+            # Generate structured JSON market data
+            market_data_json = generate_market_data_json(
+                raw_bars,
+                daily_context,
+                current_position_type,
+                position_details,
+                working_orders,
+                contract_id
+            )
+            
+            # TEMPORARY: Send only JSON format (disabled text blob market context)
+            json_section = f"\n\nMarket Data JSON:\n{market_data_json}\n"
+            daily_context_with_bars = json_section  # Temporarily disabled: daily_context + json_section
+        except Exception as e:
+            logging.warning(f"Error fetching bar data (non-critical): {e}")
+            daily_context_with_bars = daily_context
+        
         # Select and format prompt based on current_position_type
         llm_observations = get_llm_observations()
         if current_position_type == 'none':
-            prompt = no_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context, LLM_Context=llm_observations)
+            prompt = no_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
         elif current_position_type == 'long':
-            prompt = long_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context, LLM_Context=llm_observations)
+            prompt = long_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
         elif current_position_type == 'short':
-            prompt = short_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context, LLM_Context=llm_observations)
+            prompt = short_position_prompt.format(symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
         else:
             logging.error(f"Invalid position_type: {current_position_type}")
             raise ValueError(f"Invalid position_type: {current_position_type}")
@@ -3263,6 +3368,773 @@ def login_topstep(topstep_config):
     except requests.exceptions.RequestException as e:
         logging.error(f"Login request failed: {e}")
         return None
+
+def fetch_topstepx_bars(contract_id, start_time, end_time, topstep_config, auth_token, interval='5m'):
+    """Fetch bar data from TopstepX /api/History/retrieveBars endpoint.
+    
+    Args:
+        contract_id: Contract symbol (e.g., "CON.F.US.EP.Z25")
+        start_time: Start timestamp as datetime object or ISO string
+        end_time: End timestamp as datetime object or ISO string
+        topstep_config: Topstep configuration dict
+        auth_token: Auth token for API
+        interval: Bar interval (default '5m')
+    
+    Returns:
+        list: List of bar dicts with keys {t, o, h, l, c, v} or None on error
+    """
+    try:
+        base_url = topstep_config['base_url']
+        endpoint = '/api/History/retrieveBars'
+        url = base_url + endpoint
+        
+        # Convert datetime to UTC ISO format (handle both datetime and string inputs)
+        if isinstance(start_time, str):
+            start_time_str = start_time
+        else:
+            start_time_str = start_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        
+        if isinstance(end_time, str):
+            end_time_str = end_time
+        else:
+            end_time_str = end_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        
+        # Build request payload
+        payload = {
+            "contractId": contract_id,
+            "live": False,
+            "startTime": start_time_str,
+            "endTime": end_time_str,
+            "unit": 2,  # Minutes
+            "unitNumber": 5,  # 5 minutes
+            "limit": 200,  # Max bars to fetch
+            "includePartialBar": True  # Only complete bars
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json"
+        }
+        
+        logging.info("=" * 80)
+        logging.info("FETCHING BARS FROM TOPSTEPX API")
+        logging.info("=" * 80)
+        logging.info(f"Bar fetch URL: {url}")
+        logging.info(f"Time range: {start_time_str} to {end_time_str}")
+        logging.info(f"Auth token: {auth_token[:20]}..." if auth_token else "None")
+        logging.info("Request payload:")
+        logging.info(json.dumps(payload, indent=2))
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        
+        logging.info("=" * 80)
+        logging.info("BAR FETCH API RESPONSE")
+        logging.info("=" * 80)
+        logging.info(f"Status Code: {response.status_code}")
+        logging.info(f"Response Headers: {dict(response.headers)}")
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        logging.info("Response Body:")
+        logging.info(json.dumps(result, indent=2))
+        logging.info("=" * 80)
+        
+        # Check for API errors
+        if not result.get('success', True):
+            error_code = result.get('errorCode', 0)
+            error_message = result.get('errorMessage', 'Unknown error')
+            logging.error(f"Bar fetch failed: {error_message} (code: {error_code})")
+            return None
+        
+        bars = result.get('bars', [])
+        logging.info(f"Successfully fetched {len(bars)} bars")
+        if bars:
+            logging.info(f"First bar timestamp: {bars[0].get('t')}")
+            logging.info(f"Last bar timestamp: {bars[-1].get('t')}")
+        return bars
+        
+    except Exception as e:
+        logging.error(f"Error fetching bars from TopstepX: {e}")
+        logging.exception("Full traceback:")
+        return None
+
+def get_cached_bars(date_str):
+    """Read cached bars from /cache/bars/YYYYMMDD.json.
+    
+    Args:
+        date_str: Date string in YYYYMMDD format
+    
+    Returns:
+        dict: Cache data with keys {date, contract_id, interval, bars, last_fetched} or None
+    """
+    try:
+        cache_folder = 'cache/bars'
+        cache_file = os.path.join(cache_folder, f"{date_str}.json")
+        
+        if not os.path.exists(cache_file):
+            logging.debug(f"No cache file found for {date_str}")
+            return None
+        
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            cache_data = json.load(f)
+        
+        logging.info(f"Loaded {len(cache_data.get('bars', []))} cached bars from {cache_file}")
+        return cache_data
+        
+    except Exception as e:
+        logging.error(f"Error reading cached bars: {e}")
+        return None
+
+def save_bars_to_cache(date_str, contract_id, bars, interval='5m'):
+    """Save bars to cache file /cache/bars/YYYYMMDD.json.
+    
+    Args:
+        date_str: Date string in YYYYMMDD format
+        contract_id: Contract symbol
+        bars: List of bar dicts
+        interval: Bar interval (default '5m')
+    """
+    try:
+        cache_folder = 'cache/bars'
+        os.makedirs(cache_folder, exist_ok=True)
+        cache_file = os.path.join(cache_folder, f"{date_str}.json")
+        
+        # Prepare cache data
+        cache_data = {
+            'date': date_str,
+            'contract_id': contract_id,
+            'interval': interval,
+            'bars': bars,
+            'last_fetched': datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        }
+        
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, indent=2)
+        
+        logging.info(f"Saved {len(bars)} bars to cache: {cache_file}")
+        
+    except Exception as e:
+        logging.error(f"Error saving bars to cache: {e}")
+        logging.exception("Full traceback:")
+
+def calculate_bar_metrics(bars):
+    """Calculate trend, volume, and key level metrics from bars.
+    
+    Args:
+        bars: List of bar dicts with keys {t, o, h, l, c, v}
+    
+    Returns:
+        dict: Metrics including trend, volume stats, and key levels
+    """
+    try:
+        if not bars or len(bars) < 2:
+            return {
+                'trend': 'insufficient data',
+                'avg_volume': 0,
+                'swing_high': 0,
+                'swing_low': 0
+            }
+        
+        # Extract highs, lows, closes, volumes
+        highs = [bar['h'] for bar in bars]
+        lows = [bar['l'] for bar in bars]
+        closes = [bar['c'] for bar in bars]
+        volumes = [bar['v'] for bar in bars]
+        
+        # Trend analysis - compare recent half to earlier half
+        mid_point = len(closes) // 2
+        earlier_avg = sum(closes[:mid_point]) / mid_point if mid_point > 0 else closes[0]
+        recent_avg = sum(closes[mid_point:]) / (len(closes) - mid_point)
+        
+        # Determine trend
+        if recent_avg > earlier_avg * 1.001:  # 0.1% threshold
+            trend = 'uptrend'
+        elif recent_avg < earlier_avg * 0.999:
+            trend = 'downtrend'
+        else:
+            trend = 'sideways'
+        
+        # Volume analysis
+        avg_volume = sum(volumes) / len(volumes)
+        
+        # Key levels
+        swing_high = max(highs)
+        swing_low = min(lows)
+        
+        return {
+            'trend': trend,
+            'avg_volume': avg_volume,
+            'swing_high': swing_high,
+            'swing_low': swing_low,
+            'recent_close': closes[-1]
+        }
+        
+    except Exception as e:
+        logging.error(f"Error calculating bar metrics: {e}")
+        return {
+            'trend': 'error',
+            'avg_volume': 0,
+            'swing_high': 0,
+            'swing_low': 0
+        }
+
+def format_bars_for_context(bars, num_bars=36):
+    """Format bars into readable table and analysis for LLM context.
+    
+    Args:
+        bars: List of bar dicts
+        num_bars: Number of most recent bars to include (default 36 = 3 hours)
+    
+    Returns:
+        str: Formatted bar data and analysis
+    """
+    try:
+        if not bars:
+            return "\n[No bar data available]"
+        
+        # Take last N bars
+        recent_bars = bars[-num_bars:] if len(bars) > num_bars else bars
+        
+        # Calculate metrics
+        metrics = calculate_bar_metrics(recent_bars)
+        
+        # Format bars table
+        context = f"\n\nRecent 5-Minute Bars (Last {len(recent_bars)} bars / {len(recent_bars)*5/60:.1f} hours):\n"
+        context += "Time (CT)  Open      High      Low       Close     Volume\n"
+        context += "-" * 65 + "\n"
+        
+        # Show last 10 bars in table to keep context manageable
+        display_bars = recent_bars[-10:]
+        for bar in display_bars:
+            # Convert UTC timestamp to ET
+            try:
+                bar_time = datetime.datetime.fromisoformat(bar['t'].replace('Z', '+00:00'))
+                et_time = utc_to_eastern(bar_time)
+                time_str = et_time.strftime("%H:%M")
+            except:
+                time_str = "??:??"
+            
+            context += f"{time_str}     {bar['o']:<9.2f} {bar['h']:<9.2f} {bar['l']:<9.2f} {bar['c']:<9.2f} {bar['v']:>8,}\n"
+        
+        # Add analysis
+        context += f"\nBar Analysis ({len(recent_bars)} bars):\n"
+        context += f"- Trend: {metrics['trend'].title()}\n"
+        context += f"- Volume: Average {metrics['avg_volume']:,.0f}\n"
+        context += f"- Key Levels: Swing High {metrics['swing_high']:.2f}, Swing Low {metrics['swing_low']:.2f}\n"
+        context += f"- Current Close: {metrics['recent_close']:.2f}\n"
+        
+        return context
+        
+    except Exception as e:
+        logging.error(f"Error formatting bars for context: {e}")
+        logging.exception("Full traceback:")
+        return "\n[Error formatting bar data]"
+
+def parse_yahoo_context(context_text):
+    """Parse Yahoo Finance text context to extract structured metrics.
+    
+    Args:
+        context_text: Yahoo Finance context string from market_data.py
+    
+    Returns:
+        dict: Extracted metrics {prev_close, open, gap_direction, gap_size, pdh, pdl, day_trend, vwap, poc}
+    """
+    try:
+        import re
+        
+        metrics = {
+            'prev_close': None,
+            'open': None,
+            'gap_direction': '',
+            'gap_size': 0,
+            'pdh': None,
+            'pdl': None,
+            'day_trend': '',
+            'vwap': None,
+            'poc': None
+        }
+        
+        # Extract current open/close from "ES: Open X, Current Y"
+        open_match = re.search(r'Open\s+([\d.]+)', context_text)
+        if open_match:
+            metrics['open'] = float(open_match.group(1))
+        
+        # Extract range for PDH/PDL from "Range X-Y"
+        range_match = re.search(r'Range\s+([\d.]+)-([\d.]+)', context_text)
+        if range_match:
+            metrics['pdl'] = float(range_match.group(1))
+            metrics['pdh'] = float(range_match.group(2))
+        
+        # Extract gap info from "GAP UP:" or "GAP DOWN:" or "Minor gap"
+        if 'GAP UP' in context_text:
+            metrics['gap_direction'] = 'up'
+            gap_match = re.search(r'GAP UP:\s+([\d.]+)\s+pts', context_text)
+            if gap_match:
+                metrics['gap_size'] = float(gap_match.group(1))
+        elif 'GAP DOWN' in context_text:
+            metrics['gap_direction'] = 'down'
+            gap_match = re.search(r'GAP DOWN:\s+([\d.]+)\s+pts', context_text)
+            if gap_match:
+                metrics['gap_size'] = float(gap_match.group(1))
+        elif 'Minor gap up' in context_text:
+            metrics['gap_direction'] = 'up'
+            gap_match = re.search(r'Minor gap up:\s+([\d.]+)\s+pts', context_text)
+            if gap_match:
+                metrics['gap_size'] = float(gap_match.group(1))
+        elif 'Minor gap down' in context_text:
+            metrics['gap_direction'] = 'down'
+            gap_match = re.search(r'Minor gap down:\s+([\d.]+)\s+pts', context_text)
+            if gap_match:
+                metrics['gap_size'] = float(gap_match.group(1))
+        
+        # Extract previous close from gap info "from previous close X"
+        prev_close_match = re.search(r'from previous close\s+([\d.]+)', context_text)
+        if prev_close_match:
+            metrics['prev_close'] = float(prev_close_match.group(1))
+        
+        # Extract 5-day trend from "5-Day Trend: UPTREND" or "DOWNTREND"
+        if '5-Day Trend: UPTREND' in context_text:
+            metrics['day_trend'] = 'uptrend'
+        elif '5-Day Trend: DOWNTREND' in context_text:
+            metrics['day_trend'] = 'downtrend'
+        elif '5-Day Trend: NEUTRAL' in context_text:
+            metrics['day_trend'] = 'neutral'
+        
+        # Extract VWAP from "VWAP (X-day): Y.YY"
+        vwap_match = re.search(r'VWAP\s+\([^)]+\):\s+([\d.]+)', context_text)
+        if vwap_match:
+            metrics['vwap'] = float(vwap_match.group(1))
+        
+        # Extract POC from "1. X.XX pts (POC - Point of Control)"
+        poc_match = re.search(r'1\.\s+([\d.]+)\s+pts.*\(POC', context_text)
+        if poc_match:
+            metrics['poc'] = float(poc_match.group(1))
+        
+        return metrics
+        
+    except Exception as e:
+        logging.error(f"Error parsing Yahoo context: {e}")
+        logging.exception("Full traceback:")
+        return {
+            'prev_close': None,
+            'open': None,
+            'gap_direction': '',
+            'gap_size': 0,
+            'pdh': None,
+            'pdl': None,
+            'day_trend': '',
+            'vwap': None,
+            'poc': None
+        }
+
+def calculate_overnight_metrics(bars):
+    """Calculate overnight session metrics (ONH, ONL, Globex VWAP).
+    
+    Overnight session: 16:00 ET previous day to 09:30 ET current day
+    
+    Args:
+        bars: List of bar dicts with keys {t, o, h, l, c, v}
+    
+    Returns:
+        dict: {onh, onl, globex_vwap}
+    """
+    try:
+        if not bars:
+            return {'onh': None, 'onl': None, 'globex_vwap': None}
+        
+        # Filter bars for overnight session
+        # Overnight is 16:00 ET to 09:30 ET
+        overnight_bars = []
+        
+        for bar in bars:
+            try:
+                # Parse bar timestamp
+                bar_time_utc = datetime.datetime.fromisoformat(bar['t'].replace('Z', '+00:00'))
+                bar_time_et = utc_to_eastern(bar_time_utc)
+                bar_hour = bar_time_et.hour
+                bar_minute = bar_time_et.minute
+                
+                # Check if in overnight session (16:00-23:59 or 00:00-09:30)
+                is_overnight = (bar_hour >= 16) or (bar_hour < 9) or (bar_hour == 9 and bar_minute < 30)
+                
+                if is_overnight:
+                    overnight_bars.append(bar)
+            except:
+                continue
+        
+        if not overnight_bars:
+            logging.warning("No overnight bars found for ONH/ONL/Globex VWAP calculation")
+            return {'onh': None, 'onl': None, 'globex_vwap': None}
+        
+        # Calculate ONH (overnight high)
+        onh = max(bar['h'] for bar in overnight_bars)
+        
+        # Calculate ONL (overnight low)
+        onl = min(bar['l'] for bar in overnight_bars)
+        
+        # Calculate Globex VWAP
+        total_volume = sum(bar['v'] for bar in overnight_bars)
+        if total_volume > 0:
+            typical_prices = [(bar['h'] + bar['l'] + bar['c']) / 3 * bar['v'] for bar in overnight_bars]
+            globex_vwap = sum(typical_prices) / total_volume
+        else:
+            globex_vwap = None
+        
+        logging.info(f"Overnight metrics: ONH={onh}, ONL={onl}, Globex VWAP={globex_vwap}")
+        return {
+            'onh': round(onh, 2) if onh else None,
+            'onl': round(onl, 2) if onl else None,
+            'globex_vwap': round(globex_vwap, 2) if globex_vwap else None
+        }
+        
+    except Exception as e:
+        logging.error(f"Error calculating overnight metrics: {e}")
+        logging.exception("Full traceback:")
+        return {'onh': None, 'onl': None, 'globex_vwap': None}
+
+def generate_market_data_json(bars, yahoo_context_text, position_type, position_details=None, working_orders=None, contract_id='', num_bars=36):
+    """Generate structured JSON market data combining Yahoo Finance and TopstepX bars.
+    
+    Args:
+        bars: List of bar dicts from TopstepX
+        yahoo_context_text: Yahoo Finance context string
+        position_type: Current position type ('none', 'long', 'short')
+        position_details: Position details dict
+        working_orders: Working orders dict
+        contract_id: Contract ID for parsing working orders
+        num_bars: Number of bars to include (default 36)
+    
+    Returns:
+        str: JSON string with structured market data
+    """
+    try:
+        # Parse Yahoo Finance context
+        yahoo_metrics = parse_yahoo_context(yahoo_context_text)
+        
+        # Calculate overnight metrics from bars
+        overnight_metrics = calculate_overnight_metrics(bars) if bars else {'onh': None, 'onl': None, 'globex_vwap': None}
+        
+        # Format 5-minute bars (last num_bars)
+        recent_bars = bars[-num_bars:] if bars and len(bars) > num_bars else (bars if bars else [])
+        five_min_bars = []
+        for bar in recent_bars:
+            try:
+                # Convert UTC to ET
+                bar_time_utc = datetime.datetime.fromisoformat(bar['t'].replace('Z', '+00:00'))
+                bar_time_et = utc_to_eastern(bar_time_utc)
+                time_str = bar_time_et.strftime("%H:%M")
+                
+                five_min_bars.append({
+                    "time": time_str,
+                    "open": round(bar['o'], 2),
+                    "high": round(bar['h'], 2),
+                    "low": round(bar['l'], 2),
+                    "close": round(bar['c'], 2),
+                    "volume": int(bar['v'])
+                })
+            except:
+                continue
+        
+        # Build MarketContext
+        market_context = {
+            "PrevClose": yahoo_metrics['prev_close'],
+            "Open": yahoo_metrics['open'],
+            "GapDirection": yahoo_metrics['gap_direction'],
+            "GapSizePts": yahoo_metrics['gap_size'],
+            "ONH": overnight_metrics['onh'],
+            "ONL": overnight_metrics['onl'],
+            "DayTrend5D": yahoo_metrics['day_trend']
+        }
+        
+        # Build KeyLevels (removed ONH/ONL as they're already in MarketContext)
+        key_levels = {
+            "PDH": yahoo_metrics['pdh'],
+            "PDL": yahoo_metrics['pdl'],
+            "RTH_VWAP": yahoo_metrics['vwap'],
+            "Globex_VWAP": overnight_metrics['globex_vwap'],
+            "5DayPOC": yahoo_metrics['poc']
+        }
+        
+        # Build Position (only include if actively in a trade)
+        position_status = "flat"
+        if position_type == 'long':
+            position_status = "long"
+        elif position_type == 'short':
+            position_status = "short"
+        
+        # Get current time in Eastern Time
+        current_utc = datetime.datetime.utcnow()
+        current_et = utc_to_eastern(current_utc)
+        current_time_str = current_et.strftime("%Y-%m-%d %H:%M:%S ET")
+        
+        # Build complete structure
+        market_data = {
+            "CurrentTime": current_time_str,
+            "FiveMinuteBars": five_min_bars,
+            "MarketContext": market_context,
+            "KeyLevels": key_levels
+        }
+        
+        # Only include Position if in an active trade
+        if position_status in ['long', 'short']:
+            entry_price = None
+            stop = None
+            target = None
+            
+            # Get entry price from position_details
+            if position_details:
+                entry_price = position_details.get('average_price')
+            
+            # Get stop/target from working orders
+            if working_orders and contract_id:
+                order_info = parse_working_orders(working_orders, contract_id)
+                stop = order_info.get('stop_loss_price')
+                target = order_info.get('take_profit_price')
+            
+            market_data["Position"] = {
+                "status": position_status,
+                "entry_price": round(entry_price, 2) if entry_price else None,
+                "stop": round(stop, 2) if stop else None,
+                "target": round(target, 2) if target else None
+            }
+        
+        # Convert to formatted JSON string
+        json_string = json.dumps(market_data, indent=2)
+        
+        return json_string
+        
+    except Exception as e:
+        logging.error(f"Error generating market data JSON: {e}")
+        logging.exception("Full traceback:")
+        return "{}"
+
+def get_bars_for_llm(contract_id, topstep_config, auth_token, num_bars=36):
+    """Main function to get bars for LLM with smart daily caching.
+    
+    This function:
+    1. Checks cache for today's bars
+    2. Fetches missing bars from API (all day on first run, incremental after)
+    3. Appends new bars to cache
+    4. Returns both raw bars and formatted bar data for LLM context
+    
+    Args:
+        contract_id: Contract symbol
+        topstep_config: Topstep configuration dict
+        auth_token: Auth token for API
+        num_bars: Number of bars to return for context (default 36)
+    
+    Returns:
+        dict: {'bars': list of raw bar dicts, 'formatted': formatted text for LLM}
+              Returns {'bars': [], 'formatted': ''} if disabled or error
+    """
+    try:
+        # Check if bar data is enabled
+        enable_bar_data = config.getboolean('TopstepXBars', 'enable_bar_data', fallback=True)
+        if not enable_bar_data:
+            logging.debug("Bar data disabled in config")
+            return {'bars': [], 'formatted': ''}
+        
+        if not auth_token:
+            logging.warning("No auth token - skipping bar data fetch")
+            return {'bars': [], 'formatted': ''}
+        
+        # Get today's date
+        today = datetime.datetime.now()
+        date_str = today.strftime("%Y%m%d")
+        
+        # Try to load cached bars for today
+        cache_data = get_cached_bars(date_str)
+        
+        # Check if we might need bars from previous day (early morning hours)
+        current_utc = datetime.datetime.utcnow()
+        minutes_needed = num_bars * 5  # 5-minute bars
+        calculated_start = current_utc - datetime.timedelta(minutes=minutes_needed)
+        midnight_utc = current_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # If we need bars from yesterday, try to load yesterday's cache too
+        yesterday_bars = []
+        if calculated_start < midnight_utc:
+            yesterday = today - datetime.timedelta(days=1)
+            yesterday_str = yesterday.strftime("%Y%m%d")
+            yesterday_cache = get_cached_bars(yesterday_str)
+            if yesterday_cache:
+                yesterday_bars = yesterday_cache.get('bars', [])
+                logging.info(f"Loaded {len(yesterday_bars)} bars from yesterday's cache ({yesterday_str})")
+                
+                # Filter yesterday's bars to only include those after calculated_start
+                calculated_start_str = calculated_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                yesterday_bars = [bar for bar in yesterday_bars if bar['t'] >= calculated_start_str]
+                logging.info(f"Filtered to {len(yesterday_bars)} bars from yesterday after {calculated_start_str}")
+        
+        # Determine what time range to fetch
+        market_open = config.get('TopstepXBars', 'market_open', fallback='09:30')
+        open_hour, open_min = map(int, market_open.split(':'))
+        
+        # Create market open datetime (ET - convert to UTC)
+        market_open_et = today.replace(hour=open_hour, minute=open_min, second=0, microsecond=0)
+        market_open_utc = eastern_to_utc(market_open_et)
+        
+        if cache_data is None:
+            # First fetch of the day - get all bars from market open
+            logging.info("First bar fetch of the day - fetching all bars from market open")
+            
+            # If we're in early morning hours and need bars from previous day
+            if calculated_start < midnight_utc:
+                logging.info(f"Early morning fetch - need bars from previous day")
+                logging.info(f"Calculated start: {calculated_start.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                logging.info(f"Using calculated start instead of market open")
+                start_time = calculated_start
+            else:
+                # Normal case - use market open or calculated start, whichever is later
+                start_time = max(market_open_utc, calculated_start)
+            
+            end_time = current_utc
+            existing_bars = []
+        else:
+            # Incremental fetch - only get new bars since last fetch
+            try:
+                last_fetched_str = cache_data.get('last_fetched')
+                last_fetched = datetime.datetime.fromisoformat(last_fetched_str.replace('Z', '+00:00'))
+                
+                # Only fetch if more than 5 minutes have passed
+                time_diff = (current_utc - last_fetched.replace(tzinfo=None)).total_seconds()
+                if time_diff < 300:  # Less than 5 minutes
+                    logging.debug(f"Using cached bars - only {time_diff:.0f}s since last fetch")
+                    # Merge yesterday's bars with cached bars if in early morning
+                    all_cached_bars = yesterday_bars.copy() if yesterday_bars else []
+                    all_cached_bars.extend(cache_data.get('bars', []))
+                    
+                    # Check if we have enough bars before returning
+                    if len(all_cached_bars) < num_bars:
+                        logging.warning(f"Cached bars ({len(all_cached_bars)}) < required ({num_bars}) - fetching historical data")
+                        # Fetch enough historical bars to fill the gap
+                        minutes_back = num_bars * 5 + 60  # Extra buffer
+                        hist_start = current_utc - datetime.timedelta(minutes=minutes_back)
+                        hist_bars = fetch_topstepx_bars(
+                            contract_id,
+                            hist_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                            current_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                            topstep_config,
+                            auth_token
+                        )
+                        if hist_bars:
+                            # Merge and deduplicate
+                            existing_ts = {bar['t'] for bar in all_cached_bars}
+                            for bar in hist_bars:
+                                if bar['t'] not in existing_ts:
+                                    all_cached_bars.append(bar)
+                            all_cached_bars.sort(key=lambda x: x['t'])
+                            logging.info(f"After historical backfill: {len(all_cached_bars)} total bars")
+                    
+                    return {'bars': all_cached_bars, 'formatted': format_bars_for_context(all_cached_bars, num_bars)}
+                
+                logging.info(f"Incremental fetch - getting bars since {last_fetched_str}")
+                start_time = last_fetched.replace(tzinfo=None)
+                end_time = current_utc
+                existing_bars = cache_data.get('bars', [])
+            except:
+                logging.warning("Error parsing cache timestamp - fetching all bars")
+                start_time = market_open_utc
+                end_time = current_utc
+                existing_bars = []
+        
+        # Fetch new bars from API
+        new_bars = fetch_topstepx_bars(contract_id, start_time, end_time, topstep_config, auth_token)
+        
+        if new_bars is None:
+            # API fetch failed - use cached bars if available
+            logging.warning("Bar fetch failed - using cached bars if available")
+            if cache_data or yesterday_bars:
+                # Merge yesterday's bars with cached bars if in early morning
+                all_cached_bars = yesterday_bars.copy() if yesterday_bars else []
+                if cache_data:
+                    all_cached_bars.extend(cache_data.get('bars', []))
+                
+                # Check if we have enough bars - try one more historical fetch if not
+                if len(all_cached_bars) < num_bars:
+                    logging.warning(f"Cached bars ({len(all_cached_bars)}) < required ({num_bars}) - attempting historical backfill")
+                    minutes_back = num_bars * 5 + 60
+                    hist_start = current_utc - datetime.timedelta(minutes=minutes_back)
+                    hist_bars = fetch_topstepx_bars(
+                        contract_id,
+                        hist_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        current_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        topstep_config,
+                        auth_token
+                    )
+                    if hist_bars:
+                        existing_ts = {bar['t'] for bar in all_cached_bars}
+                        for bar in hist_bars:
+                            if bar['t'] not in existing_ts:
+                                all_cached_bars.append(bar)
+                        all_cached_bars.sort(key=lambda x: x['t'])
+                        logging.info(f"After historical backfill: {len(all_cached_bars)} total bars")
+                
+                return {'bars': all_cached_bars, 'formatted': format_bars_for_context(all_cached_bars, num_bars)}
+            else:
+                return {'bars': [], 'formatted': "\n[Bar data unavailable - API fetch failed]"}
+        
+        # Merge yesterday's bars, existing bars, and new bars (remove duplicates by timestamp)
+        all_bars = yesterday_bars.copy() if yesterday_bars else []
+        all_bars.extend(existing_bars)
+        existing_timestamps = {bar['t'] for bar in all_bars}
+        
+        for bar in new_bars:
+            if bar['t'] not in existing_timestamps:
+                all_bars.append(bar)
+        
+        # Sort by timestamp
+        all_bars.sort(key=lambda x: x['t'])
+        
+        # Check if we have enough bars - if not, fetch more historical data
+        if len(all_bars) < num_bars:
+            logging.warning(f"Only have {len(all_bars)} bars, need {num_bars} - fetching more historical data")
+            
+            # Calculate how far back we need to go to get num_bars
+            minutes_needed = num_bars * 5 + 60  # Extra 60 min buffer
+            historical_start = current_utc - datetime.timedelta(minutes=minutes_needed)
+            
+            # If all_bars has some data, start from before the earliest bar we have
+            if all_bars:
+                earliest_bar_time = datetime.datetime.fromisoformat(all_bars[0]['t'].replace('Z', '+00:00')).replace(tzinfo=None)
+                historical_start = min(historical_start, earliest_bar_time - datetime.timedelta(minutes=30))
+            
+            logging.info(f"Fetching historical bars from {historical_start.strftime('%Y-%m-%d %H:%M:%S UTC')} to fill gap")
+            
+            # Fetch historical bars
+            historical_bars = fetch_topstepx_bars(
+                contract_id,
+                historical_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                current_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                topstep_config,
+                auth_token
+            )
+            
+            if historical_bars:
+                logging.info(f"Fetched {len(historical_bars)} historical bars")
+                
+                # Merge with existing bars (avoid duplicates)
+                existing_timestamps = {bar['t'] for bar in all_bars}
+                for bar in historical_bars:
+                    if bar['t'] not in existing_timestamps:
+                        all_bars.append(bar)
+                
+                # Re-sort
+                all_bars.sort(key=lambda x: x['t'])
+                logging.info(f"After historical fetch: total {len(all_bars)} bars")
+        
+        # Save updated cache for today (not including yesterday's bars)
+        today_bars = [bar for bar in all_bars if bar['t'] >= midnight_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")]
+        save_bars_to_cache(date_str, contract_id, today_bars)
+        
+        # Format and return (including yesterday's bars if present)
+        return {'bars': all_bars, 'formatted': format_bars_for_context(all_bars, num_bars)}
+        
+    except Exception as e:
+        logging.error(f"Error in get_bars_for_llm: {e}")
+        logging.exception("Full traceback:")
+        return {'bars': [], 'formatted': "\n[Error retrieving bar data]"}
 
 def get_available_contracts(topstep_config, auth_token=None, symbol=None):
     """Query API for contract search by symbol (or available contracts if no symbol specified)."""

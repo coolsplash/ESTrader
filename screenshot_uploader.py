@@ -27,6 +27,7 @@ import urllib.parse  # For Telegram URL encoding
 import csv
 from market_data import MarketDataAnalyzer
 import economic_calendar
+import market_holidays
 
 # Supabase integration
 try:
@@ -1587,10 +1588,20 @@ def show_dashboard(root=None):
             widget.destroy()
         DASHBOARD_WIDGETS.clear()
         
-        # Title
-        title = tk.Label(dashboard, text="ES TRADER DASHBOARD", font=("Arial", 20, "bold"), 
+        # Title bar with clock
+        title_frame = tk.Frame(dashboard, bg='#1e1e1e')
+        title_frame.pack(fill="x", pady=10)
+        
+        # Title (centered)
+        title = tk.Label(title_frame, text="ES TRADER DASHBOARD", font=("Arial", 20, "bold"), 
                         bg='#1e1e1e', fg='#00ff00')
-        title.pack(pady=10)
+        title.pack(side="left", expand=True)
+        
+        # Clock (top right)
+        clock_label = tk.Label(title_frame, text="", font=("Arial", 14), 
+                              bg='#1e1e1e', fg='#00aaff', padx=20)
+        clock_label.pack(side="right")
+        DASHBOARD_WIDGETS['clock_label'] = clock_label
         
         # Account Section
         account_frame = tk.LabelFrame(dashboard, text="Account Status", font=("Arial", 12, "bold"),
@@ -1794,6 +1805,69 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
         return
+    
+    # Check if today is a market holiday (full close)
+    if HOLIDAY_CONFIG['enabled']:
+        now = datetime.datetime.now()
+        holiday_file = HOLIDAY_CONFIG['data_file']
+        
+        if market_holidays.is_market_holiday(now, holiday_file):
+            logging.info("🚫 Market is CLOSED today (holiday) - Skipping all trading operations")
+            return
+        
+        # Check for early close day with Trading Halt and Reopen (like Thanksgiving)
+        if market_holidays.is_early_close_day(now.date(), holiday_file):
+            # Load holiday data to check for reopen times
+            holiday_data = market_holidays.load_holiday_data(holiday_file)
+            if holiday_data and 'holidays' in holiday_data:
+                date_str = now.date().isoformat()
+                for holiday in holiday_data['holidays']:
+                    if holiday['date'] == date_str and holiday['type'] == 'early_close':
+                        close_time = market_holidays.get_close_time(now.date(), holiday_file)
+                        notes = holiday.get('notes', '')
+                        
+                        # Check if there's a reopen time mentioned in notes (e.g., "Reopen @ 17:00 CT (18:00 ET)")
+                        reopen_time = None
+                        if 'reopen' in notes.lower():
+                            # Try to extract reopen time from notes (format: "18:00 ET" or "17:00 CT (18:00 ET)")
+                            import re
+                            # Look for time in format HH:MM after "Reopen" or "Open @"
+                            match = re.search(r'(?:Reopen|Open)\s+@\s+(\d{1,2}):(\d{2})\s+(?:CT|ET)', notes, re.IGNORECASE)
+                            if match:
+                                hour = int(match.group(1))
+                                minute = int(match.group(2))
+                                # If it says CT, convert to ET
+                                if 'CT' in match.group(0):
+                                    hour += 1  # CT to ET conversion
+                                reopen_time = datetime.time(hour, minute)
+                                logging.info(f"ℹ️  Detected Trading Halt with reopen at {reopen_time.strftime('%H:%M')} ET")
+                        
+                        if close_time:
+                            # Calculate adjusted close time with buffer
+                            minutes_before = HOLIDAY_CONFIG['minutes_before_close']
+                            close_datetime = datetime.datetime.combine(now.date(), close_time)
+                            adjusted_close = close_datetime - datetime.timedelta(minutes=minutes_before)
+                            
+                            # If there's a reopen time, check if we're in the halt period
+                            if reopen_time:
+                                # We're in halt period if: current time >= adjusted_close AND current time < reopen_time
+                                if adjusted_close.time() <= now.time() < reopen_time:
+                                    logging.info(f"⚠️  Trading Halt period (halt at {close_time.strftime('%H:%M')}, reopen at {reopen_time.strftime('%H:%M')})")
+                                    logging.info(f"⚠️  Stop time reached: {adjusted_close.strftime('%H:%M')} - Skipping trading operations")
+                                    return
+                                elif now.time() >= reopen_time:
+                                    logging.info(f"✅ Market reopened at {reopen_time.strftime('%H:%M')} ET - Trading allowed")
+                                    # Continue with normal trading
+                                    break
+                            else:
+                                # No reopen time, just check if we're past adjusted close
+                                if now >= adjusted_close:
+                                    logging.info(f"⚠️  Approaching early market close (normal: {close_time.strftime('%H:%M')}, buffer: {minutes_before}min)")
+                                    logging.info(f"⚠️  Stop time reached: {adjusted_close.strftime('%H:%M')} - Skipping trading operations")
+                                    return
+                                elif now.time() >= datetime.time(close_time.hour - 1, 0):  # Within 1 hour of close
+                                    logging.info(f"ℹ️  Early close today at {close_time.strftime('%H:%M')} - Will stop trading at {adjusted_close.strftime('%H:%M')}")
+                        break
 
     logging.info(f"Starting job at {time.ctime()}")
     
@@ -2039,10 +2113,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 daily_context_with_bars = daily_context
             
             # Format prompt with position details
-            position_prompt_template = config.get('LLM', 'position_prompt', fallback='')
-            if not position_prompt_template:
-                # Fallback to long/short specific prompts
-                position_prompt_template = long_position_prompt if current_position_type == 'long' else short_position_prompt
+            # Use the pre-loaded global variable (which has the file content, not the path)
+            position_prompt_template = long_position_prompt if current_position_type == 'long' else short_position_prompt
             
             # Parse working orders to get current stop loss and take profit
             contract_id = topstep_config.get('contract_id', '')
@@ -4695,6 +4767,22 @@ if TELEGRAM_CONFIG['api_key'] and TELEGRAM_CONFIG['chat_id']:
 else:
     logging.info("Telegram config not found or incomplete - notifications disabled")
 
+# Load Market Holidays configuration
+HOLIDAY_CONFIG = {
+    'enabled': config.getboolean('MarketHolidays', 'enable_holiday_check', fallback=True),
+    'cme_url': config.get('MarketHolidays', 'cme_url', fallback='https://www.cmegroup.com/trading-hours.html'),
+    'data_file': config.get('MarketHolidays', 'data_file', fallback='market_data/market_holidays.json'),
+    'minutes_before_close': int(config.get('MarketHolidays', 'minutes_before_close', fallback='30')),
+    'minutes_after_open': int(config.get('MarketHolidays', 'minutes_after_open', fallback='5')),
+    'force_refresh': config.getboolean('MarketHolidays', 'force_refresh', fallback=False)
+}
+
+if HOLIDAY_CONFIG['enabled']:
+    logging.info(f"Market holidays checking enabled - Data file: {HOLIDAY_CONFIG['data_file']}")
+    logging.info(f"  Buffer times: {HOLIDAY_CONFIG['minutes_before_close']}min before close, {HOLIDAY_CONFIG['minutes_after_open']}min after open")
+else:
+    logging.info("Market holidays checking disabled")
+
 # Initialize Supabase client
 SUPABASE_CONFIG = {
     'url': config.get('Supabase', 'supabase_url', fallback=''),
@@ -4922,6 +5010,77 @@ except Exception as e:
     logging.error(f"Error checking/fetching economic calendar: {e}")
     logging.exception("Full traceback:")
     logging.info("System will continue without economic calendar data")
+
+# Check/fetch market holiday data if enabled
+logging.info("=" * 80)
+logging.info("CHECKING MARKET HOLIDAY DATA")
+logging.info("=" * 80)
+try:
+    if HOLIDAY_CONFIG['enabled']:
+        holiday_file = HOLIDAY_CONFIG['data_file']
+        
+        # Check if we need to refresh
+        need_refresh = HOLIDAY_CONFIG['force_refresh'] or not market_holidays.has_current_week_data(holiday_file)
+        
+        if need_refresh:
+            logging.info("Fetching market holiday data for current trading week...")
+            
+            openai_config = {
+                'api_key': OPENAI_API_KEY,
+                'api_url': OPENAI_API_URL
+            }
+            
+            # Fetch and parse week data
+            holidays = market_holidays.fetch_and_parse_week(HOLIDAY_CONFIG['cme_url'], openai_config)
+            
+            if holidays:
+                logging.info(f"Fetched {len(holidays)} days of holiday data")
+                
+                # Save to file
+                if market_holidays.save_holiday_data(holidays, holiday_file):
+                    logging.info(f"Market holiday data saved to {holiday_file}")
+                    logging.info("=" * 80)
+                    logging.info("MARKET HOLIDAYS FOR THIS WEEK:")
+                    logging.info("=" * 80)
+                    for day in holidays:
+                        date_str = day.get('date', 'Unknown')
+                        day_type = day.get('type', 'unknown')
+                        notes = day.get('notes', '')
+                        if day_type == 'closed':
+                            logging.info(f"  🚫 {date_str}: CLOSED - {notes}")
+                        elif day_type == 'early_close':
+                            close_time = day.get('close_time', 'Unknown')
+                            logging.info(f"  ⚠️  {date_str}: EARLY CLOSE at {close_time} - {notes}")
+                        else:
+                            logging.info(f"  ✅ {date_str}: Normal trading - {notes}")
+                    logging.info("=" * 80)
+                else:
+                    logging.error("Failed to save market holiday data")
+            else:
+                logging.warning("No holiday data fetched")
+        else:
+            logging.info("Market holiday data already exists for current trading week")
+            # Load and display summary
+            holiday_data = market_holidays.load_holiday_data(holiday_file)
+            if holiday_data and 'holidays' in holiday_data:
+                holidays = holiday_data['holidays']
+                logging.info(f"Loaded {len(holidays)} days for week {holiday_data.get('week_start')} to {holiday_data.get('week_end')}")
+                
+                # Check for upcoming holidays/early closes
+                today = datetime.datetime.now().date()
+                for day in holidays:
+                    day_date = datetime.date.fromisoformat(day['date'])
+                    if day_date >= today:
+                        if day['type'] == 'closed':
+                            logging.info(f"  ⚠️  {day['date']}: Market CLOSED - {day.get('notes', '')}")
+                        elif day['type'] == 'early_close':
+                            logging.info(f"  ⚠️  {day['date']}: Early close at {day.get('close_time', 'Unknown')} - {day.get('notes', '')}")
+    else:
+        logging.info("Market holiday checking disabled in config")
+except Exception as e:
+    logging.error(f"Error checking/fetching market holidays: {e}")
+    logging.exception("Full traceback:")
+    logging.info("System will continue without market holiday data")
 
 logging.info("=" * 80)
 
@@ -5617,6 +5776,17 @@ def reload_config():
             'api_key': config.get('Telegram', 'telegram_api_key', fallback=''),
             'chat_id': config.get('Telegram', 'telegram_chat_id', fallback='')
         })
+        
+        # Reload Market Holidays settings
+        global HOLIDAY_CONFIG
+        HOLIDAY_CONFIG = {
+            'enabled': config.getboolean('MarketHolidays', 'enable_holiday_check', fallback=True),
+            'cme_url': config.get('MarketHolidays', 'cme_url', fallback='https://www.cmegroup.com/trading-hours.html'),
+            'data_file': config.get('MarketHolidays', 'data_file', fallback='market_data/market_holidays.json'),
+            'minutes_before_close': int(config.get('MarketHolidays', 'minutes_before_close', fallback='30')),
+            'minutes_after_open': int(config.get('MarketHolidays', 'minutes_after_open', fallback='5')),
+            'force_refresh': config.getboolean('MarketHolidays', 'force_refresh', fallback=False)
+        }
         
         logging.info("Configuration reloaded successfully:")
         logging.info(f"  INTERVAL_MINUTES={INTERVAL_MINUTES}, INTERVAL_SECONDS={INTERVAL_SECONDS}")

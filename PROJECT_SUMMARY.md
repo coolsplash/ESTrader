@@ -33,19 +33,30 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
    - Pure data generation (caching handled by screenshot_uploader.py)
    - Can be run standalone or integrated into main system
 
-3. **config.ini** (159 lines)
+3. **market_holidays.py** (~500 lines)
+   - Fetches market holiday schedules from EdgeClear
+   - Extracts Equities futures trading hours using BeautifulSoup
+   - Parses holiday data with LLM (CT to ET conversion)
+   - Handles Trading Halt with Reopen (e.g., Thanksgiving 13:00 halt, 18:00 reopen)
+   - Caches weekly data to avoid redundant fetches
+   - Provides functions to check holidays, early closes, and specific times
+   - Integrates with main bot to stop trading before early closes
+   - Configurable buffer times (minutes before close, minutes after open)
+
+4. **config.ini** (189 lines)
    - Centralized configuration for all system components
    - **Points to external prompt files** (no_position_prompt.txt, position_prompt.txt)
    - TopstepX API credentials and settings
    - Trading parameters (risk limits, contract size, etc.)
    - Market data settings (tickers, intervals, analysis parameters)
+   - **Market holidays configuration**: EdgeClear integration, buffer times
    - Time window controls (no_new_trades_windows, force_close_time)
    - **Interval scheduling**: Time-based screenshot intervals (e.g., 30s during RTH, 5min pre-market)
    - **Supabase configuration**: Database connection and logging settings
    - **TopstepX bars configuration**: Bar data fetching and caching settings
    - Hot-reloadable without restarting the application
 
-4. **Prompt Files** (New: External prompt management)
+5. **Prompt Files** (External prompt management)
    - **no_position_prompt.txt** - LLM prompt for identifying new trade entries (sweep/reclaim/retest setups)
    - **position_prompt.txt** - LLM prompt for managing existing positions (risk management, scaling, exits)
    - **position_variables.txt** - Documentation of all placeholder variables used in prompts:
@@ -111,7 +122,26 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 - Trading hours restrictions (begin_time/end_time)
 - Position size limits
 
-### 6. Comprehensive Logging & Notifications
+### 6. Market Holiday Management
+- **EdgeClear integration**: Fetches holiday schedules from https://edgeclear.com/exchange-holiday-hours/
+- **Efficient parsing**: BeautifulSoup extracts only Equities row before LLM processing
+- **Trading Halt with Reopen**: Correctly handles days like Thanksgiving (halt at 13:00, reopen at 18:00)
+- **Time conversion**: Automatic CT to ET conversion (+1 hour)
+- **Weekly caching**: Stores current week data in `market_data/market_holidays.json`
+- **Configurable buffers**:
+  - `minutes_before_close`: Stop trading X minutes before early close (default: 30)
+  - `minutes_after_open`: Wait X minutes after open before trading (default: 5)
+- **Trading logic**:
+  - Full holidays: Skip all processing for the day
+  - Early close: Stop trading at adjusted time (close_time - buffer)
+  - Trading halt with reopen: Skip during halt period, resume after reopen
+- **Example - Thanksgiving 2025**:
+  - Before 12:30: Trading allowed
+  - 12:30-17:59: Skip (halt period with 30min buffer)
+  - 18:00+: Trading resumes (market reopened)
+- **Black Friday handling**: Correctly identifies market already open from previous day (open_time: null)
+
+### 7. Comprehensive Logging & Notifications
 - Daily log files with full execution details
 - Monthly CSV trade journals with:
   - Timestamp, Event Type (ENTRY/ADJUSTMENT/SCALE/CLOSE/HOLD)
@@ -130,7 +160,7 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 - Detailed error logging with stack traces
 - LLM interaction logs in CSV format (`logs/*_LLM.csv`)
 
-### 7. User Interface
+### 8. User Interface
 - Windows system tray icon with menu
 - Functions accessible via right-click:
   - Start/Stop scheduler
@@ -191,6 +221,15 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 - Auto-fetch on startup if context missing
 - Caching to avoid repeated API calls
 
+### Market Holidays Settings
+- `enable_holiday_check`: Enable/disable holiday checking (default: true)
+- `cme_url`: EdgeClear holiday calendar URL
+- `data_file`: Weekly cache file path (market_data/market_holidays.json)
+- `minutes_before_close`: Buffer before early close (default: 30)
+- `minutes_after_open`: Buffer after open (default: 5)
+- `force_refresh`: Force refresh even if cached data exists (default: false)
+- Automatic weekly data refresh when current week data is missing
+
 ### Supabase Database Settings
 - `supabase_url`: Project URL
 - `supabase_anon_key`: Anonymous/public API key
@@ -210,11 +249,19 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
    - 5 days VIX data
 4. Calculates VWAP, Volume Profile, and gap analysis
 5. Generates and caches market context
-6. Authenticates with TopstepX API
-7. Detects if trading during after-hours (ETH) and adds notice
+6. **Checks for current week's holiday data**:
+   - Fetches from EdgeClear if missing
+   - Parses with LLM (CT to ET conversion)
+   - Caches to `market_data/market_holidays.json`
+7. Authenticates with TopstepX API
+8. Detects if trading during after-hours (ETH) and adds notice
 
 ### During Trading Hours
-1. Every minute (configurable):
+1. Every interval (configurable, e.g., 30s):
+   - **Checks holiday status**:
+     - Skip if full holiday (market closed)
+     - Check if early close day (calculate adjusted stop time with buffer)
+     - Check if in Trading Halt period (skip until reopen)
    - Captures screenshot of Bookmap window
    - Queries current position status via API (only during trading hours)
    - Appends after-hours notice to context if outside RTH
@@ -223,10 +270,11 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 2. Sends screenshot + market context + prompt to GPT-4o
 3. Receives JSON response with action and reasoning
 4. Executes trade if action is buy/sell/adjust/scale/close
-5. Logs trade event to CSV and daily log
+5. Logs trade event to CSV, daily log, and Supabase
 6. Sends Telegram notification
 7. Updates market context if LLM provides new insights
 8. No-new-trades window respected (stops entries between configured times)
+9. Holiday buffer times respected (stops before early close, waits after open)
 
 ### Position Management Cycle (Every 15s)
 - Checks if position is still active
@@ -251,9 +299,10 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 
 ```
 ESTrader/
-├── screenshot_uploader.py       # Main trading bot (5612 lines)
+├── screenshot_uploader.py       # Main trading bot (5939 lines)
 ├── market_data.py               # Market data fetcher (433 lines)
-├── config.ini                   # All configuration (159 lines)
+├── market_holidays.py           # Holiday data fetcher (~500 lines)
+├── config.ini                   # All configuration (189 lines)
 ├── no_position_prompt.txt       # LLM prompt for new entries
 ├── position_prompt.txt          # LLM prompt for position management
 ├── position_variables.txt       # Documentation of prompt variables
@@ -263,6 +312,7 @@ ESTrader/
 ├── fetch_market_data.ps1        # Pre-fetch market data
 ├── MARKET_DATA_GUIDE.md         # Market data documentation
 ├── PROMPT_FORMATTING_GUIDE.md   # Prompt formatting and escaping documentation
+├── EDGECLEAR_INTEGRATION.md     # Holiday data integration documentation
 ├── EXAMPLE_INTRADAY_OUTPUT.txt  # Sample context output
 ├── PROJECT_SUMMARY.md           # This file
 ├── QUICK_CONTEXT.md             # Quick reference guide
@@ -281,7 +331,8 @@ ESTrader/
 ├── market_data/                 # Yahoo Finance raw data cache
 │   ├── ES_F_20251127.csv       # Daily ES data
 │   ├── ES_F_5m_20251127.csv    # Intraday 5m ES data
-│   └── VIX_20251127.csv        # VIX data
+│   ├── VIX_20251127.csv        # VIX data
+│   └── market_holidays.json    # Weekly holiday schedule (EdgeClear)
 ├── cache/                       # TopstepX API caches
 │   └── bars/                   # 5m OHLCV bar data
 │       └── 20251127.json       # Daily bar cache
@@ -291,6 +342,9 @@ ESTrader/
 ├── testing/                     # Test scripts and utilities
 │   ├── test_llm.py             # LLM prompt testing
 │   ├── test_signalr_user_hub.py # SignalR real-time testing
+│   ├── test_market_holidays.py # Holiday integration tests
+│   ├── test_edgeclear_fetch.py # EdgeClear data fetching tests
+│   ├── test_trading_halt_reopen.py # Trading halt/reopen logic tests
 │   └── responses/              # Test response storage
 └── venv/                        # Python virtual environment
 ```
@@ -389,8 +443,9 @@ All stored in `config.ini` (already configured).
 ## Current Status
 
 Based on recent changes:
-- Core files: screenshot_uploader.py (5612 lines), market_data.py (433 lines), config.ini (159 lines)
+- Core files: screenshot_uploader.py (5939 lines), market_data.py (433 lines), market_holidays.py (~500 lines), config.ini (189 lines)
 - **Prompt management**: External .txt files (no_position_prompt.txt, position_prompt.txt, position_variables.txt)
+- **Market holidays**: EdgeClear integration with Trading Halt/Reopen support
 - Market data integration: Fully operational with gap detection and 5m intraday data
 - Context storage: Dual storage (`context/YYMMDD.txt` base + `context/YYMMDD_LLM.txt` updated)
 - TopstepX bar data: 5m OHLCV bars cached in `cache/bars/` directory
@@ -400,6 +455,8 @@ Based on recent changes:
 - LLM model: gpt-5.1-chat-latest
 - Supabase: Integrated for database logging and analytics
 - Features: 
+  - Market holiday checking (EdgeClear integration)
+  - Trading Halt with Reopen support (e.g., Thanksgiving)
   - Dynamic interval scheduling
   - Hot-reload configuration (including external prompt files)
   - After-hours detection
@@ -412,7 +469,22 @@ Based on recent changes:
 
 ## Recent Enhancements (November 2025)
 
-### External Prompt Management (Latest)
+### Market Holiday Integration (Latest)
+- **EdgeClear data source**: Fetches Equities futures holiday schedules
+- **Efficient extraction**: BeautifulSoup pre-processes HTML to extract only Equities row
+- **LLM parsing**: GPT-4o processes holiday data with CT to ET conversion
+- **Trading Halt with Reopen**: Handles complex schedules (e.g., Thanksgiving halt at 13:00, reopen at 18:00)
+- **Intelligent trading logic**: 
+  - Skips full holidays entirely
+  - Stops trading before early closes (with configurable buffer)
+  - Resumes trading after reopen times
+  - Correctly handles days already open from previous day (open_time: null)
+- **Weekly caching**: Stores data in `market_data/market_holidays.json`
+- **Configurable buffers**: minutes_before_close (30) and minutes_after_open (5)
+- **Testing**: Comprehensive test suite verifying all holiday scenarios
+- **Token efficiency**: Reduced from ~7,000 tokens to ~1,500-2,000 tokens per LLM call
+
+### External Prompt Management
 - **Prompt files**: LLM prompts moved to separate .txt files for easier editing
 - **no_position_prompt.txt**: Contains full prompt for identifying new trade entries
 - **position_prompt.txt**: Contains full prompt for managing existing positions
@@ -477,19 +549,22 @@ Based on recent changes:
 ## Notes for Future Sessions
 
 1. The system has been enhanced with comprehensive market data integration
-2. LLM now receives rich market context (VWAP, volume profile, VIX, trend, gaps, 5m bars)
-3. Both daily and intraday (5m) analysis is provided
-4. Context updates dynamically as LLM observes intraday changes (stored separately)
-5. All trades are logged to CSV **and** Supabase database for advanced analytics
-6. System can run fully automated during configured trading hours
-7. Telegram notifications keep you informed of all trade activity
-8. Hot-reload capability allows config changes without downtime (including prompt files)
-9. After-hours trading is automatically detected and communicated to LLM
-10. Context management uses dual storage (base + LLM updates) for reliability
-11. Dynamic interval scheduling allows optimal screenshot frequency per time period
-12. TopstepX bar data provides additional price action context to LLM
-13. Supabase integration enables real-time analytics, win rate tracking, and performance views
-14. SignalR testing infrastructure in place for potential real-time event migration
-15. Current model is gpt-5.1-chat-latest with updated prompts focused on sweep/reclaim setups
-16. **LLM prompts now managed in external .txt files** for easier editing and version control (no_position_prompt.txt, position_prompt.txt, position_variables.txt)
+2. **Market holidays now managed via EdgeClear integration** with Trading Halt/Reopen support
+3. LLM now receives rich market context (VWAP, volume profile, VIX, trend, gaps, 5m bars)
+4. Both daily and intraday (5m) analysis is provided
+5. Context updates dynamically as LLM observes intraday changes (stored separately)
+6. All trades are logged to CSV **and** Supabase database for advanced analytics
+7. System can run fully automated during configured trading hours
+8. **Trading automatically pauses on holidays and before early closes** (configurable buffers)
+9. Telegram notifications keep you informed of all trade activity
+10. Hot-reload capability allows config changes without downtime (including prompt files)
+11. After-hours trading is automatically detected and communicated to LLM
+12. Context management uses dual storage (base + LLM updates) for reliability
+13. Dynamic interval scheduling allows optimal screenshot frequency per time period
+14. TopstepX bar data provides additional price action context to LLM
+15. Supabase integration enables real-time analytics, win rate tracking, and performance views
+16. SignalR testing infrastructure in place for potential real-time event migration
+17. Current model is gpt-5.1-chat-latest with updated prompts focused on sweep/reclaim setups
+18. **LLM prompts now managed in external .txt files** for easier editing and version control (no_position_prompt.txt, position_prompt.txt, position_variables.txt)
+19. **Holiday data cached weekly** - automatic refresh when current week data is missing
 

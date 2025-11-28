@@ -4,9 +4,10 @@
 Automated ES futures trading system using GPT-4o vision to analyze Bookmap screenshots and execute trades via TopstepX API.
 
 ## Core Files
-- **screenshot_uploader.py** (5612 lines) - Main trading bot with system tray, scheduler, API integration, Supabase logging
+- **screenshot_uploader.py** (5939 lines) - Main trading bot with system tray, scheduler, API integration, Supabase logging, holiday checking
 - **market_data.py** (433 lines) - Fetches Yahoo Finance data, calculates VWAP/volume profile
-- **config.ini** (159 lines) - All settings, credentials, interval scheduling, prompt file pointers
+- **market_holidays.py** (~500 lines) - Fetches EdgeClear holiday schedules, parses with LLM, manages Trading Halt/Reopen
+- **config.ini** (189 lines) - All settings, credentials, interval scheduling, prompt file pointers, holiday configuration
 - **no_position_prompt.txt** - LLM prompt for identifying new trade entries
 - **position_prompt.txt** - LLM prompt for managing existing positions
 - **position_variables.txt** - Documentation of all prompt placeholder variables
@@ -14,16 +15,17 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - **backfill_supabase.py** - Import historical CSV data to Supabase database
 
 ## How It Works
-1. Dynamic interval: Capture Bookmap screenshot based on time-based schedule (e.g., 30s during RTH, 5min pre-market)
-2. Fetch TopstepX 5m bar data: Cache OHLCV bars for price action context
-3. Every 30 minutes: Refresh base market context from Yahoo Finance (VWAP, volume profile, VIX)
-4. Query TopstepX API for current position status
-5. Send screenshot + market context + bar data to GPT-4o with appropriate prompt:
+1. **Check holiday status**: Verify market is open, not early close, not in Trading Halt period
+2. Dynamic interval: Capture Bookmap screenshot based on time-based schedule (e.g., 30s during RTH, 5min pre-market)
+3. Fetch TopstepX 5m bar data: Cache OHLCV bars for price action context
+4. Every 30 minutes: Refresh base market context from Yahoo Finance (VWAP, volume profile, VIX)
+5. Query TopstepX API for current position status
+6. Send screenshot + market context + bar data to GPT-4o with appropriate prompt:
    - **No position**: Look for sweep/reclaim/retest setups (buy/sell/hold)
    - **Has position**: Manage it (hold/adjust/scale/close)
-6. Parse JSON response and execute trades
-7. Log everything to daily logs, monthly CSV trade journal, **and Supabase database**
-8. Send Telegram notifications
+7. Parse JSON response and execute trades
+8. Log everything to daily logs, monthly CSV trade journal, **and Supabase database**
+9. Send Telegram notifications
 
 ## Market Context Provided to LLM
 - ES price, daily range, 5-day trend
@@ -49,6 +51,7 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - `enable_llm` - Use AI analysis (true/false)
 - `enable_trading` - Enable API calls (true/false)
 - `execute_trades` - Actually execute trades (true/false)
+- `enable_holiday_check` - Check market holidays and early closes (true/false)
 - `interval_seconds` - Default screenshot frequency in seconds
 - `interval_schedule` - Time-based intervals (e.g., "09:30-16:00=30,18:00-23:59=300")
 - `begin_time`/`end_time` - Trading hours window
@@ -57,6 +60,8 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - `window_process_name` - Filter windows by process name (e.g., Bookmap.exe)
 - `enable_supabase_logging` - Log to PostgreSQL database (true/false)
 - `enable_bar_data` - Fetch TopstepX bar data for context (true/false)
+- `minutes_before_close` - Stop trading X min before early close (default: 30)
+- `minutes_after_open` - Wait X min after open before trading (default: 5)
 
 ## Data Storage
 - `logs/YYYYMMDD.txt` - Daily execution logs
@@ -66,6 +71,7 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - `context/YYMMDD.txt` - Original market data context (never overwritten)
 - `context/YYMMDD_LLM.txt` - LLM's updated context (evolves throughout day)
 - `market_data/` - Cached Yahoo Finance raw data (CSV files: daily, 5m intraday, VIX)
+- `market_data/market_holidays.json` - Weekly holiday schedule (EdgeClear)
 - `cache/bars/` - TopstepX 5m OHLCV bar data (JSON files)
 - `screenshots/` - Captured images (timestamped)
 - `supabase/` - Database migrations and schema
@@ -122,7 +128,13 @@ Right-click the tray icon for quick access to:
 - Virtual environment: `venv/`
 
 ## Recent Changes
-- **External prompt management** (Latest): LLM prompts moved to .txt files (no_position_prompt.txt, position_prompt.txt, position_variables.txt) for easier editing and version control
+- **Market holiday integration** (Latest): EdgeClear data source with Trading Halt/Reopen support
+  - **Efficient extraction**: BeautifulSoup pre-processes HTML to extract only Equities row
+  - **Trading logic**: Skips full holidays, stops before early closes, resumes after reopen
+  - **Example - Thanksgiving**: Before 12:30 = trade, 12:30-17:59 = skip (halt), 18:00+ = trade (reopen)
+  - **Weekly caching**: `market_data/market_holidays.json`
+  - **Configurable buffers**: minutes_before_close (30), minutes_after_open (5)
+- **External prompt management**: LLM prompts moved to .txt files (no_position_prompt.txt, position_prompt.txt, position_variables.txt) for easier editing and version control
   - **Safe formatting**: Automatic escaping of special characters (curly braces, quotes) in replacement values
   - **Error handling**: Graceful handling with detailed logging
   - **Documentation**: See PROMPT_FORMATTING_GUIDE.md for details
@@ -134,7 +146,7 @@ Right-click the tray icon for quick access to:
 - **Enhanced intraday data**: 5-minute intervals (previously 15m)
 - **Dual context storage**: Base context + LLM-updated context stored separately
 - **Window process filtering**: Ensure correct Bookmap window is captured
-- **Testing infrastructure**: SignalR testing, LLM prompt testing, comprehensive test utilities
+- **Testing infrastructure**: SignalR testing, LLM prompt testing, holiday testing, comprehensive test utilities
 - **Account update**: Now trading on account #14789500 with 3 contracts
 - **Backfill utility**: Import historical CSV data to Supabase
 
@@ -144,6 +156,7 @@ Right-click the tray icon for quick access to:
 - **LLM prompts stored in external .txt files** for easy editing (no_position_prompt.txt, position_prompt.txt)
 - Prompt variables documented in position_variables.txt
 - **Safe formatting**: Special characters (braces, quotes) in market data are automatically escaped
+- **Market holidays checked automatically**: Skips full holidays, stops before early closes, resumes after reopen
 - Position management happens every 20 seconds when in a trade
 - Screenshots taken based on dynamic interval schedule (not fixed 1-minute)
 - API queries only run during trading hours (saves API calls)
@@ -157,5 +170,6 @@ Right-click the tray icon for quick access to:
 - Bar data cached daily to minimize API calls
 - LLM interactions logged separately for analysis (`logs/*_LLM.csv`)
 - Window process filtering prevents accidental wrong-window captures
-- Testing directory contains SignalR and LLM testing utilities
+- Testing directory contains SignalR, LLM, and holiday testing utilities
+- **Holiday data cached weekly** - automatic refresh when current week data is missing
 

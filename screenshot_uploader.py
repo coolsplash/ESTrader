@@ -1437,7 +1437,7 @@ def show_dashboard(root=None):
         
         dashboard.title("ES Trader Dashboard")
         if is_initial_build:
-            dashboard.geometry("800x700")
+            dashboard.geometry("500x640")
         dashboard.configure(bg='#1e1e1e')
         
         # Get current data - verify position from API if trading is enabled
@@ -1554,15 +1554,16 @@ def show_dashboard(root=None):
                     DASHBOARD_WIDGETS['reasoning_text'].insert(1.0, llm_data.get('reasoning', 'N/A'))
                     DASHBOARD_WIDGETS['reasoning_text'].config(state=tk.DISABLED)
                 
-                if 'context_text' in DASHBOARD_WIDGETS:
-                    DASHBOARD_WIDGETS['context_text'].config(state=tk.NORMAL)
-                    DASHBOARD_WIDGETS['context_text'].delete(1.0, tk.END)
-                    DASHBOARD_WIDGETS['context_text'].insert(1.0, llm_data.get('context', 'N/A'))
-                    DASHBOARD_WIDGETS['context_text'].config(state=tk.DISABLED)
+                # Market Context temporarily hidden
+                # if 'context_text' in DASHBOARD_WIDGETS:
+                #     DASHBOARD_WIDGETS['context_text'].config(state=tk.NORMAL)
+                #     DASHBOARD_WIDGETS['context_text'].delete(1.0, tk.END)
+                #     DASHBOARD_WIDGETS['context_text'].insert(1.0, llm_data.get('context', 'N/A'))
+                #     DASHBOARD_WIDGETS['context_text'].config(state=tk.DISABLED)
                 
-                # Show LLM data widgets, hide no-data label
+                # Show LLM data widgets, hide no-data label (context temporarily hidden)
                 for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
-                           'reasoning_title', 'reasoning_text', 'context_title', 'context_text']:
+                           'reasoning_title', 'reasoning_text']:
                     if key in DASHBOARD_WIDGETS:
                         if 'text' in key:
                             # Text widgets need fill="x" not anchor
@@ -1572,9 +1573,9 @@ def show_dashboard(root=None):
                 if 'no_llm_label' in DASHBOARD_WIDGETS:
                     DASHBOARD_WIDGETS['no_llm_label'].pack_forget()
             else:
-                # Hide LLM widgets, show no-data label
+                # Hide LLM widgets, show no-data label (context temporarily hidden)
                 for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
-                           'reasoning_title', 'reasoning_text', 'context_title', 'context_text']:
+                           'reasoning_title', 'reasoning_text']:
                     if key in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS[key].pack_forget()
                 if 'no_llm_label' in DASHBOARD_WIDGETS:
@@ -1667,8 +1668,8 @@ def show_dashboard(root=None):
         prices_label = tk.Label(llm_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#00aaff')
         confidence_label = tk.Label(llm_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#ffaa00')
         reasoning_title = tk.Label(llm_frame, text="Reasoning:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
-        reasoning_text = tk.Text(llm_frame, height=4, wrap=tk.WORD, font=("Arial", 10),
-                                bg='#1e1e1e', fg='#ffffff', relief=tk.FLAT)
+        reasoning_text = tk.Text(llm_frame, height=6, wrap=tk.WORD, font=("Arial", 10),
+                                bg='#2d2d2d', fg='#ffffff', relief=tk.FLAT)
         context_title = tk.Label(llm_frame, text="Market Context:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
         context_text = tk.Text(llm_frame, height=4, wrap=tk.WORD, font=("Arial", 10),
                               bg='#1e1e1e', fg='#aaaaaa', relief=tk.FLAT)
@@ -1747,10 +1748,11 @@ def show_dashboard(root=None):
             reasoning_text.config(state=tk.DISABLED)
             reasoning_text.pack(fill="x", pady=5)
             
-            context_title.pack(anchor="w", pady=(10, 5))
-            context_text.insert(1.0, llm_data.get('context', 'N/A'))
-            context_text.config(state=tk.DISABLED)
-            context_text.pack(fill="x", pady=5)
+            # Market Context temporarily hidden
+            # context_title.pack(anchor="w", pady=(10, 5))
+            # context_text.insert(1.0, llm_data.get('context', 'N/A'))
+            # context_text.config(state=tk.DISABLED)
+            # context_text.pack(fill="x", pady=5)
         else:
             no_llm_label.pack(pady=20)
         
@@ -1758,17 +1760,12 @@ def show_dashboard(root=None):
         btn_frame = tk.Frame(dashboard, bg='#1e1e1e')
         btn_frame.pack(pady=10)
         
+        # Centered refresh button that triggers full screenshot workflow
         refresh_btn = tk.Button(btn_frame, text="Refresh", 
-                               command=lambda: show_dashboard(dashboard),
+                               command=manual_job,
                                font=("Arial", 11), bg='#006600', fg='#ffffff',
                                activebackground='#008800', relief=tk.FLAT, padx=20, pady=5)
-        refresh_btn.pack(side=tk.LEFT, padx=5)
-        
-        close_btn = tk.Button(btn_frame, text="Minimize to Tray", 
-                             command=dashboard.withdraw,
-                             font=("Arial", 11), bg='#444444', fg='#ffffff',
-                             activebackground='#666666', relief=tk.FLAT, padx=20, pady=5)
-        close_btn.pack(side=tk.LEFT, padx=5)
+        refresh_btn.pack()
         
         # Center the window only on initial build
         if is_initial_build:
@@ -1857,7 +1854,7 @@ def update_countdown():
                         color = '#00ff00'  # Green - plenty of time
                     
                     DASHBOARD_WIDGETS['countdown_label'].config(
-                        text=f"[Next: {remaining}s]", 
+                        text=f"{remaining}s", 
                         fg=color
                     )
             else:

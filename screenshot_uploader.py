@@ -1561,24 +1561,29 @@ def show_dashboard(root=None):
                     DASHBOARD_WIDGETS['context_text'].config(state=tk.DISABLED)
                 
                 # Show LLM data widgets, hide no-data label
-                for key in ['action_label', 'timestamp_label', 'prices_label', 'confidence_label', 
+                for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
                            'reasoning_title', 'reasoning_text', 'context_title', 'context_text']:
                     if key in DASHBOARD_WIDGETS:
                         if 'text' in key:
                             # Text widgets need fill="x" not anchor
                             DASHBOARD_WIDGETS[key].pack(fill="x", pady=5)
-                        elif 'label' in key or 'title' in key:
-                            DASHBOARD_WIDGETS[key].pack(anchor="w", pady=5 if 'label' in key else (10, 5))
+                        elif key == 'time_frame' or 'label' in key or 'title' in key:
+                            DASHBOARD_WIDGETS[key].pack(anchor="w", pady=5 if 'label' in key or key == 'time_frame' else (10, 5))
                 if 'no_llm_label' in DASHBOARD_WIDGETS:
                     DASHBOARD_WIDGETS['no_llm_label'].pack_forget()
             else:
                 # Hide LLM widgets, show no-data label
-                for key in ['action_label', 'timestamp_label', 'prices_label', 'confidence_label', 
+                for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
                            'reasoning_title', 'reasoning_text', 'context_title', 'context_text']:
                     if key in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS[key].pack_forget()
                 if 'no_llm_label' in DASHBOARD_WIDGETS:
                     DASHBOARD_WIDGETS['no_llm_label'].pack(pady=20)
+            
+            # Update clock
+            if 'clock_label' in DASHBOARD_WIDGETS:
+                current_time = datetime.datetime.now().strftime("%H:%M:%S")
+                DASHBOARD_WIDGETS['clock_label'].config(text=current_time)
             
             return  # Exit after updating existing widgets
         
@@ -1653,7 +1658,12 @@ def show_dashboard(root=None):
         
         # Create LLM widgets (shown/hidden based on data availability)
         action_label = tk.Label(llm_frame, text="", font=("Arial", 14, "bold"), bg='#2d2d2d')
-        timestamp_label = tk.Label(llm_frame, text="", font=("Arial", 10), bg='#2d2d2d', fg='#aaaaaa')
+        
+        # Timestamp and countdown on same line
+        time_frame = tk.Frame(llm_frame, bg='#2d2d2d')
+        timestamp_label = tk.Label(time_frame, text="", font=("Arial", 10), bg='#2d2d2d', fg='#aaaaaa')
+        countdown_label = tk.Label(time_frame, text="", font=("Arial", 10), bg='#2d2d2d', fg='#00ff00')
+        
         prices_label = tk.Label(llm_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#00aaff')
         confidence_label = tk.Label(llm_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#ffaa00')
         reasoning_title = tk.Label(llm_frame, text="Reasoning:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
@@ -1666,7 +1676,9 @@ def show_dashboard(root=None):
                                font=("Arial", 12), bg='#2d2d2d', fg='#888888')
         
         DASHBOARD_WIDGETS['action_label'] = action_label
+        DASHBOARD_WIDGETS['time_frame'] = time_frame
         DASHBOARD_WIDGETS['timestamp_label'] = timestamp_label
+        DASHBOARD_WIDGETS['countdown_label'] = countdown_label
         DASHBOARD_WIDGETS['prices_label'] = prices_label
         DASHBOARD_WIDGETS['confidence_label'] = confidence_label
         DASHBOARD_WIDGETS['reasoning_title'] = reasoning_title
@@ -1687,7 +1699,11 @@ def show_dashboard(root=None):
             action_label.pack(anchor="w", pady=5)
             
             timestamp_label.config(text=f"Time: {llm_data.get('date_time', 'N/A')}")
-            timestamp_label.pack(anchor="w")
+            timestamp_label.pack(side="left")
+            
+            # Countdown will be updated by update_countdown()
+            countdown_label.pack(side="left", padx=10)
+            time_frame.pack(anchor="w")
             
             # Prices
             price_info = []
@@ -1762,6 +1778,10 @@ def show_dashboard(root=None):
             x = (dashboard.winfo_screenwidth() // 2) - (width // 2)
             y = (dashboard.winfo_screenheight() // 2) - (height // 2)
             dashboard.geometry(f'{width}x{height}+{x}+{y}')
+            
+            # Start the clock and countdown updates (only on initial build to avoid multiple timers)
+            update_clock()
+            update_countdown()
         
     except Exception as e:
         logging.error(f"Error showing dashboard: {e}")
@@ -1797,6 +1817,58 @@ def _update_dashboard_widgets():
         logging.debug("Dashboard widgets updated successfully")
     except Exception as e:
         logging.error(f"Error updating dashboard widgets: {e}")
+
+def update_clock():
+    """Update the clock label with current time (HH:MM:SS)."""
+    global DASHBOARD_WINDOW, DASHBOARD_WIDGETS
+    if DASHBOARD_WINDOW and DASHBOARD_WINDOW.winfo_exists() and 'clock_label' in DASHBOARD_WIDGETS:
+        try:
+            current_time = datetime.datetime.now().strftime("%H:%M:%S")
+            DASHBOARD_WIDGETS['clock_label'].config(text=current_time)
+            # Schedule next update in 1 second
+            DASHBOARD_WINDOW.after(1000, update_clock)
+        except Exception as e:
+            logging.debug(f"Error updating clock: {e}")
+    else:
+        logging.debug("Dashboard window or clock widget not available")
+
+def update_countdown():
+    """Update the countdown label showing seconds until next screenshot."""
+    global DASHBOARD_WINDOW, DASHBOARD_WIDGETS, LAST_JOB_TIME
+    if DASHBOARD_WINDOW and DASHBOARD_WINDOW.winfo_exists() and 'countdown_label' in DASHBOARD_WIDGETS:
+        try:
+            if LAST_JOB_TIME is not None:
+                current_interval = get_current_interval()
+                
+                # Skip if screenshots disabled
+                if current_interval == -1:
+                    DASHBOARD_WIDGETS['countdown_label'].config(text="[Screenshots disabled]", fg='#888888')
+                else:
+                    # Calculate seconds since last job
+                    elapsed = (datetime.datetime.now() - LAST_JOB_TIME).total_seconds()
+                    remaining = max(0, int(current_interval - elapsed))
+                    
+                    # Color based on urgency
+                    if remaining <= 5:
+                        color = '#ff4444'  # Red - imminent
+                    elif remaining <= 15:
+                        color = '#ffaa00'  # Orange - soon
+                    else:
+                        color = '#00ff00'  # Green - plenty of time
+                    
+                    DASHBOARD_WIDGETS['countdown_label'].config(
+                        text=f"[Next: {remaining}s]", 
+                        fg=color
+                    )
+            else:
+                DASHBOARD_WIDGETS['countdown_label'].config(text="[Waiting...]", fg='#aaaaaa')
+            
+            # Schedule next update in 1 second
+            DASHBOARD_WINDOW.after(1000, update_countdown)
+        except Exception as e:
+            logging.debug(f"Error updating countdown: {e}")
+    else:
+        logging.debug("Dashboard window or countdown widget not available")
 
 def job(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
     """The main job to run periodically."""
@@ -4576,6 +4648,7 @@ DASHBOARD_WINDOW = None
 ACCOUNT_BALANCE = None
 LATEST_LLM_DATA = None  # Store the most recent LLM response for immediate dashboard updates
 DASHBOARD_WIDGETS = {}  # Store references to dashboard widgets for updates without rebuild
+LAST_JOB_TIME = None  # Track when last screenshot/job was taken for countdown
 
 # Global Supabase client
 SUPABASE_CLIENT = None
@@ -5266,6 +5339,7 @@ def run_scheduler():
     global SHORT_POSITION_PROMPT, MODEL, TOPSTEP_CONFIG, ENABLE_LLM, ENABLE_TRADING
     global OPENAI_API_URL, OPENAI_API_KEY, ENABLE_SAVE_SCREENSHOTS, AUTH_TOKEN
     global EXECUTE_TRADES, TELEGRAM_CONFIG, NO_NEW_TRADES_WINDOWS, FORCE_CLOSE_TIME
+    global LAST_JOB_TIME
     
     last_run_time = None
     last_interval_log = None
@@ -5324,6 +5398,7 @@ def run_scheduler():
                 logging.exception("Full traceback:")
             
             last_run_time = current_time
+            LAST_JOB_TIME = current_time  # Update global for dashboard countdown
         
         time.sleep(1)
 

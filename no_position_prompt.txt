@@ -53,7 +53,7 @@ PREVIOUS ANALYSIS TRACKING
 {waiting_for}
 RESPONSE FORMAT – MUST BE VALID JSON
 Return JSON ONLY in the following structure:
-{
+{{
 "action": "buy" | "sell" | "hold",
 "entry_price": number | null,
 "price_target": number | null,
@@ -62,7 +62,7 @@ Return JSON ONLY in the following structure:
 "reasoning": "2-4 sentences explaining the sweep, trap, or continuation evidence supporting a 20+ point move.",
 "context": "Explain how current structure evolved relative to recent bars and key levels.",
 "waiting_for": "Describe the exact condition you're waiting for if the setup is developing but incomplete, otherwise null"
-}
+}}
 RULES
 - For "hold": all numeric fields must be null.
 - Provide "buy" or "sell" signals when sweep, reclaim, retest, or continuation signals are clearly present.

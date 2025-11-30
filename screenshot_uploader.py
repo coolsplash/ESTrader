@@ -102,6 +102,70 @@ def eastern_to_utc(et_dt):
     offset_hours = get_eastern_utc_offset()
     return et_dt + datetime.timedelta(hours=offset_hours)
 
+def is_market_closed_weekly(market_closed_config):
+    """Check if current time falls within weekly market closed periods.
+    
+    Args:
+        market_closed_config: String format "DAY:HH:MM-HH:MM,DAY:HH:MM-HH:MM"
+                             Day numbers: 0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 
+                                         4=Friday, 5=Saturday, 6=Sunday
+    
+    Returns:
+        tuple: (is_closed, reason) where is_closed is bool and reason is string
+    """
+    if not market_closed_config:
+        return False, None
+    
+    now = datetime.datetime.now()
+    current_day = now.weekday()  # 0=Monday, 6=Sunday
+    current_time = now.time()
+    
+    try:
+        # Parse the market_closed config
+        # Format: DAY:HH:MM-HH:MM,DAY:HH:MM-HH:MM
+        periods = market_closed_config.split(',')
+        
+        for period in periods:
+            period = period.strip()
+            if not period:
+                continue
+            
+            # Split day from time range
+            parts = period.split(':')
+            if len(parts) < 3:
+                logging.warning(f"Invalid market_closed format: {period}")
+                continue
+            
+            day_num = int(parts[0])
+            time_range = ':'.join(parts[1:])  # Rejoin in case of HH:MM:SS format
+            
+            # Check if current day matches
+            if current_day == day_num:
+                # Parse time range
+                time_parts = time_range.split('-')
+                if len(time_parts) != 2:
+                    logging.warning(f"Invalid time range format: {time_range}")
+                    continue
+                
+                start_time_str = time_parts[0].strip()
+                end_time_str = time_parts[1].strip()
+                
+                # Parse times
+                start_time = datetime.datetime.strptime(start_time_str, '%H:%M').time()
+                end_time = datetime.datetime.strptime(end_time_str, '%H:%M').time()
+                
+                # Check if current time is within closed period
+                if start_time <= current_time <= end_time:
+                    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                    reason = f"Market closed: {day_names[current_day]} {start_time_str}-{end_time_str}"
+                    return True, reason
+        
+        return False, None
+        
+    except Exception as e:
+        logging.error(f"Error checking weekly market closed periods: {e}")
+        return False, None
+
 def get_active_trade_info():
     """Get the current active trade info from file.
     
@@ -1891,6 +1955,13 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
         return
+    
+    # Check weekly market closed periods (Saturday/Sunday closure)
+    if HOLIDAY_CONFIG.get('market_closed'):
+        is_closed, reason = is_market_closed_weekly(HOLIDAY_CONFIG['market_closed'])
+        if is_closed:
+            logging.info(f"📅 {reason} - Skipping all operations")
+            return
     
     # Check if today is a market holiday (full close)
     if HOLIDAY_CONFIG['enabled']:
@@ -4929,12 +5000,15 @@ HOLIDAY_CONFIG = {
     'data_file': config.get('MarketHolidays', 'data_file', fallback='market_data/market_holidays.json'),
     'minutes_before_close': int(config.get('MarketHolidays', 'minutes_before_close', fallback='30')),
     'minutes_after_open': int(config.get('MarketHolidays', 'minutes_after_open', fallback='5')),
-    'force_refresh': config.getboolean('MarketHolidays', 'force_refresh', fallback=False)
+    'force_refresh': config.getboolean('MarketHolidays', 'force_refresh', fallback=False),
+    'market_closed': config.get('MarketHolidays', 'market_closed', fallback='')
 }
 
 if HOLIDAY_CONFIG['enabled']:
     logging.info(f"Market holidays checking enabled - Data file: {HOLIDAY_CONFIG['data_file']}")
     logging.info(f"  Buffer times: {HOLIDAY_CONFIG['minutes_before_close']}min before close, {HOLIDAY_CONFIG['minutes_after_open']}min after open")
+    if HOLIDAY_CONFIG['market_closed']:
+        logging.info(f"  Weekly closed periods: {HOLIDAY_CONFIG['market_closed']}")
 else:
     logging.info("Market holidays checking disabled")
 
@@ -5328,6 +5402,7 @@ job(
     no_position_prompt=NO_POSITION_PROMPT, 
     long_position_prompt=LONG_POSITION_PROMPT, 
     short_position_prompt=SHORT_POSITION_PROMPT, 
+    runner_prompt=RUNNER_PROMPT,
     model=MODEL, 
     topstep_config=TOPSTEP_CONFIG, 
     enable_llm=ENABLE_LLM,
@@ -5948,7 +6023,8 @@ def reload_config():
             'data_file': config.get('MarketHolidays', 'data_file', fallback='market_data/market_holidays.json'),
             'minutes_before_close': int(config.get('MarketHolidays', 'minutes_before_close', fallback='30')),
             'minutes_after_open': int(config.get('MarketHolidays', 'minutes_after_open', fallback='5')),
-            'force_refresh': config.getboolean('MarketHolidays', 'force_refresh', fallback=False)
+            'force_refresh': config.getboolean('MarketHolidays', 'force_refresh', fallback=False),
+            'market_closed': config.get('MarketHolidays', 'market_closed', fallback='')
         }
         
         logging.info("Configuration reloaded successfully:")

@@ -101,13 +101,13 @@ INPUT DATA
 Use the Position JSON (direction, entry_price, stop, targets) combined with Market Data JSON (structure, levels, volume, liquidity, trend) and the screenshot.
 
 RESPONSE FORMAT (MUST BE VALID JSON)
-{
+{{
 "action": "hold" | "scale" | "adjust" | "close",
 "price_target": number,
 "stop_loss": number,
 "reasoning": "2-4 sentences explaining whether the thesis is still valid, how order flow/liquidity support or contradict the trade, and why you chose this management action.",
 "context": "Briefly describe how current conditions compare to when the trade was opened (trend, structure, key levels, and behavior since entry)."
-}
+}}
 
 ACTION LOGIC
 Use "close" when:

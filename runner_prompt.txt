@@ -20,13 +20,13 @@ The focus should be on:
 - Identifying optimal exit points for maximum profit
 
 RESPONSE FORMAT (MUST BE VALID JSON)
-{
+{{
 "action": "hold" | "adjust" | "close",
 "price_target": number,
 "stop_loss": number,
 "reasoning": "Explain your runner management decision.",
 "context": "Describe current market conditions and how they support continued holding or exit."
-}
+}}
 
 RULES
 - NEVER widen a stop beyond break-even.

@@ -1886,7 +1886,7 @@ def update_countdown():
 
 def job(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, runner_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
     """The main job to run periodically."""
-    global PREVIOUS_POSITION_TYPE
+    global PREVIOUS_POSITION_TYPE, LAST_WAITING_FOR
     
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
@@ -2422,8 +2422,7 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 )
                 logging.info(f"LLM response logged and cached at {llm_response_time.strftime('%H:%M:%S')}")
                 
-                # Store waiting_for condition for next iteration (make it global)
-                global LAST_WAITING_FOR
+                # Store waiting_for condition for next iteration
                 LAST_WAITING_FOR = waiting_for if waiting_for else None
                 logging.info(f"Updated LAST_WAITING_FOR to: {LAST_WAITING_FOR}")
                 

@@ -69,6 +69,9 @@ position_prompt = You are an expert ES futures trader. I am currently in a {posi
 
 	Analyze the attached Bookmap screenshot for {symbol} futures and advise: hold, adjust, scale, or close. Actions: 'hold' (keep position as-is), 'adjust' (modify stop loss and/or price target), 'scale' (partially close position), 'close' (exit entire position). Always provide price_target and stop_loss numbers even if you recommend holding. Move stops to break even or into profit once those options make sense, but dont be super aggressive and lose the trade. We dont want to hold unnecessary risk. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{{{""action"": ""hold/adjust/scale/close"", ""price_target"": number, ""stop_loss"": number, ""reasoning"": ""text"", ""context"": ""Update with any new observations or insights you've learned throughout the trading session.""}}}}
 
+; Path to the prompt file for managing runner contracts (after scaling out)
+runner_prompt = runner_prompt.txt
+
 long_position_prompt = You are an expert ES futures trader. I am currently in a long position. Analyze this Bookmap screenshot for a long position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{{{""action"": ""hold/scale/close"", ""price_target"": number, ""stop_loss"": number, ""reasoning"": ""text""}}}}
 short_position_prompt = You are an expert ES futures trader and can make millions by analyzing a chart. Analyze this Bookmap screenshot for a short position in {symbol} futures and advise: hold, scale, or close. Provide a price target and stop loss. Explain your reasoning based on order book, heat map, and volume. Respond in JSON: {{{{""action"": ""hold/scale/close"", ""price_target"": number, ""stop_loss"": number, ""reasoning"": ""text""}}}}
 model = gpt-4o
@@ -106,6 +109,8 @@ trade_search_endpoint = /api/Trade/search
 account_id = YOUR_ACCOUNT_ID
 contract_id = CON.F.US.EP.Z25
 quantity = 2
+; Number of contracts to keep as "runners" after scaling out (0 = no runners, scale closes entire position)
+runners_quantity = 1
 contract_to_search = E-Mini S&P 500
 ; Maximum risk per contract in points/ticks (leave empty to use LLM suggestions)
 max_risk_per_contract = 8

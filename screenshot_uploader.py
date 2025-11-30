@@ -171,7 +171,7 @@ def clear_active_trade_info():
         logging.error(f"Error clearing active trade info: {e}")
 
 def log_llm_interaction(request_prompt, response_text, action=None, entry_price=None, 
-                        price_target=None, stop_loss=None, confidence=None, reasoning=None, context=None):
+                        price_target=None, stop_loss=None, confidence=None, reasoning=None, context=None, waiting_for=None):
     """Log LLM request and response to daily CSV file.
     
     Args:
@@ -184,6 +184,7 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
         confidence: Parsed confidence level
         reasoning: Parsed reasoning
         context: Market context used in the request
+        waiting_for: Condition the LLM is waiting for before taking action
     """
     global LATEST_LLM_DATA
     
@@ -206,7 +207,8 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
             'stop_loss': stop_loss or '',
             'confidence': confidence or '',
             'reasoning': reasoning[:500] if reasoning else '',
-            'context': context[:500] if context else ''
+            'context': context[:500] if context else '',
+            'waiting_for': waiting_for[:500] if waiting_for else ''
         }
         
         # Check if file exists to determine if we need to write header
@@ -219,7 +221,7 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
             if not file_exists:
                 writer.writerow([
                     'date_time', 'request', 'response', 'action', 'entry_price', 
-                    'price_target', 'stop_loss', 'confidence', 'reasoning', 'context'
+                    'price_target', 'stop_loss', 'confidence', 'reasoning', 'context', 'waiting_for'
                 ])
             
             # Write the log entry
@@ -233,7 +235,8 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
                 LATEST_LLM_DATA['stop_loss'],
                 LATEST_LLM_DATA['confidence'],
                 LATEST_LLM_DATA['reasoning'],
-                LATEST_LLM_DATA['context']
+                LATEST_LLM_DATA['context'],
+                LATEST_LLM_DATA['waiting_for']
             ])
         
         logging.info(f"LLM interaction logged to {csv_file}")
@@ -253,7 +256,8 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
                     'stop_loss': float(stop_loss) if stop_loss else None,
                     'confidence': int(confidence) if confidence else None,
                     'reasoning': reasoning if reasoning else '',  # Full reasoning, not truncated
-                    'context': context if context else ''  # Full context, not truncated
+                    'context': context if context else '',  # Full context, not truncated
+                    'waiting_for': waiting_for if waiting_for else None
                 }
                 SUPABASE_CLIENT.table('llm_interactions').insert(supabase_data).execute()
                 logging.debug("LLM interaction logged to Supabase (full message, not truncated)")
@@ -1437,7 +1441,7 @@ def show_dashboard(root=None):
         
         dashboard.title("ES Trader Dashboard")
         if is_initial_build:
-            dashboard.geometry("500x640")
+            dashboard.geometry("500x680")
         dashboard.configure(bg='#1e1e1e')
         
         # Get current data - verify position from API if trading is enabled
@@ -1670,6 +1674,9 @@ def show_dashboard(root=None):
         reasoning_title = tk.Label(llm_frame, text="Reasoning:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
         reasoning_text = tk.Text(llm_frame, height=6, wrap=tk.WORD, font=("Arial", 10),
                                 bg='#2d2d2d', fg='#ffffff', relief=tk.FLAT)
+        waiting_for_title = tk.Label(llm_frame, text="Waiting For:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
+        waiting_for_text = tk.Text(llm_frame, height=2, wrap=tk.WORD, font=("Arial", 10),
+                                   bg='#2d2d2d', fg='#ffaa00', relief=tk.FLAT)
         context_title = tk.Label(llm_frame, text="Market Context:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
         context_text = tk.Text(llm_frame, height=4, wrap=tk.WORD, font=("Arial", 10),
                               bg='#1e1e1e', fg='#aaaaaa', relief=tk.FLAT)
@@ -1684,6 +1691,8 @@ def show_dashboard(root=None):
         DASHBOARD_WIDGETS['confidence_label'] = confidence_label
         DASHBOARD_WIDGETS['reasoning_title'] = reasoning_title
         DASHBOARD_WIDGETS['reasoning_text'] = reasoning_text
+        DASHBOARD_WIDGETS['waiting_for_title'] = waiting_for_title
+        DASHBOARD_WIDGETS['waiting_for_text'] = waiting_for_text
         DASHBOARD_WIDGETS['context_title'] = context_title
         DASHBOARD_WIDGETS['context_text'] = context_text
         DASHBOARD_WIDGETS['no_llm_label'] = no_llm_label
@@ -1747,6 +1756,14 @@ def show_dashboard(root=None):
             reasoning_text.insert(1.0, llm_data.get('reasoning', 'N/A'))
             reasoning_text.config(state=tk.DISABLED)
             reasoning_text.pack(fill="x", pady=5)
+            
+            # Waiting For section (if available)
+            waiting_for_value = llm_data.get('waiting_for', '')
+            if waiting_for_value and waiting_for_value.strip():
+                waiting_for_title.pack(anchor="w", pady=(10, 5))
+                waiting_for_text.insert(1.0, waiting_for_value)
+                waiting_for_text.config(state=tk.DISABLED)
+                waiting_for_text.pack(fill="x", pady=5)
             
             # Market Context temporarily hidden
             # context_title.pack(anchor="w", pady=(10, 5))
@@ -1867,7 +1884,7 @@ def update_countdown():
     else:
         logging.debug("Dashboard window or countdown widget not available")
 
-def job(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
+def job(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, runner_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
     """The main job to run periodically."""
     global PREVIOUS_POSITION_TYPE
     
@@ -2183,7 +2200,20 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             
             # Format prompt with position details
             # Use the pre-loaded global variable (which has the file content, not the path)
-            position_prompt_template = long_position_prompt if current_position_type == 'long' else short_position_prompt
+            
+            # Check if we're managing runners (position size equals runners_quantity)
+            runners_qty = topstep_config.get('runners_quantity', 0)
+            current_position_size = position_details.get('size', 0) if position_details else 0
+            is_managing_runners = (runners_qty > 0 and current_position_size == runners_qty)
+            
+            if is_managing_runners:
+                # Use runner prompt for managing runner contracts
+                position_prompt_template = runner_prompt
+                logging.info(f"Managing RUNNERS position ({current_position_size} contract(s))")
+            else:
+                # Use regular position prompt (long/short)
+                position_prompt_template = long_position_prompt if current_position_type == 'long' else short_position_prompt
+                logging.info(f"Managing position ({current_position_size} contract(s))")
             
             # Parse working orders to get current stop loss and take profit
             contract_id = topstep_config.get('contract_id', '')
@@ -2332,7 +2362,19 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
         # Select and format prompt based on current_position_type (using safe formatting)
         llm_observations = get_llm_observations()
         if current_position_type == 'none':
-            prompt = safe_format_prompt(no_position_prompt, symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
+            # Format waiting_for text for prompt
+            if LAST_WAITING_FOR:
+                waiting_for_text = f"Previously waiting for: {LAST_WAITING_FOR}"
+            else:
+                waiting_for_text = "No previous conditions being tracked"
+            
+            prompt = safe_format_prompt(
+                no_position_prompt, 
+                symbol=DISPLAY_SYMBOL, 
+                Context=daily_context_with_bars, 
+                LLM_Context=llm_observations,
+                waiting_for=waiting_for_text
+            )
         elif current_position_type == 'long':
             prompt = safe_format_prompt(long_position_prompt, symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
         elif current_position_type == 'short':
@@ -2361,7 +2403,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 reasoning = advice.get('reasoning')
                 confidence = advice.get('confidence')
                 new_context = advice.get('context', '')
-                logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}")
+                waiting_for = advice.get('waiting_for')
+                logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}, WaitingFor={waiting_for}")
 
                 # Log LLM interaction to CSV
                 llm_response_time = datetime.datetime.now()
@@ -2374,9 +2417,15 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                     stop_loss=stop_loss,
                     confidence=confidence,
                     reasoning=reasoning,
-                    context=daily_context
+                    context=daily_context,
+                    waiting_for=waiting_for
                 )
                 logging.info(f"LLM response logged and cached at {llm_response_time.strftime('%H:%M:%S')}")
+                
+                # Store waiting_for condition for next iteration (make it global)
+                global LAST_WAITING_FOR
+                LAST_WAITING_FOR = waiting_for if waiting_for else None
+                logging.info(f"Updated LAST_WAITING_FOR to: {LAST_WAITING_FOR}")
                 
                 # Update dashboard with latest LLM response
                 update_dashboard_data()
@@ -2390,6 +2439,11 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 if action in ['buy', 'sell', 'scale', 'close', 'flatten']:
                     logging.info(f"Executing trade: {action}")
                     order_id, trade_position_type = execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades, None, telegram_config, reasoning, confidence, daily_context)
+                    
+                    # Clear waiting_for when entering a new position (buy/sell)
+                    if action in ['buy', 'sell'] and order_id:
+                        LAST_WAITING_FOR = None
+                        logging.info("Cleared LAST_WAITING_FOR after entering new position")
                     
                     # For new entry trades (buy/sell), fetch actual stop/target from working orders
                     if action in ['buy', 'sell'] and order_id and enable_trading:
@@ -3054,14 +3108,40 @@ def execute_topstep_trade(action, entry_price, price_target, stop_loss, topstep_
     
     # Get order size
     if action == 'scale':
+        # For scaling, calculate how many to close: quantity - runners_quantity
+        runners_qty = int(topstep_config.get('runners_quantity', 0))
+        total_qty = int(topstep_config.get('quantity', 1))
+        
+        # Validate runner configuration
+        if runners_qty >= total_qty:
+            logging.warning(f"Invalid runners config: runners_quantity ({runners_qty}) >= quantity ({total_qty}). Treating as no runners (closing all).")
+            runners_qty = 0
+        
         # For scaling, use actual position size if available, otherwise fall back to config
         if position_details and position_details.get('size'):
             actual_size = int(position_details.get('size'))
-            size = max(1, actual_size // 2)  # Scale out half, but at least 1 contract
-            logging.info(f"Scaling: Closing {size} of {actual_size} contracts (half of position)")
+            if runners_qty == 0:
+                # No runners mode - scale closes entire position
+                size = actual_size
+                logging.info(f"Scaling (no runners): Closing all {size} contracts")
+            else:
+                # Calculate close quantity: quantity - runners_quantity
+                size = actual_size - runners_qty
+                if size <= 0:
+                    logging.error(f"Scale calculation error: actual_size ({actual_size}) - runners_qty ({runners_qty}) = {size} (must be > 0)")
+                    return (None, None)
+                logging.info(f"Scaling: Closing {size} of {actual_size} contracts (leaving {runners_qty} runners)")
         else:
-            size = max(1, int(topstep_config['quantity']) // 2)
-            logging.warning(f"Scaling: No position details available, using config quantity // 2 = {size}")
+            if runners_qty == 0:
+                # No runners mode - use config quantity
+                size = total_qty
+                logging.warning(f"Scaling (no runners): No position details, using config quantity = {size}")
+            else:
+                size = total_qty - runners_qty
+                if size <= 0:
+                    logging.error(f"Scale calculation error: total_qty ({total_qty}) - runners_qty ({runners_qty}) = {size} (must be > 0)")
+                    return (None, None)
+                logging.warning(f"Scaling: No position details available, using config quantity - runners = {size}")
     else:
         size = int(topstep_config['quantity'])
     
@@ -4646,6 +4726,7 @@ ACCOUNT_BALANCE = None
 LATEST_LLM_DATA = None  # Store the most recent LLM response for immediate dashboard updates
 DASHBOARD_WIDGETS = {}  # Store references to dashboard widgets for updates without rebuild
 LAST_JOB_TIME = None  # Track when last screenshot/job was taken for countdown
+LAST_WAITING_FOR = None  # Store the most recent "waiting_for" condition from LLM response
 
 # Global Supabase client
 SUPABASE_CLIENT = None
@@ -4787,6 +4868,10 @@ if short_prompt_config:
 else:
     SHORT_POSITION_PROMPT = load_prompt_from_config(position_prompt_config, position_prompt_config)
 
+# Load runner prompt for managing runner contracts after scaling out
+runner_prompt_config = config.get('LLM', 'runner_prompt', fallback='runner_prompt.txt')
+RUNNER_PROMPT = load_prompt_from_config(runner_prompt_config, runner_prompt_config)
+
 MODEL = config.get('LLM', 'model', fallback='gpt-4o')
 
 logging.info(f"Loaded LLM config: SYMBOL={SYMBOL}, DISPLAY_SYMBOL={DISPLAY_SYMBOL}, POSITION_TYPE={POSITION_TYPE}, MODEL={MODEL}")
@@ -4811,6 +4896,7 @@ TOPSTEP_CONFIG = {
     'account_id': config.get('Topstep', 'account_id', fallback=''),
     'contract_id': config.get('Topstep', 'contract_id', fallback=''),
     'quantity': config.get('Topstep', 'quantity', fallback='1'),
+    'runners_quantity': config.getint('Topstep', 'runners_quantity', fallback=0),
     'contract_to_search': config.get('Topstep', 'contract_to_search', fallback='ES'),
     'max_risk_per_contract': config.get('Topstep', 'max_risk_per_contract', fallback=''),
     'max_profit_per_contract': config.get('Topstep', 'max_profit_per_contract', fallback=''),
@@ -5377,6 +5463,7 @@ def run_scheduler():
                     no_position_prompt=NO_POSITION_PROMPT,
                     long_position_prompt=LONG_POSITION_PROMPT,
                     short_position_prompt=SHORT_POSITION_PROMPT,
+                    runner_prompt=RUNNER_PROMPT,
                     model=MODEL,
                     topstep_config=TOPSTEP_CONFIG,
                     enable_llm=ENABLE_LLM,
@@ -5764,7 +5851,7 @@ def reload_config():
     global WINDOW_TITLE, WINDOW_PROCESS_NAME, TOP_OFFSET, BOTTOM_OFFSET, LEFT_OFFSET, RIGHT_OFFSET, SAVE_FOLDER
     global ENABLE_LLM, ENABLE_TRADING, EXECUTE_TRADES, ENABLE_SAVE_SCREENSHOTS
     global SYMBOL, DISPLAY_SYMBOL, POSITION_TYPE, NO_POSITION_PROMPT
-    global LONG_POSITION_PROMPT, SHORT_POSITION_PROMPT, MODEL
+    global LONG_POSITION_PROMPT, SHORT_POSITION_PROMPT, RUNNER_PROMPT, MODEL
     global TOPSTEP_CONFIG, OPENAI_API_KEY, OPENAI_API_URL, TELEGRAM_CONFIG
     
     try:
@@ -5820,6 +5907,10 @@ def reload_config():
         else:
             SHORT_POSITION_PROMPT = load_prompt_from_config(position_prompt_config, position_prompt_config)
         
+        # Load runner prompt for managing runner contracts after scaling out
+        runner_prompt_config = config.get('LLM', 'runner_prompt', fallback='runner_prompt.txt')
+        RUNNER_PROMPT = load_prompt_from_config(runner_prompt_config, runner_prompt_config)
+        
         MODEL = config.get('LLM', 'model', fallback='gpt-4o')
         
         # Reload Topstep settings
@@ -5830,6 +5921,7 @@ def reload_config():
             'account_id': config.get('Topstep', 'account_id', fallback=''),
             'contract_id': config.get('Topstep', 'contract_id', fallback=''),
             'quantity': config.get('Topstep', 'quantity', fallback='1'),
+            'runners_quantity': config.getint('Topstep', 'runners_quantity', fallback=0),
             'contract_to_search': config.get('Topstep', 'contract_to_search', fallback='ES'),
             'trade_search_endpoint': config.get('Topstep', 'trade_search_endpoint', fallback='/api/Trade/search'),
             'max_risk_per_contract': config.get('Topstep', 'max_risk_per_contract', fallback=''),
@@ -5981,6 +6073,7 @@ def manual_job():
         no_position_prompt=NO_POSITION_PROMPT,
         long_position_prompt=LONG_POSITION_PROMPT,
         short_position_prompt=SHORT_POSITION_PROMPT,
+        runner_prompt=RUNNER_PROMPT,
         model=MODEL,
         topstep_config=TOPSTEP_CONFIG,
         enable_llm=ENABLE_LLM,

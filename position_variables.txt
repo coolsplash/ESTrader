@@ -17,6 +17,13 @@ COMMON VARIABLES (Used in both prompts)
         - Volume profile data and liquidity zones
     Example: "Market Data:\n  Current Price: 6000.00\n  PDH: 6015.25\n  PDL: 5985.50..."
 
+{waiting_for}
+    Description: Previous condition the LLM was waiting for before taking action
+    Format: String - either "No previous conditions being tracked" or "Previously waiting for: [condition]"
+    Used in: no_position_prompt.txt only
+    Example: "Previously waiting for: Break above 6675 with aggressive buying and follow-through"
+    Notes: Provides continuity between LLM analyses, cleared when position is entered
+
 {Symbol}
     Description: The trading symbol/contract identifier
     Format: String (e.g., "CON.F.US.EP.Z25")

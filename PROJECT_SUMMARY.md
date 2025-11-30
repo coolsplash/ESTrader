@@ -43,9 +43,9 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
    - Integrates with main bot to stop trading before early closes
    - Configurable buffer times (minutes before close, minutes after open)
 
-4. **config.ini** (189 lines)
+4. **config.ini** (193 lines)
    - Centralized configuration for all system components
-   - **Points to external prompt files** (no_position_prompt.txt, position_prompt.txt)
+   - **Points to external prompt files** (no_position_prompt.txt, position_prompt.txt, runner_prompt.txt)
    - TopstepX API credentials and settings
    - Trading parameters (risk limits, contract size, etc.)
    - Market data settings (tickers, intervals, analysis parameters)
@@ -54,11 +54,13 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
    - **Interval scheduling**: Time-based screenshot intervals (e.g., 30s during RTH, 5min pre-market)
    - **Supabase configuration**: Database connection and logging settings
    - **TopstepX bars configuration**: Bar data fetching and caching settings
+   - **Runner strategy configuration**: runners_quantity and runner_prompt settings
    - Hot-reloadable without restarting the application
 
 5. **Prompt Files** (External prompt management)
    - **no_position_prompt.txt** - LLM prompt for identifying new trade entries (sweep/reclaim/retest setups)
    - **position_prompt.txt** - LLM prompt for managing existing positions (risk management, scaling, exits)
+   - **runner_prompt.txt** - LLM prompt for managing runner contracts after scaling out (specialized for letting winners run)
    - **position_variables.txt** - Documentation of all placeholder variables used in prompts:
      - Common: {Context}, {Symbol}, {display_symbol}
      - Position-specific: {position_type}, {size}, {average_price}, {current_stop_loss}, {current_take_profit}, {unrealized_pnl}, {Reason}
@@ -75,9 +77,10 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 ### 1. AI-Powered Trading Decisions
 - Uses GPT-4o vision model to analyze Bookmap screenshots
 - Analyzes: liquidity zones, order book imbalance, volume delta, momentum shifts, market structure
-- Two prompt modes:
+- Three prompt modes:
   - **No Position Mode**: Looks for high-probability entry opportunities (buy/sell/hold)
   - **Position Management Mode**: Manages open positions (hold/adjust/scale/close)
+  - **Runner Management Mode**: Specialized management for remaining contracts after scaling
 - Returns structured JSON with action, prices, confidence, and reasoning
 
 ### 2. Market Context Integration
@@ -202,6 +205,7 @@ ESTrader is an automated trading system for E-mini S&P 500 (ES) futures that use
 - Account credentials and endpoints
 - Contract details (ES December 2025: CON.F.US.EP.Z25)
 - Position sizing (current: 3 contracts)
+- Runner strategy (current: 1 runner contract)
 - Risk parameters (8 points max risk, 30 points max profit)
 - Tick size (0.25 for ES)
 - Stop loss and take profit orders (currently disabled by default)
@@ -302,9 +306,10 @@ ESTrader/
 ├── screenshot_uploader.py       # Main trading bot (5939 lines)
 ├── market_data.py               # Market data fetcher (433 lines)
 ├── market_holidays.py           # Holiday data fetcher (~500 lines)
-├── config.ini                   # All configuration (189 lines)
+├── config.ini                   # All configuration (193 lines)
 ├── no_position_prompt.txt       # LLM prompt for new entries
 ├── position_prompt.txt          # LLM prompt for position management
+├── runner_prompt.txt            # LLM prompt for managing runners after scaling
 ├── position_variables.txt       # Documentation of prompt variables
 ├── backfill_supabase.py         # Import historical CSV data to Supabase
 ├── requirements.txt             # Python dependencies
@@ -443,8 +448,9 @@ All stored in `config.ini` (already configured).
 ## Current Status
 
 Based on recent changes:
-- Core files: screenshot_uploader.py (5939 lines), market_data.py (433 lines), market_holidays.py (~500 lines), config.ini (189 lines)
-- **Prompt management**: External .txt files (no_position_prompt.txt, position_prompt.txt, position_variables.txt)
+- Core files: screenshot_uploader.py (5939 lines), market_data.py (433 lines), market_holidays.py (~500 lines), config.ini (193 lines)
+- **Prompt management**: External .txt files (no_position_prompt.txt, position_prompt.txt, runner_prompt.txt, position_variables.txt)
+- **Runner strategy**: Configurable runners_quantity with specialized runner_prompt for post-scale management
 - **Market holidays**: EdgeClear integration with Trading Halt/Reopen support
 - Market data integration: Fully operational with gap detection and 5m intraday data
 - Context storage: Dual storage (`context/YYMMDD.txt` base + `context/YYMMDD_LLM.txt` updated)
@@ -469,7 +475,22 @@ Based on recent changes:
 
 ## Recent Enhancements (November 2025)
 
-### Market Holiday Integration (Latest)
+### Runner Strategy Implementation (Latest)
+- **Configurable runners**: `runners_quantity` setting in config.ini (default: 1)
+- **Specialized prompt**: `runner_prompt.txt` for managing runner contracts
+- **Smart scaling logic**: When LLM chooses to scale, system closes `quantity - runners_quantity` contracts
+- **Automatic prompt switching**: System detects when position size equals runners_quantity and switches to runner_prompt
+- **Flexible configuration**: 
+  - Set `runners_quantity > 0` to keep runners after scaling
+  - Set `runners_quantity = 0` for traditional "scale closes entire position" behavior
+- **Enhanced logging**: Clear indication when managing runners vs full position
+- **Hot-reload support**: Runner configuration reloads with config.ini
+- **Example workflow**:
+  1. Enter with 3 contracts (uses position_prompt)
+  2. LLM decides to scale → closes 2 contracts (3 - 1)
+  3. Remaining 1 contract (uses runner_prompt for specialized management)
+
+### Market Holiday Integration
 - **EdgeClear data source**: Fetches Equities futures holiday schedules
 - **Efficient extraction**: BeautifulSoup pre-processes HTML to extract only Equities row
 - **LLM parsing**: GPT-4o processes holiday data with CT to ET conversion
@@ -565,6 +586,7 @@ Based on recent changes:
 15. Supabase integration enables real-time analytics, win rate tracking, and performance views
 16. SignalR testing infrastructure in place for potential real-time event migration
 17. Current model is gpt-5.1-chat-latest with updated prompts focused on sweep/reclaim setups
-18. **LLM prompts now managed in external .txt files** for easier editing and version control (no_position_prompt.txt, position_prompt.txt, position_variables.txt)
+18. **LLM prompts now managed in external .txt files** for easier editing and version control (no_position_prompt.txt, position_prompt.txt, runner_prompt.txt, position_variables.txt)
 19. **Holiday data cached weekly** - automatic refresh when current week data is missing
+20. **Runner strategy implemented** - keep specified number of contracts as "runners" after scaling with specialized management prompt
 

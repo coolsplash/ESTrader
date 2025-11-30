@@ -7,9 +7,10 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - **screenshot_uploader.py** (5939 lines) - Main trading bot with system tray, scheduler, API integration, Supabase logging, holiday checking
 - **market_data.py** (433 lines) - Fetches Yahoo Finance data, calculates VWAP/volume profile
 - **market_holidays.py** (~500 lines) - Fetches EdgeClear holiday schedules, parses with LLM, manages Trading Halt/Reopen
-- **config.ini** (189 lines) - All settings, credentials, interval scheduling, prompt file pointers, holiday configuration
+- **config.ini** (193 lines) - All settings, credentials, interval scheduling, prompt file pointers, holiday configuration, runner strategy
 - **no_position_prompt.txt** - LLM prompt for identifying new trade entries
 - **position_prompt.txt** - LLM prompt for managing existing positions
+- **runner_prompt.txt** - LLM prompt for managing runner contracts after scaling out
 - **position_variables.txt** - Documentation of all prompt placeholder variables
 - **start_trading.ps1** - Launcher script
 - **backfill_supabase.py** - Import historical CSV data to Supabase database
@@ -23,6 +24,7 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 6. Send screenshot + market context + bar data to GPT-4o with appropriate prompt:
    - **No position**: Look for sweep/reclaim/retest setups (buy/sell/hold)
    - **Has position**: Manage it (hold/adjust/scale/close)
+   - **Managing runners**: After scaling out, uses specialized runner_prompt when position equals runners_quantity
 7. Parse JSON response and execute trades
 8. Log everything to daily logs, monthly CSV trade journal, **and Supabase database**
 9. Send Telegram notifications
@@ -40,12 +42,14 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - **Account**: TopstepX #14789500
 - **Contract**: ES Dec 2025 (CON.F.US.EP.Z25)
 - **Size**: 3 contracts
+- **Runners**: 1 contract (kept after scaling out)
 - **Max Risk**: 8 points per contract
 - **Max Target**: 30 points per contract
 - **Stop Loss Orders**: Disabled (LLM-managed)
 - **Take Profit Orders**: Disabled (LLM-managed)
 - **LLM Model**: gpt-5.1-chat-latest
 - **Strategy**: Sweep → Reclaim → Retest → Reversal setups, trend continuation, aim for 20-30+ points
+- **Runner Strategy**: Scale out to runners_quantity, then use runner_prompt for specialized management
 
 ## Key Configuration Flags
 - `enable_llm` - Use AI analysis (true/false)
@@ -62,6 +66,7 @@ Automated ES futures trading system using GPT-4o vision to analyze Bookmap scree
 - `enable_bar_data` - Fetch TopstepX bar data for context (true/false)
 - `minutes_before_close` - Stop trading X min before early close (default: 30)
 - `minutes_after_open` - Wait X min after open before trading (default: 5)
+- `runners_quantity` - Number of contracts to keep as "runners" after scaling (0 = no runners)
 
 ## Data Storage
 - `logs/YYYYMMDD.txt` - Daily execution logs
@@ -128,7 +133,13 @@ Right-click the tray icon for quick access to:
 - Virtual environment: `venv/`
 
 ## Recent Changes
-- **Market holiday integration** (Latest): EdgeClear data source with Trading Halt/Reopen support
+- **Runner strategy implementation** (Latest): Specialized management for remaining contracts after scaling
+  - **runners_quantity config**: Number of contracts to keep after scaling out (default: 1)
+  - **runner_prompt.txt**: Dedicated LLM prompt for managing runner contracts
+  - **Smart scaling**: Closes `quantity - runners_quantity` contracts when scaling
+  - **Automatic switching**: System uses runner_prompt when position size equals runners_quantity
+  - **Flexible configuration**: Set runners_quantity=0 for traditional "scale closes all" behavior
+- **Market holiday integration**: EdgeClear data source with Trading Halt/Reopen support
   - **Efficient extraction**: BeautifulSoup pre-processes HTML to extract only Equities row
   - **Trading logic**: Skips full holidays, stops before early closes, resumes after reopen
   - **Example - Thanksgiving**: Before 12:30 = trade, 12:30-17:59 = skip (halt), 18:00+ = trade (reopen)
@@ -153,8 +164,9 @@ Right-click the tray icon for quick access to:
 ## Important Notes
 - System runs as Windows system tray application
 - All credentials are in config.ini (already configured)
-- **LLM prompts stored in external .txt files** for easy editing (no_position_prompt.txt, position_prompt.txt)
+- **LLM prompts stored in external .txt files** for easy editing (no_position_prompt.txt, position_prompt.txt, runner_prompt.txt)
 - Prompt variables documented in position_variables.txt
+- **Runner strategy**: After scaling, system automatically switches to runner_prompt when position equals runners_quantity
 - **Safe formatting**: Special characters (braces, quotes) in market data are automatically escaped
 - **Market holidays checked automatically**: Skips full holidays, stops before early closes, resumes after reopen
 - Position management happens every 20 seconds when in a trade

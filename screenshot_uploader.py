@@ -205,6 +205,107 @@ def format_key_levels_for_prompt(key_levels):
         logging.error(f"Error formatting key levels: {e}")
         return "No key levels currently tracked"
 
+def get_session_start_time():
+    """Determine the 18:00 reference time for current trading session.
+    
+    ES futures sessions run 18:00 to 18:00 ET.
+    - If current time < midnight: session started today at 18:00
+    - If current time >= midnight: session started yesterday at 18:00
+    
+    Returns:
+        datetime: Session start time (18:00 ET)
+    """
+    now = datetime.datetime.now()
+    
+    # If we're before midnight (00:00), session started today at 18:00
+    if now.hour >= 18:
+        session_start = now.replace(hour=18, minute=0, second=0, microsecond=0)
+    else:
+        # After midnight but before 18:00 - session started yesterday at 18:00
+        yesterday = now - datetime.timedelta(days=1)
+        session_start = yesterday.replace(hour=18, minute=0, second=0, microsecond=0)
+    
+    return session_start
+
+def get_session_start_balance(account_id):
+    """Query Supabase for session start balance (first snapshot >= 18:00).
+    
+    Args:
+        account_id: Account ID to query
+    
+    Returns:
+        float: Session start balance, or None if not found
+    """
+    if not SUPABASE_CLIENT:
+        logging.debug("Supabase not available - cannot query session start balance")
+        return None
+    
+    try:
+        session_start = get_session_start_time()
+        logging.info(f"Querying session start balance for session beginning at {session_start}")
+        
+        # Query for first balance snapshot >= session start time
+        response = SUPABASE_CLIENT.table('account_snapshots')\
+            .select('balance')\
+            .eq('account_id', str(account_id))\
+            .gte('timestamp', session_start.isoformat())\
+            .order('timestamp')\
+            .limit(1)\
+            .execute()
+        
+        if response.data and len(response.data) > 0:
+            balance = float(response.data[0]['balance'])
+            logging.info(f"Found session start balance: ${balance:,.2f}")
+            return balance
+        else:
+            logging.info("No session start balance found in database")
+            return None
+            
+    except Exception as e:
+        logging.error(f"Error querying session start balance: {e}")
+        return None
+
+def save_balance_snapshot(account_id, balance, rpl=None):
+    """Save account balance snapshot to Supabase.
+    
+    Args:
+        account_id: Account ID
+        balance: Current account balance
+        rpl: Optional realized P&L for the session
+    """
+    if not SUPABASE_CLIENT:
+        logging.debug("Supabase not available - skipping balance snapshot")
+        return
+    
+    try:
+        snapshot_data = {
+            'account_id': str(account_id),
+            'timestamp': datetime.datetime.now().isoformat(),
+            'balance': float(balance),
+            'daily_pnl': float(rpl) if rpl is not None else None
+        }
+        
+        SUPABASE_CLIENT.table('account_snapshots').insert(snapshot_data).execute()
+        logging.debug(f"Saved balance snapshot: ${balance:,.2f}, RPL: ${rpl:,.2f if rpl else 0:.2f}")
+        
+    except Exception as e:
+        logging.error(f"Error saving balance snapshot (non-critical): {e}")
+
+def calculate_session_rpl(current_balance, session_start_balance):
+    """Calculate session realized profit/loss.
+    
+    Args:
+        current_balance: Current account balance
+        session_start_balance: Balance at session start (18:00)
+    
+    Returns:
+        float: RPL (current - start)
+    """
+    if current_balance is None or session_start_balance is None:
+        return 0.0
+    
+    return float(current_balance) - float(session_start_balance)
+
 def get_active_trade_info():
     """Get the current active trade info from file.
     
@@ -692,6 +793,227 @@ def save_daily_context(new_context, old_context):
         logging.error(f"Error saving LLM context: {e}")
         logging.exception("Full traceback:")
 
+def reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token):
+    """Check Supabase for ENTRY events without matching CLOSE events and reconcile them.
+    
+    This function queries Supabase for open trades (ENTRY without CLOSE) and checks if they
+    are still open in the API. If not, fetches trade history to log the closure.
+    """
+    if not SUPABASE_CLIENT or not enable_trading or not auth_token:
+        return
+    
+    try:
+        account_id = topstep_config.get('account_id', '')
+        if not account_id:
+            return
+        
+        # Query Supabase for ENTRY events without matching CLOSE events
+        # Get the most recent ENTRY event that doesn't have a CLOSE with the same order_id
+        response = SUPABASE_CLIENT.table('trades').select('*').eq('account_id', account_id).eq('event_type', 'ENTRY').order('timestamp', desc=True).limit(1).execute()
+        
+        if not response.data:
+            logging.debug("No ENTRY events found in Supabase")
+            return
+        
+        most_recent_entry = response.data[0]
+        order_id = most_recent_entry.get('order_id')
+        entry_timestamp = most_recent_entry.get('timestamp')
+        
+        # Check if there's a matching CLOSE event
+        close_response = SUPABASE_CLIENT.table('trades').select('*').eq('order_id', order_id).eq('event_type', 'CLOSE').execute()
+        
+        if close_response.data and len(close_response.data) > 0:
+            logging.debug(f"Order {order_id} already has CLOSE event - no reconciliation needed")
+            return
+        
+        # No CLOSE event found - check if position still exists in API
+        current_position_type = get_current_position(SYMBOL, topstep_config, enable_trading, auth_token)
+        
+        tracked_position = most_recent_entry.get('position_type')
+        if tracked_position in ['long', 'short'] and current_position_type == 'none':
+            logging.info(f"🔄 SUPABASE RECONCILIATION: Found unclosed {tracked_position} trade (order {order_id}) - fetching trade history")
+            
+            # Fetch trade history from entry time to now
+            start_time = entry_timestamp if entry_timestamp else datetime.datetime.now().replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_time = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            
+            trades = fetch_trade_results(account_id, topstep_config, enable_trading, auth_token, start_time, end_time)
+            
+            if trades and len(trades) > 0:
+                # Find the closing trade
+                entry_price = most_recent_entry.get('entry_price') or most_recent_entry.get('price')
+                exit_trade = None
+                
+                for trade in reversed(trades):
+                    trade_side = trade.get('side', 0)
+                    if tracked_position == 'long' and trade_side == 1:
+                        exit_trade = trade
+                        break
+                    elif tracked_position == 'short' and trade_side == 0:
+                        exit_trade = trade
+                        break
+                
+                if exit_trade:
+                    exit_price = exit_trade.get('price')
+                    exit_quantity = exit_trade.get('quantity', 1)
+                    
+                    # Calculate P&L
+                    if tracked_position == 'long':
+                        pnl_points = (exit_price - entry_price) if exit_price and entry_price else 0
+                    else:
+                        pnl_points = (entry_price - exit_price) if exit_price and entry_price else 0
+                    
+                    pnl_dollars = pnl_points * 50 * exit_quantity
+                    
+                    balance = get_account_balance(account_id, topstep_config, enable_trading, auth_token)
+                    
+                    logging.info(f"🔄 SUPABASE RECONCILED: {tracked_position} @ {exit_price}, P&L: ${pnl_dollars:+,.2f}")
+                    
+                    # Log CLOSE event
+                    log_trade_event(
+                        event_type='CLOSE',
+                        symbol=SYMBOL,
+                        position_type=tracked_position,
+                        size=exit_quantity,
+                        price=exit_price,
+                        stop_loss=None,
+                        take_profit=None,
+                        reasoning="Position closed (detected via Supabase reconciliation - stop loss or take profit filled)",
+                        confidence=None,
+                        profit_loss=pnl_dollars,
+                        profit_loss_points=pnl_points,
+                        balance=balance,
+                        market_context=None,
+                        order_id=order_id,
+                        entry_price=entry_price
+                    )
+                    
+                    logging.info("✅ Supabase trade closure reconciled and logged")
+                    
+    except Exception as e:
+        logging.error(f"Error in Supabase reconciliation: {e}")
+        logging.exception("Full traceback:")
+
+def reconcile_closed_trades(topstep_config, enable_trading, auth_token):
+    """Reconcile trades that were closed via stop loss or take profit but not logged.
+    
+    Checks if we have an active trade in our tracking, verifies it still exists in API,
+    and if closed, fetches trade history to log the closure details.
+    
+    Also queries Supabase for any ENTRY events without matching CLOSE events and reconciles them.
+    """
+    if not enable_trading or not auth_token:
+        return
+    
+    # Get active trade from our local tracking
+    trade_info = get_active_trade_info()
+    if not trade_info:
+        logging.debug("No active trade in local tracking to reconcile")
+        return
+    
+    try:
+        # Check if position still exists in API
+        current_position_type = get_current_position(SYMBOL, topstep_config, enable_trading, auth_token)
+        
+        # If we think we have a position but API shows none, it was closed
+        tracked_position = trade_info.get('position_type', 'none')
+        if tracked_position in ['long', 'short'] and current_position_type == 'none':
+            logging.info("🔄 RECONCILIATION: Position closed but not logged - fetching trade history")
+            
+            # Fetch trade history to find the close
+            entry_timestamp = trade_info.get('entry_timestamp')
+            if entry_timestamp:
+                # Parse entry timestamp and fetch trades from then until now
+                start_time = entry_timestamp  # Already in ISO format
+                end_time = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                # Fallback: fetch today's trades
+                start_time = datetime.datetime.now().replace(hour=0, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+                end_time = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            
+            trades = fetch_trade_results(
+                topstep_config['account_id'],
+                topstep_config,
+                enable_trading,
+                auth_token,
+                start_time,
+                end_time
+            )
+            
+            if trades and len(trades) > 0:
+                logging.info(f"Found {len(trades)} trades in history")
+                
+                # Look for exit trades (opposite side from our entry)
+                order_id = trade_info.get('order_id')
+                entry_price = trade_info.get('entry_price')
+                
+                # Find the most recent closing trade (opposite side)
+                exit_trade = None
+                for trade in reversed(trades):  # Start from most recent
+                    # Check if this is an exit trade (opposite side)
+                    trade_side = trade.get('side', 0)  # 0=buy, 1=sell
+                    
+                    # If we were long (buy entry), look for sell exit
+                    # If we were short (sell entry), look for buy exit
+                    if tracked_position == 'long' and trade_side == 1:  # Sell closes long
+                        exit_trade = trade
+                        break
+                    elif tracked_position == 'short' and trade_side == 0:  # Buy closes short
+                        exit_trade = trade
+                        break
+                
+                if exit_trade:
+                    # Extract exit details
+                    exit_price = exit_trade.get('price')
+                    exit_quantity = exit_trade.get('quantity', 1)
+                    exit_time = exit_trade.get('timestamp', datetime.datetime.now().isoformat())
+                    
+                    # Calculate P&L
+                    if tracked_position == 'long':
+                        pnl_points = (exit_price - entry_price) if exit_price and entry_price else 0
+                    else:  # short
+                        pnl_points = (entry_price - exit_price) if exit_price and entry_price else 0
+                    
+                    pnl_dollars = pnl_points * 50 * exit_quantity  # ES: $50 per point
+                    
+                    # Get current balance
+                    balance = get_account_balance(topstep_config['account_id'], topstep_config, enable_trading, auth_token)
+                    
+                    logging.info(f"🔄 RECONCILED CLOSE: {tracked_position} @ {exit_price}, P&L: ${pnl_dollars:+,.2f} ({pnl_points:+.2f} pts)")
+                    
+                    # Log the CLOSE event (updates both CSV and Supabase)
+                    log_trade_event(
+                        event_type='CLOSE',
+                        symbol=SYMBOL,
+                        position_type=tracked_position,
+                        size=exit_quantity,
+                        price=exit_price,
+                        stop_loss=None,
+                        take_profit=None,
+                        reasoning="Position closed (detected via reconciliation - likely stop loss or take profit filled)",
+                        confidence=None,
+                        profit_loss=pnl_dollars,
+                        profit_loss_points=pnl_points,
+                        balance=balance,
+                        market_context=None,
+                        order_id=order_id,
+                        entry_price=entry_price
+                    )
+                    
+                    logging.info("✅ Trade closure reconciled and logged to CSV and Supabase")
+                else:
+                    logging.warning("Position closed but no exit trade found in history - clearing tracking")
+                    clear_active_trade_info()
+                    disable_trade_monitoring("Position closed but no exit found in API history")
+            else:
+                logging.warning("No trade history available for reconciliation - clearing tracking")
+                clear_active_trade_info()
+                disable_trade_monitoring("Position closed, no trade history")
+                
+    except Exception as e:
+        logging.error(f"Error reconciling trades: {e}")
+        logging.exception("Full traceback:")
+
 def send_telegram_message(message, telegram_config):
     """Send a message to Telegram chat."""
     try:
@@ -1029,6 +1351,122 @@ def is_in_no_new_trades_window(no_new_trades_windows_str):
         except Exception as e:
             logging.error(f"Error parsing no_new_trades_window '{window}': {e}")
             continue
+    
+    return (False, None)
+
+def get_next_active_interval(interval_schedule_str):
+    """Get the next active time from interval_schedule.
+    
+    Args:
+        interval_schedule_str: Comma-separated time ranges with intervals (e.g., "00:00-09:20=-1,09:32-15:45=45")
+        
+    Returns:
+        datetime.time or None: The next active time, or None if no active period found
+    """
+    if not interval_schedule_str or interval_schedule_str.strip() == '':
+        return None
+    
+    current_time = datetime.datetime.now().time()
+    
+    # Parse schedule
+    schedule_parts = [s.strip() for s in interval_schedule_str.split(',') if s.strip()]
+    
+    active_periods = []
+    for part in schedule_parts:
+        try:
+            if '=' not in part:
+                continue
+            
+            time_range, interval = part.split('=', 1)
+            interval_seconds = int(interval)
+            
+            # Skip disabled intervals
+            if interval_seconds < 0:
+                continue
+            
+            # Parse time range
+            if '-' not in time_range:
+                continue
+            
+            start_str, end_str = time_range.split('-', 1)
+            start_time = datetime.datetime.strptime(start_str.strip(), "%H:%M").time()
+            end_time = datetime.datetime.strptime(end_str.strip(), "%H:%M").time()
+            
+            active_periods.append((start_time, end_time))
+        except (ValueError, AttributeError) as e:
+            logging.debug(f"Error parsing interval schedule part '{part}': {e}")
+            continue
+    
+    if not active_periods:
+        return None
+    
+    # Find next active period
+    for start_time, end_time in sorted(active_periods):
+        # If current time is before this period starts, return the start time
+        if current_time < start_time:
+            return start_time
+        # If we're in this period, it's already active (shouldn't happen if called correctly)
+        elif start_time <= current_time <= end_time:
+            return None  # Already in active period
+    
+    # If we're past all periods today, return first period of tomorrow
+    if active_periods:
+        first_start = sorted(active_periods)[0][0]
+        # Return tomorrow's time (will be displayed as HH:MM)
+        return first_start
+    
+    return None
+
+def is_in_disabled_interval(interval_schedule_str):
+    """Check if current time is in a disabled interval (interval=-1).
+    
+    Args:
+        interval_schedule_str: Comma-separated time ranges with intervals
+        
+    Returns:
+        tuple: (is_disabled, next_active_time) - Whether in disabled interval and next active time
+    """
+    if not interval_schedule_str or interval_schedule_str.strip() == '':
+        return (False, None)
+    
+    current_time = datetime.datetime.now().time()
+    
+    # Parse schedule
+    schedule_parts = [s.strip() for s in interval_schedule_str.split(',') if s.strip()]
+    
+    in_disabled = False
+    for part in schedule_parts:
+        try:
+            if '=' not in part:
+                continue
+            
+            time_range, interval = part.split('=', 1)
+            interval_seconds = int(interval)
+            
+            # Parse time range
+            if '-' not in time_range:
+                continue
+            
+            start_str, end_str = time_range.split('-', 1)
+            start_time = datetime.datetime.strptime(start_str.strip(), "%H:%M").time()
+            end_time = datetime.datetime.strptime(end_str.strip(), "%H:%M").time()
+            
+            # Check if current time is in this range
+            if start_time <= current_time <= end_time:
+                if interval_seconds < 0:
+                    # We're in a disabled interval
+                    in_disabled = True
+                    break
+                else:
+                    # We're in an active interval
+                    return (False, None)
+        except (ValueError, AttributeError) as e:
+            logging.debug(f"Error parsing interval schedule part '{part}': {e}")
+            continue
+    
+    if in_disabled:
+        next_time = get_next_active_interval(interval_schedule_str)
+        return (True, next_time)
     
     return (False, None)
 
@@ -1600,6 +2038,21 @@ def show_dashboard(root=None):
             if 'balance_label' in DASHBOARD_WIDGETS:
                 DASHBOARD_WIDGETS['balance_label'].config(text=f"Balance: {balance}")
             
+            # Update session RPL (always update, even if 0 or None)
+            if SESSION_START_BALANCE is not None:
+                rpl_color = '#00ff00' if CURRENT_RPL >= 0 else '#ff4444'
+                rpl_text = f"${CURRENT_RPL:+,.2f}"
+                session_start_text = f"${SESSION_START_BALANCE:,.2f}"
+            else:
+                rpl_color = '#aaaaaa'
+                rpl_text = "$0.00"
+                session_start_text = "N/A"
+            
+            if 'session_rpl_label' in DASHBOARD_WIDGETS:
+                DASHBOARD_WIDGETS['session_rpl_label'].config(text=f"Session RPL: {rpl_text}", fg=rpl_color)
+            if 'session_start_label' in DASHBOARD_WIDGETS:
+                DASHBOARD_WIDGETS['session_start_label'].config(text=f"Session Start (18:00): {session_start_text}")
+            
             # Update position info
             if trade_info:
                 position_type = trade_info.get('position_type', 'None').upper()
@@ -1799,6 +2252,27 @@ def show_dashboard(root=None):
                                 font=("Arial", 14), bg='#2d2d2d', fg='#00ff00')
         balance_label.pack(anchor="w")
         DASHBOARD_WIDGETS['balance_label'] = balance_label
+        
+        # Session RPL Section (always displayed)
+        if SESSION_START_BALANCE is not None:
+            rpl_color = '#00ff00' if CURRENT_RPL >= 0 else '#ff4444'
+            rpl_text = f"${CURRENT_RPL:+,.2f}"
+            session_start_text = f"${SESSION_START_BALANCE:,.2f}"
+        else:
+            # Initial state before first balance query
+            rpl_color = '#aaaaaa'
+            rpl_text = "$0.00"
+            session_start_text = "N/A"
+        
+        session_start_label = tk.Label(account_frame, text=f"Session Start (18:00): {session_start_text}",
+                                      font=("Arial", 11), bg='#2d2d2d', fg='#aaaaaa')
+        session_start_label.pack(anchor="w", pady=(5, 0))
+        DASHBOARD_WIDGETS['session_start_label'] = session_start_label
+        
+        session_rpl_label = tk.Label(account_frame, text=f"Session RPL: {rpl_text}",
+                                    font=("Arial", 14, "bold"), bg='#2d2d2d', fg=rpl_color)
+        session_rpl_label.pack(anchor="w", pady=(2, 0))
+        DASHBOARD_WIDGETS['session_rpl_label'] = session_rpl_label
         
         # Position Section
         position_frame = tk.LabelFrame(dashboard, text="Current Position", font=("Arial", 12, "bold"),
@@ -2060,15 +2534,22 @@ def update_clock():
 
 def update_countdown():
     """Update the countdown label showing seconds until next screenshot."""
-    global DASHBOARD_WINDOW, DASHBOARD_WIDGETS, LAST_JOB_TIME
+    global DASHBOARD_WINDOW, DASHBOARD_WIDGETS, LAST_JOB_TIME, INTERVAL_SCHEDULE
     if DASHBOARD_WINDOW and DASHBOARD_WINDOW.winfo_exists() and 'countdown_label' in DASHBOARD_WIDGETS:
         try:
             if LAST_JOB_TIME is not None:
                 current_interval = get_current_interval()
                 
-                # Skip if screenshots disabled
+                # Check if in disabled interval and show next active time
                 if current_interval == -1:
-                    DASHBOARD_WIDGETS['countdown_label'].config(text="[Screenshots disabled]", fg='#888888')
+                    in_disabled, next_active_time = is_in_disabled_interval(INTERVAL_SCHEDULE)
+                    if in_disabled and next_active_time:
+                        DASHBOARD_WIDGETS['countdown_label'].config(
+                            text=f"[Waiting until {next_active_time.strftime('%H:%M')}]", 
+                            fg='#888888'
+                        )
+                    else:
+                        DASHBOARD_WIDGETS['countdown_label'].config(text="[Screenshots disabled]", fg='#888888')
                 else:
                     # Calculate seconds since last job
                     elapsed = (datetime.datetime.now() - LAST_JOB_TIME).total_seconds()
@@ -2087,7 +2568,15 @@ def update_countdown():
                         fg=color
                     )
             else:
-                DASHBOARD_WIDGETS['countdown_label'].config(text="[Waiting...]", fg='#aaaaaa')
+                # Check if waiting for next active interval
+                in_disabled, next_active_time = is_in_disabled_interval(INTERVAL_SCHEDULE)
+                if in_disabled and next_active_time:
+                    DASHBOARD_WIDGETS['countdown_label'].config(
+                        text=f"[Waiting until {next_active_time.strftime('%H:%M')}]", 
+                        fg='#aaaaaa'
+                    )
+                else:
+                    DASHBOARD_WIDGETS['countdown_label'].config(text="[Waiting...]", fg='#aaaaaa')
             
             # Schedule next update in 1 second
             DASHBOARD_WINDOW.after(1000, update_countdown)
@@ -2110,6 +2599,9 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
         if is_closed:
             logging.info(f"📅 {reason} - Skipping all operations")
             return
+    
+    # Check if we're in any no-new-trades window BEFORE doing anything
+    in_no_trades_window, current_window = is_in_no_new_trades_window(no_new_trades_windows)
     
     # Check if today is a market holiday (full close)
     if HOLIDAY_CONFIG['enabled']:
@@ -2174,6 +2666,25 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                                     logging.info(f"ℹ️  Early close today at {close_time.strftime('%H:%M')} - Will stop trading at {adjusted_close.strftime('%H:%M')}")
                         break
 
+    # Check if we're in no-new-trades window BEFORE taking any screenshots or querying positions
+    # (except if we have an active position that needs force closing)
+    if in_no_trades_window:
+        # Check if we have an active position that needs to be force-closed
+        trade_info = get_active_trade_info()
+        has_active_trade = trade_info and trade_info.get('position_type') in ['long', 'short']
+        
+        # Parse force close time
+        force_close = datetime.datetime.strptime(force_close_time, "%H:%M").time()
+        current_time = datetime.datetime.now().time()
+        
+        # Only proceed if we have an active trade AND it's past force close time
+        if has_active_trade and current_time >= force_close:
+            logging.info(f"In no-new-trades window '{current_window}' but active trade needs force closing - continuing")
+        else:
+            # Skip everything - no screenshots, no analysis
+            logging.info(f"In no-new-trades window '{current_window}' - Skipping all operations (screenshots, analysis, new entries)")
+            return
+
     logging.info(f"Starting job at {time.ctime()}")
     
     # First, verify Bookmap is available before doing anything else
@@ -2234,7 +2745,18 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             )
             logging.info(f"Determined current position_type: {current_position_type}")
             
-            # Update dashboard with latest position data
+            # Query account balance for session RPL tracking and snapshots
+            balance = get_account_balance(topstep_config['account_id'], topstep_config, enable_trading, auth_token)
+            if balance is not None:
+                global ACCOUNT_BALANCE
+                ACCOUNT_BALANCE = balance
+            
+            # Reconcile trades (check for positions closed by stop/target)
+            # This checks both local tracking and Supabase for unclosed trades
+            reconcile_closed_trades(topstep_config, enable_trading, auth_token)
+            reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token)
+            
+            # Update dashboard with latest position data and balance
             update_dashboard_data()
             
             # Detect if position changed from active to closed
@@ -2345,8 +2867,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             position_details = None
             working_orders = None
         
-        # Check if we're in any no-new-trades window
-        in_no_trades_window, current_window = is_in_no_new_trades_window(no_new_trades_windows)
+        # Note: in_no_trades_window and current_window were already checked at the start of job()
+        # If we made it this far, we're either not in a no-trade window, or we have an active position needing force close
         
         # Check if it's time to force close all positions
         # Force close should only apply if we're in a no-new-trades window AND past the force_close_time
@@ -4862,6 +5384,8 @@ def fetch_trade_results(account_id, topstep_config, enable_trading, auth_token=N
 
 def get_account_balance(account_id, topstep_config, enable_trading, auth_token=None):
     """Query API for account balance for a specific account ID."""
+    global SESSION_START_BALANCE, SESSION_START_TIME, CURRENT_RPL
+    
     if not enable_trading:
         logging.debug("Trading disabled - Skipping account balance query")
         return None
@@ -4895,8 +5419,33 @@ def get_account_balance(account_id, topstep_config, enable_trading, auth_token=N
             if account.get('id') == target_account_id:
                 balance = account.get('balance')
                 if balance is not None:
+                    balance = float(balance)
                     logging.info(f"Retrieved balance for account {account_id}: ${balance:,.2f}")
-                    return float(balance)
+                    
+                    # Session RPL tracking
+                    # Initialize session start balance if not set
+                    if SESSION_START_BALANCE is None:
+                        # Try to get from database first
+                        db_start_balance = get_session_start_balance(account_id)
+                        if db_start_balance is not None:
+                            SESSION_START_BALANCE = db_start_balance
+                        else:
+                            # Use current balance as baseline
+                            SESSION_START_BALANCE = balance
+                            logging.info(f"No session start balance found - using current balance as baseline: ${balance:,.2f}")
+                        
+                        SESSION_START_TIME = get_session_start_time()
+                        logging.info(f"Session started at {SESSION_START_TIME}, start balance: ${SESSION_START_BALANCE:,.2f}")
+                    
+                    # Calculate current RPL
+                    CURRENT_RPL = calculate_session_rpl(balance, SESSION_START_BALANCE)
+                    
+                    # Save snapshot to Supabase
+                    save_balance_snapshot(account_id, balance, CURRENT_RPL)
+                    
+                    logging.info(f"Session RPL: ${CURRENT_RPL:+,.2f}")
+                    
+                    return balance
                 else:
                     logging.warning(f"Found account {account_id} but no balance field")
                     return None
@@ -4966,6 +5515,11 @@ DASHBOARD_WIDGETS = {}  # Store references to dashboard widgets for updates with
 LAST_JOB_TIME = None  # Track when last screenshot/job was taken for countdown
 LAST_WAITING_FOR = None  # Store the most recent "waiting_for" condition from LLM response
 LAST_KEY_LEVELS = None  # Store the most recent key price levels from LLM response
+
+# Session RPL tracking
+SESSION_START_BALANCE = None  # Balance at 18:00 session start
+SESSION_START_TIME = None  # When the trading session started
+CURRENT_RPL = 0.0  # Current session realized profit/loss
 
 # Global Supabase client
 SUPABASE_CLIENT = None
@@ -5555,36 +6109,52 @@ logging.info("Scheduled base context refresh every 30 minutes")
 logging.info("Job scheduling uses dynamic intervals - see interval_seconds and interval_schedule in config.ini")
 
 # Run the first job immediately on startup (before entering the scheduler loop)
-logging.info("Running initial screenshot job immediately on startup...")
-job(
-    window_title=WINDOW_TITLE, 
-    window_process_name=WINDOW_PROCESS_NAME, 
-    top_offset=TOP_OFFSET, 
-    bottom_offset=BOTTOM_OFFSET, 
-    left_offset=LEFT_OFFSET, 
-    right_offset=RIGHT_OFFSET, 
-    save_folder=SAVE_FOLDER, 
-    begin_time=BEGIN_TIME, 
-    end_time=END_TIME, 
-    symbol=SYMBOL, 
-    position_type=POSITION_TYPE, 
-    no_position_prompt=NO_POSITION_PROMPT, 
-    long_position_prompt=LONG_POSITION_PROMPT, 
-    short_position_prompt=SHORT_POSITION_PROMPT, 
-    runner_prompt=RUNNER_PROMPT,
-    model=MODEL, 
-    topstep_config=TOPSTEP_CONFIG, 
-    enable_llm=ENABLE_LLM,
-    enable_trading=ENABLE_TRADING,
-    openai_api_url=OPENAI_API_URL,
-    openai_api_key=OPENAI_API_KEY,
-    enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
-    auth_token=AUTH_TOKEN,
-    execute_trades=EXECUTE_TRADES,
-    telegram_config=TELEGRAM_CONFIG,
-    no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
-    force_close_time=FORCE_CLOSE_TIME
-)
+# But first check if we're in a no-trade window or disabled interval to avoid unnecessary screenshots
+logging.info("Checking if startup screenshot should be taken...")
+startup_in_no_trades_window, startup_window = is_in_no_new_trades_window(NO_NEW_TRADES_WINDOWS)
+startup_in_disabled_interval, next_active_time = is_in_disabled_interval(INTERVAL_SCHEDULE)
+
+if startup_in_no_trades_window:
+    logging.info(f"⏸️  STARTUP: In no-new-trades window '{startup_window}' - Skipping initial screenshot")
+    logging.info("System will wait for next scheduled interval to begin operations")
+elif startup_in_disabled_interval:
+    if next_active_time:
+        logging.info(f"⏸️  STARTUP: In disabled interval (interval=-1) - Skipping initial screenshot")
+        logging.info(f"System will resume analysis at {next_active_time.strftime('%H:%M')}")
+    else:
+        logging.info(f"⏸️  STARTUP: In disabled interval (interval=-1) - Skipping initial screenshot")
+        logging.info("No active intervals configured for today")
+else:
+    logging.info("Running initial screenshot job immediately on startup...")
+    job(
+        window_title=WINDOW_TITLE, 
+        window_process_name=WINDOW_PROCESS_NAME, 
+        top_offset=TOP_OFFSET, 
+        bottom_offset=BOTTOM_OFFSET, 
+        left_offset=LEFT_OFFSET, 
+        right_offset=RIGHT_OFFSET, 
+        save_folder=SAVE_FOLDER, 
+        begin_time=BEGIN_TIME, 
+        end_time=END_TIME, 
+        symbol=SYMBOL, 
+        position_type=POSITION_TYPE, 
+        no_position_prompt=NO_POSITION_PROMPT, 
+        long_position_prompt=LONG_POSITION_PROMPT,
+        short_position_prompt=SHORT_POSITION_PROMPT,
+        runner_prompt=RUNNER_PROMPT,
+        model=MODEL,
+        topstep_config=TOPSTEP_CONFIG,
+        enable_llm=ENABLE_LLM,
+        enable_trading=ENABLE_TRADING,
+        openai_api_url=OPENAI_API_URL,
+        openai_api_key=OPENAI_API_KEY,
+        enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
+        auth_token=AUTH_TOKEN,
+        execute_trades=EXECUTE_TRADES,
+        telegram_config=TELEGRAM_CONFIG,
+        no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
+        force_close_time=FORCE_CLOSE_TIME
+    )
 
 # Global flag to control the scheduler
 running = False
@@ -5954,6 +6524,8 @@ def create_tray_icon():
         item('Reload Config', lambda icon, item: reload_config()),
         item('Refresh Market Context', lambda icon, item: refresh_market_context()),
         item('Clear Active Trade', lambda icon, item: clear_trade_and_disable_monitoring()),
+        item('Reconcile Closed Trades', lambda icon, item: manual_reconcile_trades()),
+        item('Reset Session RPL', lambda icon, item: reset_session_rpl()),
         item('Enable Trade Monitoring', lambda icon, item: enable_trade_monitoring("Manual enable via tray menu")),
         item('Set Position', pystray.Menu(
             item('None', lambda icon, item: set_position('none')),
@@ -6018,6 +6590,33 @@ def clear_trade_and_disable_monitoring():
     disable_trade_monitoring("Manual clear via tray menu")
     update_dashboard_data()
 
+def reset_session_rpl():
+    """Reset session RPL tracking (manual reset)."""
+    global SESSION_START_BALANCE, SESSION_START_TIME, CURRENT_RPL
+    
+    # Get current balance
+    if ACCOUNT_BALANCE is not None:
+        SESSION_START_BALANCE = ACCOUNT_BALANCE
+        SESSION_START_TIME = datetime.datetime.now()
+        CURRENT_RPL = 0.0
+        logging.info(f"Session RPL manually reset - New session start balance: ${SESSION_START_BALANCE:,.2f}")
+        
+        # Update dashboard
+        update_dashboard_data()
+    else:
+        logging.warning("Cannot reset session RPL - no current balance available")
+
+def manual_reconcile_trades():
+    """Manually trigger trade reconciliation (for tray menu)."""
+    logging.info("=== MANUAL TRADE RECONCILIATION TRIGGERED ===")
+    try:
+        reconcile_closed_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
+        reconcile_supabase_open_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
+        logging.info("=== MANUAL RECONCILIATION COMPLETE ===")
+    except Exception as e:
+        logging.error(f"Error during manual reconciliation: {e}")
+        logging.exception("Full traceback:")
+
 def create_tray_icon():
     # Use simple icons (green for running, red for stopped)
     green_image = Image.new('RGB', (64, 64), color=(0, 255, 0))
@@ -6029,6 +6628,8 @@ def create_tray_icon():
         item('Reload Config', lambda icon, item: reload_config()),
         item('Refresh Market Context', lambda icon, item: refresh_market_context()),
         item('Clear Active Trade', lambda icon, item: clear_trade_and_disable_monitoring()),
+        item('Reconcile Closed Trades', lambda icon, item: manual_reconcile_trades()),
+        item('Reset Session RPL', lambda icon, item: reset_session_rpl()),
         item('Enable Trade Monitoring', lambda icon, item: enable_trade_monitoring("Manual enable via tray menu")),
         item('Set Position', pystray.Menu(
             item('None', lambda icon, item: set_position('none')),

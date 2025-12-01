@@ -24,6 +24,26 @@ COMMON VARIABLES (Used in both prompts)
     Example: "Previously waiting for: Break above 6675 with aggressive buying and follow-through"
     Notes: Provides continuity between LLM analyses, cleared when position is entered
 
+{key_levels}
+    Description: Key price levels being tracked by the LLM across iterations
+    Format: Formatted text list of levels with price, type, and reason
+    Used in: All prompts (no_position_prompt.txt, position_prompt.txt, runner_prompt.txt)
+    Example: 
+        "KEY LEVELS BEING TRACKED:
+         - 6000.00 (Support): Volume shelf and prior low
+         - 6015.50 (Resistance): PDH and liquidity wall
+         - 5985.25 (Support): ONL and absorption zone"
+    JSON Format (in LLM response):
+        [
+          {"price": 6000.00, "type": "support", "reason": "Volume shelf and prior low"},
+          {"price": 6015.50, "type": "resistance", "reason": "PDH and liquidity wall"}
+        ]
+    Notes: 
+        - Persists across trade lifecycle (NOT cleared when entering position)
+        - LLM can update/add/remove levels each iteration
+        - Common types: support, resistance, POC, pivot, target, stop_trail
+        - No hard limit on number of levels (recommend 3-5 most critical)
+
 {Symbol}
     Description: The trading symbol/contract identifier
     Format: String (e.g., "CON.F.US.EP.Z25")

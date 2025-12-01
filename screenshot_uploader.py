@@ -166,6 +166,45 @@ def is_market_closed_weekly(market_closed_config):
         logging.error(f"Error checking weekly market closed periods: {e}")
         return False, None
 
+def format_key_levels_for_prompt(key_levels):
+    """Format key levels list into readable text for LLM prompt.
+    
+    Args:
+        key_levels: List of dicts with keys 'price', 'type', 'reason', or JSON string
+    
+    Returns:
+        str: Formatted text describing key levels
+    """
+    if not key_levels:
+        return "No key levels currently tracked"
+    
+    try:
+        # Parse if string
+        if isinstance(key_levels, str):
+            key_levels = json.loads(key_levels)
+        
+        if not key_levels or not isinstance(key_levels, list):
+            return "No key levels currently tracked"
+        
+        # Format as bullet list
+        formatted_lines = ["KEY LEVELS BEING TRACKED:"]
+        for level in key_levels:
+            if isinstance(level, dict):
+                price = level.get('price', 'N/A')
+                level_type = level.get('type', 'N/A')
+                reason = level.get('reason', '')
+                
+                if reason:
+                    formatted_lines.append(f"- {price} ({level_type}): {reason}")
+                else:
+                    formatted_lines.append(f"- {price} ({level_type})")
+        
+        return "\n".join(formatted_lines)
+        
+    except Exception as e:
+        logging.error(f"Error formatting key levels: {e}")
+        return "No key levels currently tracked"
+
 def get_active_trade_info():
     """Get the current active trade info from file.
     
@@ -235,7 +274,7 @@ def clear_active_trade_info():
         logging.error(f"Error clearing active trade info: {e}")
 
 def log_llm_interaction(request_prompt, response_text, action=None, entry_price=None, 
-                        price_target=None, stop_loss=None, confidence=None, reasoning=None, context=None, waiting_for=None):
+                        price_target=None, stop_loss=None, confidence=None, reasoning=None, context=None, waiting_for=None, key_levels=None):
     """Log LLM request and response to daily CSV file.
     
     Args:
@@ -249,6 +288,7 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
         reasoning: Parsed reasoning
         context: Market context used in the request
         waiting_for: Condition the LLM is waiting for before taking action
+        key_levels: Key price levels being tracked (list of dicts or JSON string)
     """
     global LATEST_LLM_DATA
     
@@ -261,6 +301,14 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
         csv_file = os.path.join(log_folder, f"{today}_LLM.csv")
         
         # Store in global variable for immediate dashboard access
+        # Convert key_levels to JSON string for storage
+        key_levels_str = ''
+        if key_levels:
+            if isinstance(key_levels, str):
+                key_levels_str = key_levels[:1000]
+            else:
+                key_levels_str = json.dumps(key_levels)[:1000]
+        
         LATEST_LLM_DATA = {
             'date_time': timestamp,
             'request': request_prompt[:1000] if request_prompt else '',
@@ -272,7 +320,8 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
             'confidence': confidence or '',
             'reasoning': reasoning[:500] if reasoning else '',
             'context': context[:500] if context else '',
-            'waiting_for': waiting_for[:500] if waiting_for else ''
+            'waiting_for': waiting_for[:500] if waiting_for else '',
+            'key_levels': key_levels_str
         }
         
         # Check if file exists to determine if we need to write header
@@ -285,7 +334,7 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
             if not file_exists:
                 writer.writerow([
                     'date_time', 'request', 'response', 'action', 'entry_price', 
-                    'price_target', 'stop_loss', 'confidence', 'reasoning', 'context', 'waiting_for'
+                    'price_target', 'stop_loss', 'confidence', 'reasoning', 'context', 'waiting_for', 'key_levels'
                 ])
             
             # Write the log entry
@@ -300,7 +349,8 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
                 LATEST_LLM_DATA['confidence'],
                 LATEST_LLM_DATA['reasoning'],
                 LATEST_LLM_DATA['context'],
-                LATEST_LLM_DATA['waiting_for']
+                LATEST_LLM_DATA['waiting_for'],
+                LATEST_LLM_DATA['key_levels']
             ])
         
         logging.info(f"LLM interaction logged to {csv_file}")
@@ -308,6 +358,17 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
         # Also log to Supabase if enabled (with FULL, untruncated data)
         if SUPABASE_CLIENT:
             try:
+                # Convert key_levels to proper JSON for JSONB column
+                key_levels_json = None
+                if key_levels:
+                    if isinstance(key_levels, str):
+                        try:
+                            key_levels_json = json.loads(key_levels)
+                        except:
+                            key_levels_json = key_levels  # Store as-is if not valid JSON
+                    else:
+                        key_levels_json = key_levels
+                
                 supabase_data = {
                     'account_id': TOPSTEP_CONFIG.get('account_id', ''),
                     'order_id': None,  # Will be set if available
@@ -321,7 +382,8 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
                     'confidence': int(confidence) if confidence else None,
                     'reasoning': reasoning if reasoning else '',  # Full reasoning, not truncated
                     'context': context if context else '',  # Full context, not truncated
-                    'waiting_for': waiting_for if waiting_for else None
+                    'waiting_for': waiting_for if waiting_for else None,
+                    'key_levels': key_levels_json  # JSONB column
                 }
                 SUPABASE_CLIENT.table('llm_interactions').insert(supabase_data).execute()
                 logging.debug("LLM interaction logged to Supabase (full message, not truncated)")
@@ -1505,7 +1567,7 @@ def show_dashboard(root=None):
         
         dashboard.title("ES Trader Dashboard")
         if is_initial_build:
-            dashboard.geometry("500x680")
+            dashboard.geometry("500x750")
         dashboard.configure(bg='#1e1e1e')
         
         # Get current data - verify position from API if trading is enabled
@@ -1625,17 +1687,60 @@ def show_dashboard(root=None):
                 # Update waiting_for text if available
                 waiting_for_value = llm_data.get('waiting_for', '')
                 if waiting_for_value and waiting_for_value.strip():
+                    if 'waiting_for_title' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['waiting_for_title'].pack(anchor="w", pady=(10, 5))
                     if 'waiting_for_text' in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS['waiting_for_text'].config(state=tk.NORMAL)
                         DASHBOARD_WIDGETS['waiting_for_text'].delete(1.0, tk.END)
                         DASHBOARD_WIDGETS['waiting_for_text'].insert(1.0, waiting_for_value)
                         DASHBOARD_WIDGETS['waiting_for_text'].config(state=tk.DISABLED)
+                        DASHBOARD_WIDGETS['waiting_for_text'].pack(fill="x", pady=5)
                 else:
                     # Hide waiting_for widgets if no data
                     if 'waiting_for_title' in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS['waiting_for_title'].pack_forget()
                     if 'waiting_for_text' in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS['waiting_for_text'].pack_forget()
+                
+                # Update key_levels text if available
+                key_levels_value = llm_data.get('key_levels', '')
+                if key_levels_value and key_levels_value.strip():
+                    # Format key levels for display
+                    try:
+                        if isinstance(key_levels_value, str):
+                            key_levels_json = json.loads(key_levels_value)
+                        else:
+                            key_levels_json = key_levels_value
+                        
+                        if key_levels_json and isinstance(key_levels_json, list):
+                            formatted_levels = []
+                            for level in key_levels_json:
+                                if isinstance(level, dict):
+                                    price = level.get('price', 'N/A')
+                                    level_type = level.get('type', 'N/A')
+                                    reason = level.get('reason', '')
+                                    if reason:
+                                        formatted_levels.append(f"{price} ({level_type}): {reason}")
+                                    else:
+                                        formatted_levels.append(f"{price} ({level_type})")
+                            
+                            if formatted_levels:
+                                if 'key_levels_title' in DASHBOARD_WIDGETS:
+                                    DASHBOARD_WIDGETS['key_levels_title'].pack(anchor="w", pady=(10, 5))
+                                if 'key_levels_text' in DASHBOARD_WIDGETS:
+                                    DASHBOARD_WIDGETS['key_levels_text'].config(state=tk.NORMAL)
+                                    DASHBOARD_WIDGETS['key_levels_text'].delete(1.0, tk.END)
+                                    DASHBOARD_WIDGETS['key_levels_text'].insert(1.0, "\n".join(formatted_levels))
+                                    DASHBOARD_WIDGETS['key_levels_text'].config(state=tk.DISABLED)
+                                    DASHBOARD_WIDGETS['key_levels_text'].pack(fill="x", pady=5)
+                    except:
+                        pass  # Skip if parsing fails
+                else:
+                    # Hide key_levels widgets if no data
+                    if 'key_levels_title' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['key_levels_title'].pack_forget()
+                    if 'key_levels_text' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['key_levels_text'].pack_forget()
                 
                 # Market Context temporarily hidden
                 # if 'context_text' in DASHBOARD_WIDGETS:
@@ -1644,27 +1749,14 @@ def show_dashboard(root=None):
                 #     DASHBOARD_WIDGETS['context_text'].insert(1.0, llm_data.get('context', 'N/A'))
                 #     DASHBOARD_WIDGETS['context_text'].config(state=tk.DISABLED)
                 
-                # Show LLM data widgets, hide no-data label (context temporarily hidden)
-                widget_keys = ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
-                              'reasoning_title', 'reasoning_text']
-                
-                # Add waiting_for widgets if data exists
-                if waiting_for_value and waiting_for_value.strip():
-                    widget_keys.extend(['waiting_for_title', 'waiting_for_text'])
-                
-                for key in widget_keys:
-                    if key in DASHBOARD_WIDGETS:
-                        if 'text' in key:
-                            # Text widgets need fill="x" not anchor
-                            DASHBOARD_WIDGETS[key].pack(fill="x", pady=5)
-                        elif key == 'time_frame' or 'label' in key or 'title' in key:
-                            DASHBOARD_WIDGETS[key].pack(anchor="w", pady=5 if 'label' in key or key == 'time_frame' else (10, 5))
+                # Hide no-data label when LLM data exists
                 if 'no_llm_label' in DASHBOARD_WIDGETS:
                     DASHBOARD_WIDGETS['no_llm_label'].pack_forget()
             else:
                 # Hide LLM widgets, show no-data label (context temporarily hidden)
                 for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
-                           'reasoning_title', 'reasoning_text', 'waiting_for_title', 'waiting_for_text']:
+                           'reasoning_title', 'reasoning_text', 'waiting_for_title', 'waiting_for_text',
+                           'key_levels_title', 'key_levels_text']:
                     if key in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS[key].pack_forget()
                 if 'no_llm_label' in DASHBOARD_WIDGETS:
@@ -1762,6 +1854,9 @@ def show_dashboard(root=None):
         waiting_for_title = tk.Label(llm_frame, text="Waiting For:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
         waiting_for_text = tk.Text(llm_frame, height=2, wrap=tk.WORD, font=("Arial", 10),
                                    bg='#2d2d2d', fg='#ffaa00', relief=tk.FLAT)
+        key_levels_title = tk.Label(llm_frame, text="Key Levels:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
+        key_levels_text = tk.Text(llm_frame, height=4, wrap=tk.WORD, font=("Arial", 10),
+                                  bg='#2d2d2d', fg='#00aaff', relief=tk.FLAT)
         context_title = tk.Label(llm_frame, text="Market Context:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
         context_text = tk.Text(llm_frame, height=4, wrap=tk.WORD, font=("Arial", 10),
                               bg='#1e1e1e', fg='#aaaaaa', relief=tk.FLAT)
@@ -1778,6 +1873,8 @@ def show_dashboard(root=None):
         DASHBOARD_WIDGETS['reasoning_text'] = reasoning_text
         DASHBOARD_WIDGETS['waiting_for_title'] = waiting_for_title
         DASHBOARD_WIDGETS['waiting_for_text'] = waiting_for_text
+        DASHBOARD_WIDGETS['key_levels_title'] = key_levels_title
+        DASHBOARD_WIDGETS['key_levels_text'] = key_levels_text
         DASHBOARD_WIDGETS['context_title'] = context_title
         DASHBOARD_WIDGETS['context_text'] = context_text
         DASHBOARD_WIDGETS['no_llm_label'] = no_llm_label
@@ -1849,6 +1946,36 @@ def show_dashboard(root=None):
                 waiting_for_text.insert(1.0, waiting_for_value)
                 waiting_for_text.config(state=tk.DISABLED)
                 waiting_for_text.pack(fill="x", pady=5)
+            
+            # Key Levels section (if available)
+            key_levels_value = llm_data.get('key_levels', '')
+            if key_levels_value and key_levels_value.strip():
+                # Format key levels for display
+                try:
+                    if isinstance(key_levels_value, str):
+                        key_levels_json = json.loads(key_levels_value)
+                    else:
+                        key_levels_json = key_levels_value
+                    
+                    if key_levels_json and isinstance(key_levels_json, list):
+                        formatted_levels = []
+                        for level in key_levels_json:
+                            if isinstance(level, dict):
+                                price = level.get('price', 'N/A')
+                                level_type = level.get('type', 'N/A')
+                                reason = level.get('reason', '')
+                                if reason:
+                                    formatted_levels.append(f"{price} ({level_type}): {reason}")
+                                else:
+                                    formatted_levels.append(f"{price} ({level_type})")
+                        
+                        if formatted_levels:
+                            key_levels_title.pack(anchor="w", pady=(10, 5))
+                            key_levels_text.insert(1.0, "\n".join(formatted_levels))
+                            key_levels_text.config(state=tk.DISABLED)
+                            key_levels_text.pack(fill="x", pady=5)
+                except:
+                    pass  # Skip if parsing fails
             
             # Market Context temporarily hidden
             # context_title.pack(anchor="w", pady=(10, 5))
@@ -1971,7 +2098,7 @@ def update_countdown():
 
 def job(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, runner_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
     """The main job to run periodically."""
-    global PREVIOUS_POSITION_TYPE, LAST_WAITING_FOR
+    global PREVIOUS_POSITION_TYPE, LAST_WAITING_FOR, LAST_KEY_LEVELS
     
     if not is_within_time_range(begin_time, end_time):
         logging.info(f"Current time {datetime.datetime.now().time()} is outside the range {begin_time}-{end_time}. Skipping.")
@@ -2320,6 +2447,9 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 entry_reasoning = trade_info.get('reasoning', 'Not available')
             
             # Add position data to prompt
+            # Format key_levels text for prompt
+            key_levels_text = format_key_levels_for_prompt(LAST_KEY_LEVELS)
+            
             # Format the position prompt with available template variables (using safe formatting)
             position_prompt = safe_format_prompt(
                 position_prompt_template,
@@ -2333,7 +2463,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 current_take_profit=current_take_profit,
                 Context=daily_context_with_bars,
                 LLM_Context=get_llm_observations(),
-                Reason=entry_reasoning
+                Reason=entry_reasoning,
+                key_levels=key_levels_text
             )
             
             logging.info(f"Using position management prompt")
@@ -2359,7 +2490,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                     stop_loss = advice.get('stop_loss')
                     reasoning = advice.get('reasoning')
                     new_context = advice.get('context', '')
-                    logging.info(f"Position Management Advice: Action={action}, Target={price_target}, Stop={stop_loss}, Reasoning={reasoning}")
+                    key_levels = advice.get('key_levels')
+                    logging.info(f"Position Management Advice: Action={action}, Target={price_target}, Stop={stop_loss}, Reasoning={reasoning}, KeyLevels={len(key_levels) if key_levels else 0} levels")
                     
                     # Log LLM interaction to CSV
                     llm_response_time = datetime.datetime.now()
@@ -2372,9 +2504,14 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                         stop_loss=stop_loss,
                         confidence=None,  # Not provided in position management
                         reasoning=reasoning,
-                        context=daily_context
+                        context=daily_context,
+                        key_levels=key_levels
                     )
                     logging.info(f"LLM response logged and cached at {llm_response_time.strftime('%H:%M:%S')}")
+                    
+                    # Store key_levels for next iteration (persists across trades)
+                    LAST_KEY_LEVELS = key_levels if key_levels else None
+                    logging.info(f"Updated LAST_KEY_LEVELS to: {len(LAST_KEY_LEVELS) if LAST_KEY_LEVELS else 0} levels")
                     
                     # Update dashboard with latest LLM response
                     update_dashboard_data()
@@ -2460,12 +2597,16 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             else:
                 waiting_for_text = "No previous conditions being tracked"
             
+            # Format key_levels text for prompt
+            key_levels_text = format_key_levels_for_prompt(LAST_KEY_LEVELS)
+            
             prompt = safe_format_prompt(
                 no_position_prompt, 
                 symbol=DISPLAY_SYMBOL, 
                 Context=daily_context_with_bars, 
                 LLM_Context=llm_observations,
-                waiting_for=waiting_for_text
+                waiting_for=waiting_for_text,
+                key_levels=key_levels_text
             )
         elif current_position_type == 'long':
             prompt = safe_format_prompt(long_position_prompt, symbol=DISPLAY_SYMBOL, Context=daily_context_with_bars, LLM_Context=llm_observations)
@@ -2496,7 +2637,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 confidence = advice.get('confidence')
                 new_context = advice.get('context', '')
                 waiting_for = advice.get('waiting_for')
-                logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}, WaitingFor={waiting_for}")
+                key_levels = advice.get('key_levels')
+                logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}, WaitingFor={waiting_for}, KeyLevels={len(key_levels) if key_levels else 0} levels")
 
                 # Log LLM interaction to CSV
                 llm_response_time = datetime.datetime.now()
@@ -2510,13 +2652,18 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                     confidence=confidence,
                     reasoning=reasoning,
                     context=daily_context,
-                    waiting_for=waiting_for
+                    waiting_for=waiting_for,
+                    key_levels=key_levels
                 )
                 logging.info(f"LLM response logged and cached at {llm_response_time.strftime('%H:%M:%S')}")
                 
                 # Store waiting_for condition for next iteration
                 LAST_WAITING_FOR = waiting_for if waiting_for else None
                 logging.info(f"Updated LAST_WAITING_FOR to: {LAST_WAITING_FOR}")
+                
+                # Store key_levels for next iteration (persists across trades)
+                LAST_KEY_LEVELS = key_levels if key_levels else None
+                logging.info(f"Updated LAST_KEY_LEVELS to: {len(LAST_KEY_LEVELS) if LAST_KEY_LEVELS else 0} levels")
                 
                 # Update dashboard with latest LLM response
                 update_dashboard_data()
@@ -4818,6 +4965,7 @@ LATEST_LLM_DATA = None  # Store the most recent LLM response for immediate dashb
 DASHBOARD_WIDGETS = {}  # Store references to dashboard widgets for updates without rebuild
 LAST_JOB_TIME = None  # Track when last screenshot/job was taken for countdown
 LAST_WAITING_FOR = None  # Store the most recent "waiting_for" condition from LLM response
+LAST_KEY_LEVELS = None  # Store the most recent key price levels from LLM response
 
 # Global Supabase client
 SUPABASE_CLIENT = None

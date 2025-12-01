@@ -3347,7 +3347,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 new_context = advice.get('context', '')
                 waiting_for = advice.get('waiting_for')
                 key_levels = advice.get('key_levels')
-                logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}, WaitingFor={waiting_for}, KeyLevels={len(key_levels) if key_levels else 0} levels")
+                next_snapshot = advice.get('next_snapshot')
+                logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}, WaitingFor={waiting_for}, KeyLevels={len(key_levels) if key_levels else 0} levels, NextSnapshot={next_snapshot}s")
 
                 # Log LLM interaction to CSV
                 llm_response_time = datetime.datetime.now()
@@ -3373,6 +3374,15 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 # Store key_levels for next iteration (persists across trades)
                 LAST_KEY_LEVELS = key_levels if key_levels else None
                 logging.info(f"Updated LAST_KEY_LEVELS to: {len(LAST_KEY_LEVELS) if LAST_KEY_LEVELS else 0} levels")
+                
+                # Store next_snapshot timing override (LLM-controlled dynamic interval)
+                global NEXT_SNAPSHOT_OVERRIDE
+                if next_snapshot and isinstance(next_snapshot, (int, float)) and next_snapshot > 0:
+                    NEXT_SNAPSHOT_OVERRIDE = int(next_snapshot)
+                    logging.info(f"🕐 LLM requested next snapshot in {NEXT_SNAPSHOT_OVERRIDE}s (overriding schedule)")
+                else:
+                    NEXT_SNAPSHOT_OVERRIDE = None
+                    logging.debug("No next_snapshot override from LLM - using schedule")
                 
                 # Update dashboard with latest LLM response
                 update_dashboard_data()
@@ -5712,6 +5722,9 @@ CURRENT_RPL = 0.0  # Current session realized profit/loss
 FORCE_IMMEDIATE_ANALYSIS = False  # Flag to trigger immediate screenshot and LLM analysis when discrepancy detected
 LAST_RECONCILIATION_TIME = None  # Timestamp of last reconciliation to prevent duplicates
 
+# Dynamic snapshot timing (LLM-controlled)
+NEXT_SNAPSHOT_OVERRIDE = None  # LLM-requested interval for next snapshot (in seconds), overrides schedule
+
 # Global Supabase client
 SUPABASE_CLIENT = None
 
@@ -6375,11 +6388,20 @@ def disable_trade_monitoring(reason=""):
 def get_current_interval():
     """Get the interval_seconds for the current time based on interval_schedule.
     
+    LLM can override the schedule by setting next_snapshot in its response.
+    This allows dynamic timing based on market conditions.
+    
     Returns:
         int: interval_seconds for current time, or -1 if screenshots disabled
     """
-    global INTERVAL_SCHEDULE, INTERVAL_SECONDS
+    global INTERVAL_SCHEDULE, INTERVAL_SECONDS, NEXT_SNAPSHOT_OVERRIDE
     
+    # Priority 1: LLM-requested override (dynamic timing based on market conditions)
+    if NEXT_SNAPSHOT_OVERRIDE is not None:
+        logging.debug(f"Using LLM-requested override: {NEXT_SNAPSHOT_OVERRIDE}s")
+        return NEXT_SNAPSHOT_OVERRIDE
+    
+    # Priority 2: Time-based schedule
     if not INTERVAL_SCHEDULE or INTERVAL_SCHEDULE.strip() == '':
         # Fallback to interval_seconds if no schedule defined
         return INTERVAL_SECONDS
@@ -6426,7 +6448,7 @@ def run_scheduler():
     global SHORT_POSITION_PROMPT, MODEL, TOPSTEP_CONFIG, ENABLE_LLM, ENABLE_TRADING
     global OPENAI_API_URL, OPENAI_API_KEY, ENABLE_SAVE_SCREENSHOTS, AUTH_TOKEN
     global EXECUTE_TRADES, TELEGRAM_CONFIG, NO_NEW_TRADES_WINDOWS, FORCE_CLOSE_TIME
-    global LAST_JOB_TIME, FORCE_IMMEDIATE_ANALYSIS, RUNNER_PROMPT
+    global LAST_JOB_TIME, FORCE_IMMEDIATE_ANALYSIS, RUNNER_PROMPT, NEXT_SNAPSHOT_OVERRIDE
     
     last_run_time = None
     last_interval_log = None
@@ -6435,6 +6457,10 @@ def run_scheduler():
         # Check if immediate analysis is requested (due to position discrepancy)
         if FORCE_IMMEDIATE_ANALYSIS:
             FORCE_IMMEDIATE_ANALYSIS = False  # Reset the flag
+            
+            # Clear any LLM snapshot override since we're taking an immediate screenshot
+            NEXT_SNAPSHOT_OVERRIDE = None
+            
             logging.info("="*80)
             logging.info("🚨 FORCE_IMMEDIATE_ANALYSIS triggered - Running immediate screenshot and LLM analysis")
             logging.info("="*80)
@@ -6494,6 +6520,12 @@ def run_scheduler():
         current_time = datetime.datetime.now()
         if last_run_time is None or (current_time - last_run_time).total_seconds() >= current_interval:
             logging.info(f"Running scheduled job (interval: {current_interval}s)")
+            
+            # Clear the LLM override after using it (it only applies to the NEXT screenshot)
+            if NEXT_SNAPSHOT_OVERRIDE is not None:
+                logging.debug(f"Clearing NEXT_SNAPSHOT_OVERRIDE ({NEXT_SNAPSHOT_OVERRIDE}s) - was used for this screenshot")
+                NEXT_SNAPSHOT_OVERRIDE = None
+            
             try:
                 # Call job directly instead of using schedule.run_pending()
                 job(

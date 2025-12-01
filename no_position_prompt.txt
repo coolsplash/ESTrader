@@ -50,6 +50,14 @@ Evaluate the following in every screenshot:
 •	Backside tests of broken levels holding cleanly
 ________________________________________
 IF YOU ARE WAITING FOR A SPECIFIC CONDITION
+When the previously stated "waiting_for" condition has occurred on the new screenshot,
+you MUST execute the corresponding trade unless the structure has clearly invalidated it.
+You are NOT allowed to add a new "waiting_for" requirement when the previous one has already been fulfilled.
+Once a waiting_for condition is completed, you MUST switch to a buy or sell decision immediately.
+The model must treat the previously stated "waiting_for" as the gating condition unless that has been completely invalidated and you are waiting for something new.
+When that condition is met, the setup is considered complete.
+Do NOT escalate to a new requirement.
+
 If the setup is developing but incomplete, explicitly state the confirming condition.
 Examples (these must appear literally as examples):
 "waiting_for": "Break above 6675 with aggressive buying and follow-through"
@@ -75,12 +83,12 @@ Apply these rules:
 •	You may take trades near news only if the setup is pristine AND stop placement protects against spikes.
 ________________________________________
 MARKET CONTEXT (Dynamic)
-{{Context}}
+{Context}
 PREVIOUS ANALYSIS TRACKING
 Waiting for:
-{{waiting_for}}
+{waiting_for}
 Key Levels:
-{{key_levels}}
+{key_levels}
 ________________________________________
 KEY LEVELS INSTRUCTIONS
 Identify and track 3–5 critical price levels that define current market structure. Update each iteration.

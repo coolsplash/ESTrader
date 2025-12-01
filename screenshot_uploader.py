@@ -1014,6 +1014,191 @@ def reconcile_closed_trades(topstep_config, enable_trading, auth_token):
         logging.error(f"Error reconciling trades: {e}")
         logging.exception("Full traceback:")
 
+def check_position_discrepancy(api_position_type, api_position_details):
+    """Compare local tracking (active_trade.json) against actual API results.
+    
+    Args:
+        api_position_type: Position type from API ('long', 'short', or 'none')
+        api_position_details: Full position details dict from API (or None if no position)
+    
+    Returns:
+        dict or None: Discrepancy details if mismatch found, None if everything matches
+        {
+            'type': 'full_close' | 'partial_close' | 'position_mismatch',
+            'local_position_type': str,
+            'api_position_type': str,
+            'local_quantity': int,
+            'api_quantity': int,
+            'local_entry_price': float,
+            'api_entry_price': float
+        }
+    """
+    try:
+        # Get local tracking info
+        trade_info = get_active_trade_info()
+        
+        # If no local tracking and no API position, everything matches
+        if not trade_info and api_position_type == 'none':
+            return None
+        
+        # Extract local tracking details
+        local_position_type = trade_info.get('position_type', 'none') if trade_info else 'none'
+        local_entry_price = trade_info.get('entry_price', 0) if trade_info else 0
+        
+        # For API position details
+        api_quantity = 0
+        api_entry_price = 0
+        if api_position_details:
+            # Extract quantity from various possible fields
+            api_quantity = (
+                api_position_details.get('quantity', 0) or 
+                api_position_details.get('size', 0) or 
+                api_position_details.get('netQuantity', 0)
+            )
+            # Extract entry price
+            api_entry_price = (
+                api_position_details.get('entryPrice', 0) or 
+                api_position_details.get('averagePrice', 0) or 
+                api_position_details.get('avgPrice', 0) or
+                0
+            )
+        
+        # SCENARIO 1: Full close - we think we have position but API shows none
+        if local_position_type in ['long', 'short'] and api_position_type == 'none':
+            logging.info(f"🔄 DISCREPANCY: Full position close detected")
+            logging.info(f"   Local tracking: {local_position_type.upper()} position")
+            logging.info(f"   API shows: NO POSITION")
+            return {
+                'type': 'full_close',
+                'local_position_type': local_position_type,
+                'api_position_type': api_position_type,
+                'local_quantity': 0,  # We don't track quantity in active_trade.json
+                'api_quantity': 0,
+                'local_entry_price': local_entry_price,
+                'api_entry_price': 0
+            }
+        
+        # SCENARIO 2: Partial close - both have positions but quantities differ
+        # Note: We don't currently track quantity in active_trade.json, so we can't detect this
+        # This would require enhancing active_trade.json to include quantity
+        
+        # SCENARIO 3: Position type mismatch - different position types
+        if local_position_type != api_position_type:
+            # This shouldn't happen normally, but handle it
+            logging.warning(f"🔄 DISCREPANCY: Position type mismatch")
+            logging.warning(f"   Local tracking: {local_position_type}")
+            logging.warning(f"   API shows: {api_position_type}")
+            return {
+                'type': 'position_mismatch',
+                'local_position_type': local_position_type,
+                'api_position_type': api_position_type,
+                'local_quantity': 0,
+                'api_quantity': api_quantity,
+                'local_entry_price': local_entry_price,
+                'api_entry_price': api_entry_price
+            }
+        
+        # Everything matches
+        return None
+        
+    except Exception as e:
+        logging.error(f"Error checking position discrepancy: {e}")
+        logging.exception("Full traceback:")
+        return None
+
+def correct_position_state(discrepancy, api_position_type, api_position_details, working_orders, 
+                           topstep_config, enable_trading, auth_token):
+    """Update all system state to match TRUE position from API.
+    
+    This function corrects the system's internal state when a discrepancy is detected between
+    what we think we have (active_trade.json) and what the API actually shows.
+    
+    Args:
+        discrepancy: Dict with discrepancy details from check_position_discrepancy()
+        api_position_type: Current position type from API ('long', 'short', 'none')
+        api_position_details: Full position details from API
+        working_orders: Current working orders from API
+        topstep_config: TopstepX configuration dict
+        enable_trading: Whether trading is enabled
+        auth_token: Authentication token for API calls
+    
+    Returns:
+        bool: True if state was successfully corrected, False otherwise
+    """
+    global ACCOUNT_BALANCE, LAST_RECONCILIATION_TIME
+    
+    try:
+        discrepancy_type = discrepancy.get('type')
+        local_position_type = discrepancy.get('local_position_type')
+        
+        # Log the discrepancy clearly
+        logging.info("="*80)
+        logging.info("🔄 POSITION DISCREPANCY DETECTED - CORRECTING STATE")
+        logging.info(f"Discrepancy Type: {discrepancy_type}")
+        logging.info(f"Local tracking showed: {local_position_type}")
+        logging.info(f"API actually shows: {api_position_type}")
+        logging.info("="*80)
+        
+        # Handle different discrepancy types
+        if discrepancy_type == 'full_close':
+            # Position was closed - run existing reconciliation to log the closure
+            logging.info("Running reconcile_closed_trades() to fetch and log exit details...")
+            reconcile_closed_trades(topstep_config, enable_trading, auth_token)
+            
+            # Clear local tracking (reconcile_closed_trades should do this, but double-check)
+            trade_info = get_active_trade_info()
+            if trade_info:
+                logging.info("Clearing active_trade.json after reconciliation")
+                clear_active_trade_info()
+        
+        elif discrepancy_type == 'partial_close':
+            # Partial close detected - update quantity in active_trade.json
+            # Note: Current implementation doesn't track quantity in active_trade.json
+            # For now, just log it
+            logging.info("Partial close detected - not currently handled in active_trade.json")
+            logging.info("System will continue with existing position tracking")
+        
+        elif discrepancy_type == 'position_mismatch':
+            # Unexpected position mismatch - update to match API
+            logging.warning("Position mismatch - updating local tracking to match API")
+            if api_position_type == 'none':
+                clear_active_trade_info()
+            else:
+                # API shows a position we don't have tracked - this is unusual
+                # Just log it for now, don't try to create tracking
+                logging.warning("API shows position but we have no/different local tracking")
+                logging.warning("This may indicate manual trading or system restart")
+        
+        # Query and update account balance
+        logging.info("Querying account balance...")
+        balance = get_account_balance(topstep_config['account_id'], topstep_config, enable_trading, auth_token)
+        if balance is not None:
+            ACCOUNT_BALANCE = balance
+            logging.info(f"Account balance updated: ${balance:,.2f}")
+        else:
+            logging.warning("Could not retrieve account balance")
+        
+        # Update dashboard if visible
+        try:
+            update_dashboard_data()
+            logging.info("Dashboard updated with corrected position state")
+        except Exception as e:
+            logging.debug(f"Dashboard update skipped: {e}")
+        
+        # Update reconciliation timestamp
+        LAST_RECONCILIATION_TIME = datetime.datetime.now()
+        
+        logging.info("="*80)
+        logging.info("✅ POSITION STATE CORRECTED - System now matches API reality")
+        logging.info("="*80)
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error correcting position state: {e}")
+        logging.exception("Full traceback:")
+        return False
+
 def send_telegram_message(message, telegram_config):
     """Send a message to Telegram chat."""
     try:
@@ -2005,25 +2190,15 @@ def show_dashboard(root=None):
         
         dashboard.title("ES Trader Dashboard")
         if is_initial_build:
-            dashboard.geometry("500x750")
+            dashboard.geometry("550x850")
         dashboard.configure(bg='#1e1e1e')
         
         # Get current data - verify position from API if trading is enabled
         trade_info = get_active_trade_info()
         
-        # Verify position is actually active by checking API
-        if trade_info and ENABLE_TRADING:
-            try:
-                auth_token = authenticate_topstep(TOPSTEP_CONFIG) if not AUTH_TOKEN else AUTH_TOKEN
-                if auth_token:
-                    actual_position = get_current_position(SYMBOL, TOPSTEP_CONFIG, ENABLE_TRADING, auth_token)
-                    # If API says no position but we have trade_info, clear the stale file
-                    if actual_position == 'none':
-                        logging.info("Dashboard: Clearing stale active_trade.json - API shows no position")
-                        clear_active_trade_info()
-                        trade_info = None
-            except Exception as e:
-                logging.error(f"Dashboard: Error verifying position: {e}")
+        # Note: Position verification is now handled by reconciliation in job() and run_trade_monitor()
+        # Dashboard simply displays what's in active_trade.json without modifying it
+        # This prevents race conditions and duplicate reconciliation
         
         llm_data = get_latest_llm_data()
         
@@ -2753,8 +2928,20 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             
             # Reconcile trades (check for positions closed by stop/target)
             # This checks both local tracking and Supabase for unclosed trades
-            reconcile_closed_trades(topstep_config, enable_trading, auth_token)
-            reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token)
+            # Skip if reconciliation was just done by trade monitor (within last 5 seconds)
+            global LAST_RECONCILIATION_TIME
+            should_reconcile = True
+            if LAST_RECONCILIATION_TIME:
+                time_since_reconciliation = (datetime.datetime.now() - LAST_RECONCILIATION_TIME).total_seconds()
+                if time_since_reconciliation < 5:
+                    should_reconcile = False
+                    logging.debug(f"Skipping reconciliation - just handled by trade monitor {time_since_reconciliation:.1f}s ago")
+            
+            if should_reconcile:
+                reconcile_closed_trades(topstep_config, enable_trading, auth_token)
+                reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token)
+            else:
+                logging.debug("Using position state from recent reconciliation")
             
             # Update dashboard with latest position data and balance
             update_dashboard_data()
@@ -5521,6 +5708,10 @@ SESSION_START_BALANCE = None  # Balance at 18:00 session start
 SESSION_START_TIME = None  # When the trading session started
 CURRENT_RPL = 0.0  # Current session realized profit/loss
 
+# Position reconciliation tracking
+FORCE_IMMEDIATE_ANALYSIS = False  # Flag to trigger immediate screenshot and LLM analysis when discrepancy detected
+LAST_RECONCILIATION_TIME = None  # Timestamp of last reconciliation to prevent duplicates
+
 # Global Supabase client
 SUPABASE_CLIENT = None
 
@@ -6235,12 +6426,56 @@ def run_scheduler():
     global SHORT_POSITION_PROMPT, MODEL, TOPSTEP_CONFIG, ENABLE_LLM, ENABLE_TRADING
     global OPENAI_API_URL, OPENAI_API_KEY, ENABLE_SAVE_SCREENSHOTS, AUTH_TOKEN
     global EXECUTE_TRADES, TELEGRAM_CONFIG, NO_NEW_TRADES_WINDOWS, FORCE_CLOSE_TIME
-    global LAST_JOB_TIME
+    global LAST_JOB_TIME, FORCE_IMMEDIATE_ANALYSIS, RUNNER_PROMPT
     
     last_run_time = None
     last_interval_log = None
     
     while running:
+        # Check if immediate analysis is requested (due to position discrepancy)
+        if FORCE_IMMEDIATE_ANALYSIS:
+            FORCE_IMMEDIATE_ANALYSIS = False  # Reset the flag
+            logging.info("="*80)
+            logging.info("🚨 FORCE_IMMEDIATE_ANALYSIS triggered - Running immediate screenshot and LLM analysis")
+            logging.info("="*80)
+            try:
+                # Run job immediately with corrected state
+                job(
+                    window_title=WINDOW_TITLE,
+                    window_process_name=WINDOW_PROCESS_NAME,
+                    top_offset=TOP_OFFSET,
+                    bottom_offset=BOTTOM_OFFSET,
+                    left_offset=LEFT_OFFSET,
+                    right_offset=RIGHT_OFFSET,
+                    save_folder=SAVE_FOLDER,
+                    begin_time=BEGIN_TIME,
+                    end_time=END_TIME,
+                    symbol=SYMBOL,
+                    position_type=POSITION_TYPE,
+                    no_position_prompt=NO_POSITION_PROMPT,
+                    long_position_prompt=LONG_POSITION_PROMPT,
+                    short_position_prompt=SHORT_POSITION_PROMPT,
+                    runner_prompt=RUNNER_PROMPT,
+                    model=MODEL,
+                    topstep_config=TOPSTEP_CONFIG,
+                    enable_llm=ENABLE_LLM,
+                    enable_trading=ENABLE_TRADING,
+                    openai_api_url=OPENAI_API_URL,
+                    openai_api_key=OPENAI_API_KEY,
+                    enable_save_screenshots=ENABLE_SAVE_SCREENSHOTS,
+                    auth_token=AUTH_TOKEN,
+                    execute_trades=EXECUTE_TRADES,
+                    telegram_config=TELEGRAM_CONFIG,
+                    no_new_trades_windows=NO_NEW_TRADES_WINDOWS,
+                    force_close_time=FORCE_CLOSE_TIME
+                )
+                last_run_time = datetime.datetime.now()
+                LAST_JOB_TIME = last_run_time
+                logging.info("✅ Immediate analysis completed - Position state now correct for LLM")
+            except Exception as e:
+                logging.error(f"Error running immediate analysis job: {e}")
+                logging.exception("Full traceback:")
+        
         current_interval = get_current_interval()
         
         # Log interval changes (but not on every iteration)
@@ -6301,7 +6536,7 @@ def run_scheduler():
 
 def run_trade_monitor():
     """Background thread to continuously monitor trade status (smart monitoring - only when needed)."""
-    global running, ACCOUNT_BALANCE, monitoring_enabled
+    global running, ACCOUNT_BALANCE, monitoring_enabled, FORCE_IMMEDIATE_ANALYSIS
     last_active_state = None
     last_position_type = 'none'  # Track last known position
     initial_check_done = False  # Track if we've done the initial startup check
@@ -6322,9 +6557,32 @@ def run_trade_monitor():
             
             # Only check trades during trading hours
             if is_within_time_range(BEGIN_TIME, END_TIME):
-                # Get current position
-                current_position_type = get_current_position(SYMBOL, TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
+                # Get current position with details
+                current_position_type, position_details, working_orders = get_current_position(
+                    SYMBOL, TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN, return_details=True
+                )
                 is_active = current_position_type in ['long', 'short']
+                
+                # Check for position discrepancies between local tracking and API
+                discrepancy = check_position_discrepancy(current_position_type, position_details)
+                if discrepancy:
+                    logging.info("⚠️ DISCREPANCY DETECTED in trade monitor - correcting state")
+                    
+                    # Correct the system state to match API reality
+                    success = correct_position_state(
+                        discrepancy,
+                        current_position_type,
+                        position_details,
+                        working_orders,
+                        TOPSTEP_CONFIG,
+                        ENABLE_TRADING,
+                        AUTH_TOKEN
+                    )
+                    
+                    if success:
+                        # Set flag to trigger immediate screenshot and LLM analysis
+                        FORCE_IMMEDIATE_ANALYSIS = True
+                        logging.info("🔄 FORCE_IMMEDIATE_ANALYSIS flag set - will trigger screenshot on next scheduler tick")
                 
                 # Initial startup check - disable monitoring if no position found
                 if not initial_check_done:

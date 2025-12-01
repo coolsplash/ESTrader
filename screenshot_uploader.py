@@ -1622,6 +1622,21 @@ def show_dashboard(root=None):
                     DASHBOARD_WIDGETS['reasoning_text'].insert(1.0, llm_data.get('reasoning', 'N/A'))
                     DASHBOARD_WIDGETS['reasoning_text'].config(state=tk.DISABLED)
                 
+                # Update waiting_for text if available
+                waiting_for_value = llm_data.get('waiting_for', '')
+                if waiting_for_value and waiting_for_value.strip():
+                    if 'waiting_for_text' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['waiting_for_text'].config(state=tk.NORMAL)
+                        DASHBOARD_WIDGETS['waiting_for_text'].delete(1.0, tk.END)
+                        DASHBOARD_WIDGETS['waiting_for_text'].insert(1.0, waiting_for_value)
+                        DASHBOARD_WIDGETS['waiting_for_text'].config(state=tk.DISABLED)
+                else:
+                    # Hide waiting_for widgets if no data
+                    if 'waiting_for_title' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['waiting_for_title'].pack_forget()
+                    if 'waiting_for_text' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['waiting_for_text'].pack_forget()
+                
                 # Market Context temporarily hidden
                 # if 'context_text' in DASHBOARD_WIDGETS:
                 #     DASHBOARD_WIDGETS['context_text'].config(state=tk.NORMAL)
@@ -1630,8 +1645,14 @@ def show_dashboard(root=None):
                 #     DASHBOARD_WIDGETS['context_text'].config(state=tk.DISABLED)
                 
                 # Show LLM data widgets, hide no-data label (context temporarily hidden)
-                for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
-                           'reasoning_title', 'reasoning_text']:
+                widget_keys = ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
+                              'reasoning_title', 'reasoning_text']
+                
+                # Add waiting_for widgets if data exists
+                if waiting_for_value and waiting_for_value.strip():
+                    widget_keys.extend(['waiting_for_title', 'waiting_for_text'])
+                
+                for key in widget_keys:
                     if key in DASHBOARD_WIDGETS:
                         if 'text' in key:
                             # Text widgets need fill="x" not anchor
@@ -1643,7 +1664,7 @@ def show_dashboard(root=None):
             else:
                 # Hide LLM widgets, show no-data label (context temporarily hidden)
                 for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
-                           'reasoning_title', 'reasoning_text']:
+                           'reasoning_title', 'reasoning_text', 'waiting_for_title', 'waiting_for_text']:
                     if key in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS[key].pack_forget()
                 if 'no_llm_label' in DASHBOARD_WIDGETS:

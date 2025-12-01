@@ -7,6 +7,7 @@ Focus on asymmetric, high-conviction conditions such as:
 - Aggressive taker initiative AFTER a reclaim is confirmed
 - Liquidity flipping (resistance to support or support to resistance)
 If these conditions are clearly developing BUT NOT COMPLETE, you must state exactly what confirming condition you are waiting for.
+If conditions have changed and what you were previously waiting for is no longer relevant, state what you are currently waiting for, if anything.
 TREND CONTINUATION SIGNALS
 You may enter continuation trades when:
 - Clean market structure (higher-highs/higher-lows for longs or lower-highs/lower-lows for shorts)

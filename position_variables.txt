@@ -130,3 +130,275 @@ USAGE NOTES
 5. JSON-structured variables ({Context}) should maintain their formatting when replaced
 6. Numeric variables should maintain appropriate precision (2 decimals for prices, etc.)
 
+
+================================================================================
+LLM RESPONSE FORMAT
+================================================================================
+
+The LLM must respond with valid JSON containing an "action" field and additional
+fields depending on the current position state. The system parses this JSON and
+executes trades accordingly.
+
+
+NO POSITION - ENTRY ANALYSIS RESPONSE
+---------------------------------------
+
+When no position is open, the LLM analyzes for new entry opportunities.
+
+AVAILABLE ACTIONS:
+- "buy"  - Open a long position
+- "sell" - Open a short position
+- "hold" - Don't enter a position yet (wait for better setup)
+
+REQUIRED JSON RESPONSE FORMAT:
+
+{
+  "action": "buy|sell|hold",
+  "entry_price": 6000.25,
+  "price_target": 6025.00,
+  "stop_loss": 5992.50,
+  "confidence": "high",
+  "reasoning": "ES showing strong buying pressure at support with delta confirmation. Liquidity stacked above supports continuation to 6025 target.",
+  "waiting_for": "Break above 6010 with volume confirmation",
+  "key_levels": [
+    {"price": 6000.00, "type": "support", "reason": "Volume shelf and prior low"},
+    {"price": 6025.00, "type": "resistance", "reason": "PDH and liquidity wall"},
+    {"price": 5992.50, "type": "stop", "reason": "Below structure invalidation"}
+  ],
+  "context": "Market showing bullish structure with higher lows. Strong bid support at 6000.",
+  "next_snapshot": 60
+}
+
+FIELD DESCRIPTIONS:
+
+action (string, REQUIRED)
+    Values: "buy", "sell", "hold"
+    Purpose: Determines if/what trade to execute
+    
+entry_price (number, optional)
+    Purpose: Desired entry price for limit orders
+    Notes: Currently system uses market orders, but field is logged
+    
+price_target (number, REQUIRED for buy/sell)
+    Purpose: Take profit level - system places limit order at this price
+    Format: Decimal price (e.g., 6025.00)
+    
+stop_loss (number, REQUIRED for buy/sell)
+    Purpose: Stop loss level - system places stop order at this price
+    Format: Decimal price (e.g., 5992.50)
+    
+confidence (string, optional)
+    Values: "high", "medium", "low"
+    Purpose: Logged for trade analysis and performance review
+    Notes: Does not affect trade execution
+    
+reasoning (string, REQUIRED)
+    Purpose: Trade thesis and setup explanation
+    Usage: Logged to CSV/Supabase, sent via Telegram notifications
+    Notes: Should include key factors: structure, delta, liquidity, levels
+    
+waiting_for (string, optional)
+    Purpose: Condition being monitored before taking action
+    Behavior: Persists across cycles until position is entered
+    Usage: Shown in next prompt as {waiting_for} variable
+    Example: "Break above 6010 with aggressive buying and follow-through"
+    Notes: Cleared when position is entered (buy/sell executed)
+    
+key_levels (array of objects, optional)
+    Purpose: Key price levels being tracked by the LLM
+    Behavior: Persists across entire trade lifecycle (NOT cleared on entry)
+    Usage: Shown in all subsequent prompts as {key_levels} variable
+    Format: Array of {"price": number, "type": string, "reason": string}
+    Types: "support", "resistance", "POC", "pivot", "target", "stop_trail"
+    Example: [
+        {"price": 6000.00, "type": "support", "reason": "Volume shelf"},
+        {"price": 6025.00, "type": "resistance", "reason": "PDH"}
+    ]
+    Notes: LLM can update/add/remove levels each iteration
+    
+context (string, optional)
+    Purpose: Updated market context to save for future reference
+    Behavior: Saved to daily context file, available in future cycles
+    Usage: Market structure observations, trend notes, key insights
+    
+next_snapshot (integer, optional)
+    Purpose: Seconds until next analysis (dynamic interval control)
+    Range: Positive integer (e.g., 30, 60, 120, 300)
+    Behavior: Overrides scheduled interval for next cycle only
+    Usage: Request faster updates during critical setups or slower during quiet periods
+    Example: 30 for active setup, 300 for waiting period
+
+
+POSITION OPEN - POSITION MANAGEMENT RESPONSE
+---------------------------------------------
+
+When a position is open, the LLM manages the existing position.
+
+AVAILABLE ACTIONS:
+- "close"  - Close the entire position immediately
+- "scale"  - Partially close position (scale out to runner quantity)
+- "adjust" - Modify stop loss and/or take profit levels
+- "hold"   - Keep position as-is (no changes)
+
+REQUIRED JSON RESPONSE FORMAT:
+
+{
+  "action": "close|scale|adjust|hold",
+  "price_target": 6030.00,
+  "stop_loss": 6005.00,
+  "reasoning": "Moving stop to breakeven as target approaches. Strong momentum continues.",
+  "key_levels": [
+    {"price": 6015.25, "type": "entry", "reason": "Original entry point"},
+    {"price": 6030.00, "type": "target", "reason": "Primary profit target"},
+    {"price": 6005.00, "type": "stop_trail", "reason": "Trailing stop at breakeven"}
+  ],
+  "context": "Position in profit, trailing stop to protect gains."
+}
+
+FIELD DESCRIPTIONS:
+
+action (string, REQUIRED)
+    Values: "close", "scale", "adjust", "hold"
+    
+    "close" - Closes entire position with market order
+        Use when: Setup invalidated, target reached, risk management
+        
+    "scale" - Partially closes position down to runner quantity
+        Use when: Taking partial profits while leaving runners
+        Behavior: Closes (total_quantity - runners_quantity) contracts
+        Config: runners_quantity set in config.ini
+        Example: If quantity=3 and runners_quantity=1, closes 2 contracts
+        
+    "adjust" - Modifies stop loss and/or take profit orders
+        Use when: Trailing stops, adjusting targets, tightening risk
+        Behavior: Cancels existing orders, places new ones at specified levels
+        Note: Also triggered if action="hold" but new price_target/stop_loss provided
+        
+    "hold" - No changes to position
+        Use when: Position structure intact, no adjustments needed
+        
+price_target (number, optional for hold/close, REQUIRED for adjust)
+    Purpose: New take profit level
+    Behavior: System cancels old limit order and places new one
+    Format: Decimal price (e.g., 6030.00)
+    
+stop_loss (number, optional for hold/close, REQUIRED for adjust)
+    Purpose: New stop loss level
+    Behavior: System cancels old stop order and places new one
+    Format: Decimal price (e.g., 6005.00)
+    Notes: Common use cases - trail stop, move to breakeven, tighten risk
+    
+reasoning (string, REQUIRED)
+    Purpose: Explanation for position management decision
+    Usage: Logged and sent via Telegram
+    Examples:
+        - "Target reached, taking profits"
+        - "Setup invalidated, cutting loss"
+        - "Trailing stop to breakeven as momentum continues"
+        - "Scaling out at resistance, leaving runners for extension"
+        
+key_levels (array of objects, optional)
+    Purpose: Updated key levels for continued tracking
+    Behavior: Persists across position lifecycle
+    Usage: Same format as entry response
+    Notes: Should include entry price, current targets, trailing stops
+    
+context (string, optional)
+    Purpose: Updated market observations
+    Behavior: Saved to daily context file
+
+
+SPECIAL BEHAVIORS
+-----------------
+
+ADJUST via HOLD:
+If action="hold" BUT price_target AND stop_loss are both provided,
+the system treats it as action="adjust" and modifies the orders.
+
+Example:
+{
+  "action": "hold",
+  "price_target": 6030.00,
+  "stop_loss": 6010.00,
+  "reasoning": "Trailing stop to breakeven while holding position"
+}
+This will adjust the stops/targets even though action is "hold".
+
+
+RESPONSE PARSING
+----------------
+
+The system strips markdown code fences if present:
+- Strips ```json ... ``` wrapper
+- Strips ``` ... ``` wrapper
+- Then parses as JSON
+
+Valid response formats:
+1. Pure JSON: {"action": "buy", ...}
+2. Markdown wrapped: ```json\n{"action": "buy", ...}\n```
+3. Generic fence: ```\n{"action": "buy", ...}\n```
+
+
+ERROR HANDLING
+--------------
+
+Invalid JSON:
+- System logs error and continues monitoring
+- No trade executed
+- Next cycle will retry analysis
+
+Missing required fields:
+- action missing: No trade executed
+- price_target/stop_loss missing for buy/sell: Trade may fail
+- reasoning missing: Logged as "N/A"
+
+Invalid action values:
+- Unknown action: Logged as warning, no trade executed
+- Case insensitive: "BUY", "buy", "Buy" all work
+
+Legacy actions:
+- "flatten": Not implemented, logs error (use "close" instead)
+
+
+LOGGING AND NOTIFICATIONS
+--------------------------
+
+All LLM interactions are logged to:
+1. Daily CSV file (llm_interactions_YYYY-MM-DD.csv)
+2. System log file (app.log)
+
+Trade events are logged to:
+1. Trade log CSV (trades_log.csv)
+2. Supabase database (if configured)
+3. Telegram notifications (if configured)
+
+Each log includes:
+- Timestamp
+- Action taken
+- All prices (entry, target, stop)
+- Reasoning
+- Confidence level
+- Market context
+- Key levels
+- Waiting conditions
+
+
+DASHBOARD DISPLAY
+------------------
+
+The system dashboard shows:
+- Current action (color-coded)
+- Latest reasoning
+- Key levels
+- Position status
+- Profit/Loss
+- Account balance
+
+Action colors:
+- BUY: Green
+- SELL: Red
+- HOLD: Orange/Yellow
+- CLOSE: Red
+- ADJUST: Blue
+- SCALE: Orange/Yellow
+

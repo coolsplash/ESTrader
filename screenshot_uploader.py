@@ -1024,7 +1024,7 @@ def check_position_discrepancy(api_position_type, api_position_details):
     Returns:
         dict or None: Discrepancy details if mismatch found, None if everything matches
         {
-            'type': 'full_close' | 'partial_close' | 'position_mismatch',
+            'type': 'full_close' | 'partial_close' | 'position_mismatch' | 'untracked_position',
             'local_position_type': str,
             'api_position_type': str,
             'local_quantity': int,
@@ -1040,6 +1040,39 @@ def check_position_discrepancy(api_position_type, api_position_details):
         # If no local tracking and no API position, everything matches
         if not trade_info and api_position_type == 'none':
             return None
+        
+        # SCENARIO: API shows position but we have no local tracking
+        # This happens when: system restart, manual entry, or tracking lost
+        if not trade_info and api_position_type in ['long', 'short']:
+            logging.warning(f"🔄 DISCREPANCY: Untracked position detected!")
+            logging.warning(f"   Local tracking: NO POSITION")
+            logging.warning(f"   API shows: {api_position_type.upper()} position")
+            
+            # Extract API position details
+            api_quantity = 0
+            api_entry_price = 0
+            if api_position_details:
+                api_quantity = (
+                    api_position_details.get('quantity', 0) or 
+                    api_position_details.get('size', 0) or 
+                    api_position_details.get('netQuantity', 0)
+                )
+                api_entry_price = (
+                    api_position_details.get('entryPrice', 0) or 
+                    api_position_details.get('averagePrice', 0) or 
+                    api_position_details.get('avgPrice', 0) or
+                    0
+                )
+            
+            return {
+                'type': 'untracked_position',
+                'local_position_type': 'none',
+                'api_position_type': api_position_type,
+                'local_quantity': 0,
+                'api_quantity': api_quantity,
+                'local_entry_price': 0,
+                'api_entry_price': api_entry_price
+            }
         
         # Extract local tracking details
         local_position_type = trade_info.get('position_type', 'none') if trade_info else 'none'
@@ -1157,6 +1190,68 @@ def correct_position_state(discrepancy, api_position_type, api_position_details,
             # For now, just log it
             logging.info("Partial close detected - not currently handled in active_trade.json")
             logging.info("System will continue with existing position tracking")
+        
+        elif discrepancy_type == 'untracked_position':
+            # Position opened manually from broker - create tracking for it
+            logging.info("📊 Untracked position detected - creating tracking for manually-opened position")
+            
+            if api_position_details:
+                # Extract position details from API
+                api_entry_price = api_position_details.get('average_price') or api_position_details.get('averagePrice') or api_position_details.get('entryPrice') or 0
+                api_symbol = api_position_details.get('symbol', 'UNKNOWN')
+                api_quantity = abs(api_position_details.get('quantity', 0) or api_position_details.get('size', 0))
+                
+                # Parse working orders to get stop loss and take profit
+                contract_id = topstep_config.get('contract_id', '')
+                order_info = parse_working_orders(working_orders, contract_id)
+                current_stop_loss = order_info.get('stop_loss_price')
+                current_take_profit = order_info.get('take_profit_price')
+                
+                # Generate a unique order ID for tracking
+                order_id = f"MANUAL_{api_position_type.upper()}_{int(datetime.datetime.now().timestamp())}"
+                
+                # Save active trade info
+                entry_timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+                save_active_trade_info(
+                    order_id=order_id,
+                    entry_price=api_entry_price,
+                    position_type=api_position_type,
+                    entry_timestamp=entry_timestamp,
+                    stop_loss=current_stop_loss,
+                    price_target=current_take_profit,
+                    reasoning="Position opened manually from broker - detected by system"
+                )
+                
+                logging.info(f"✅ Created tracking for {api_position_type.upper()} position @ {api_entry_price}")
+                logging.info(f"   Stop Loss: {current_stop_loss}, Take Profit: {current_take_profit}")
+                
+                # Log ENTRY event to trade log and Supabase
+                balance = get_account_balance(topstep_config['account_id'], topstep_config, enable_trading, auth_token)
+                log_trade_event(
+                    event_type='ENTRY',
+                    symbol=api_symbol,
+                    position_type=api_position_type,
+                    size=api_quantity,
+                    price=api_entry_price,
+                    stop_loss=current_stop_loss,
+                    take_profit=current_take_profit,
+                    reasoning="Position opened manually from broker - detected by system",
+                    confidence=None,
+                    profit_loss=None,
+                    profit_loss_points=None,
+                    balance=balance,
+                    market_context=None,
+                    order_id=order_id,
+                    entry_price=api_entry_price
+                )
+                
+                # Update global position tracking
+                global PREVIOUS_POSITION_TYPE
+                PREVIOUS_POSITION_TYPE = api_position_type
+                
+                logging.info("✅ ENTRY event logged for manually-opened position")
+            else:
+                logging.warning("No API position details available - cannot create tracking")
         
         elif discrepancy_type == 'position_mismatch':
             # Unexpected position mismatch - update to match API
@@ -2925,6 +3020,42 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             if balance is not None:
                 global ACCOUNT_BALANCE
                 ACCOUNT_BALANCE = balance
+            
+            # Check for position discrepancies (e.g., positions opened manually from broker)
+            discrepancy = check_position_discrepancy(current_position_type, position_details)
+            if discrepancy:
+                logging.info("⚠️ DISCREPANCY DETECTED in main job - correcting state")
+                
+                # Handle untracked position (opened manually from broker)
+                if discrepancy.get('type') == 'untracked_position':
+                    logging.info("📊 Detected untracked position opened from broker - updating system state")
+                    
+                    # Correct the system state to match API reality
+                    success = correct_position_state(
+                        discrepancy,
+                        current_position_type,
+                        position_details,
+                        working_orders,
+                        topstep_config,
+                        enable_trading,
+                        auth_token
+                    )
+                    
+                    if success:
+                        logging.info("✅ System state corrected for manually-opened position")
+                    else:
+                        logging.warning("⚠️ Failed to correct system state")
+                else:
+                    # Other discrepancy types (full_close, position_mismatch, etc.)
+                    correct_position_state(
+                        discrepancy,
+                        current_position_type,
+                        position_details,
+                        working_orders,
+                        topstep_config,
+                        enable_trading,
+                        auth_token
+                    )
             
             # Reconcile trades (check for positions closed by stop/target)
             # This checks both local tracking and Supabase for unclosed trades

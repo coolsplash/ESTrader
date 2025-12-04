@@ -139,9 +139,15 @@ The LLM must respond with valid JSON containing an "action" field and additional
 fields depending on the current position state. The system parses this JSON and
 executes trades accordingly.
 
+There are THREE response formats depending on which prompt is active:
+1. No Position (no_position_prompt.txt) - Entry analysis
+2. Position Open (position_prompt.txt) - Full position management
+3. Runner Management (runner_prompt.txt) - Managing runner contracts after scaling
 
-NO POSITION - ENTRY ANALYSIS RESPONSE
----------------------------------------
+
+================================================================================
+1. NO POSITION - ENTRY ANALYSIS RESPONSE (no_position_prompt.txt)
+================================================================================
 
 When no position is open, the LLM analyzes for new entry opportunities.
 
@@ -153,20 +159,23 @@ AVAILABLE ACTIONS:
 REQUIRED JSON RESPONSE FORMAT:
 
 {
-  "action": "buy|sell|hold",
-  "entry_price": 6000.25,
-  "price_target": 6025.00,
-  "stop_loss": 5992.50,
-  "confidence": "high",
-  "reasoning": "ES showing strong buying pressure at support with delta confirmation. Liquidity stacked above supports continuation to 6025 target.",
-  "waiting_for": "Break above 6010 with volume confirmation",
+  "action": "buy" | "sell" | "hold",
+  "entry_price": number | null,
+  "price_target": number | null,
+  "stop_loss": number | null,
+  "confidence": 0-100,
+  "reasoning": "2-3 sentences explaining the setup.",
+  "context": "How price is interacting with key levels.",
+  "waiting_for": "What confirmation (if any) is needed, or null.",
+  "next_snapshot": number,
   "key_levels": [
-    {"price": 6000.00, "type": "support", "reason": "Volume shelf and prior low"},
-    {"price": 6025.00, "type": "resistance", "reason": "PDH and liquidity wall"},
-    {"price": 5992.50, "type": "stop", "reason": "Below structure invalidation"}
+    {
+      "price": 6000.00,
+      "type": "support",
+      "reason": "volume shelf"
+    }
   ],
-  "context": "Market showing bullish structure with higher lows. Strong bid support at 6000.",
-  "next_snapshot": 60
+  "suggestion": "Optional feedback to improve prompt or screenshot, or null."
 }
 
 FIELD DESCRIPTIONS:
@@ -175,158 +184,323 @@ action (string, REQUIRED)
     Values: "buy", "sell", "hold"
     Purpose: Determines if/what trade to execute
     
-entry_price (number, optional)
+entry_price (number | null, optional)
     Purpose: Desired entry price for limit orders
     Notes: Currently system uses market orders, but field is logged
+    Rules: When "hold", set to null
     
-price_target (number, REQUIRED for buy/sell)
+price_target (number | null, REQUIRED for buy/sell)
     Purpose: Take profit level - system places limit order at this price
     Format: Decimal price (e.g., 6025.00)
+    Rules: When "hold", set to null
     
-stop_loss (number, REQUIRED for buy/sell)
+stop_loss (number | null, REQUIRED for buy/sell)
     Purpose: Stop loss level - system places stop order at this price
     Format: Decimal price (e.g., 5992.50)
+    Rules: When "hold", set to null
     
-confidence (string, optional)
-    Values: "high", "medium", "low"
-    Purpose: Logged for trade analysis and performance review
+confidence (integer 0-100, REQUIRED)
+    Purpose: Confidence level for the trade decision
+    Range: 0 (no confidence) to 100 (maximum confidence)
+    Usage: Logged for trade analysis and performance review
     Notes: Does not affect trade execution
     
 reasoning (string, REQUIRED)
-    Purpose: Trade thesis and setup explanation
+    Purpose: Trade thesis and setup explanation (2-3 sentences)
     Usage: Logged to CSV/Supabase, sent via Telegram notifications
     Notes: Should include key factors: structure, delta, liquidity, levels
     
-waiting_for (string, optional)
+context (string, REQUIRED)
+    Purpose: How price is interacting with key levels
+    Behavior: Saved to daily context file, available in future cycles
+    Usage: Market structure observations, trend notes, key insights
+    
+waiting_for (string | null, optional)
     Purpose: Condition being monitored before taking action
     Behavior: Persists across cycles until position is entered
     Usage: Shown in next prompt as {waiting_for} variable
     Example: "Break above 6010 with aggressive buying and follow-through"
-    Notes: Cleared when position is entered (buy/sell executed)
+    Notes: Cleared when position is entered (buy/sell executed); set to null if not waiting
     
-key_levels (array of objects, optional)
-    Purpose: Key price levels being tracked by the LLM
+next_snapshot (integer, REQUIRED)
+    Purpose: Seconds until next analysis (dynamic interval control)
+    Range: Positive integer (e.g., 10, 25, 30, 45, 60, 300)
+    Behavior: Overrides scheduled interval for next cycle only
+    Guidelines:
+        - Fast-forming setup: 10-25s
+        - Developing setup: 30-45s
+        - Slow market: 60-300s
+    
+key_levels (array of objects, REQUIRED)
+    Purpose: Key price levels being tracked by the LLM (3-5 critical levels)
     Behavior: Persists across entire trade lifecycle (NOT cleared on entry)
     Usage: Shown in all subsequent prompts as {key_levels} variable
     Format: Array of {"price": number, "type": string, "reason": string}
-    Types: "support", "resistance", "POC", "pivot", "target", "stop_trail"
+    Types: "support", "resistance", "pivot", "liquidity", "iceberg", "POC", "target", etc.
     Example: [
         {"price": 6000.00, "type": "support", "reason": "Volume shelf"},
         {"price": 6025.00, "type": "resistance", "reason": "PDH"}
     ]
-    Notes: LLM can update/add/remove levels each iteration
+    Notes: LLM should update as structure evolves each iteration
     
-context (string, optional)
-    Purpose: Updated market context to save for future reference
-    Behavior: Saved to daily context file, available in future cycles
-    Usage: Market structure observations, trend notes, key insights
-    
-next_snapshot (integer, optional)
-    Purpose: Seconds until next analysis (dynamic interval control)
-    Range: Positive integer (e.g., 30, 60, 120, 300)
-    Behavior: Overrides scheduled interval for next cycle only
-    Usage: Request faster updates during critical setups or slower during quiet periods
-    Example: 30 for active setup, 300 for waiting period
+suggestion (string | null, optional)
+    Purpose: Meta-feedback for improving prompt or screenshot
+    Usage: LLM can flag issues or suggest improvements
+    Examples:
+        - "Screenshot too zoomed out - key levels hard to read"
+        - "Add delta/CVD indicator for clearer flow analysis"
+        - "Prompt should specify max hold time for scalps"
+        - "Consider adding volume profile overlay"
+    Notes: Set to null if no suggestions; logged for review
 
 
-POSITION OPEN - POSITION MANAGEMENT RESPONSE
----------------------------------------------
+================================================================================
+2. POSITION OPEN - POSITION MANAGEMENT RESPONSE (position_prompt.txt)
+================================================================================
 
-When a position is open, the LLM manages the existing position.
+When a position is open (and not yet scaled to runners), the LLM manages the position.
 
 AVAILABLE ACTIONS:
-- "close"  - Close the entire position immediately
-- "scale"  - Partially close position (scale out to runner quantity)
-- "adjust" - Modify stop loss and/or take profit levels
 - "hold"   - Keep position as-is (no changes)
+- "scale"  - Partially close position (scale out, leave runners)
+- "adjust" - Modify stop loss and/or take profit levels
+- "close"  - Close the entire position immediately (exit)
 
 REQUIRED JSON RESPONSE FORMAT:
 
 {
-  "action": "close|scale|adjust|hold",
-  "price_target": 6030.00,
-  "stop_loss": 6005.00,
-  "reasoning": "Moving stop to breakeven as target approaches. Strong momentum continues.",
-  "key_levels": [
-    {"price": 6015.25, "type": "entry", "reason": "Original entry point"},
-    {"price": 6030.00, "type": "target", "reason": "Primary profit target"},
-    {"price": 6005.00, "type": "stop_trail", "reason": "Trailing stop at breakeven"}
-  ],
-  "context": "Position in profit, trailing stop to protect gains."
+  "action": "hold" | "scale" | "adjust" | "close",
+  "price_target": number | null,
+  "stop_loss": number | null,
+  "scale_out_size": number | null,
+  "scale_out_price": number | null,
+  "reasoning": "2-3 sentences explaining why the action matches structure.",
+  "context": "How price interacted with key levels and your entry.",
+  "thesis_intact": true | false,
+  "next_snapshot": number,
+  "suggestion": "Optional feedback to improve prompt or screenshot, or null."
 }
 
 FIELD DESCRIPTIONS:
 
 action (string, REQUIRED)
-    Values: "close", "scale", "adjust", "hold"
+    Values: "hold", "scale", "adjust", "close"
     
-    "close" - Closes entire position with market order
-        Use when: Setup invalidated, target reached, risk management
+    "hold" - No changes to position
+        Use when: Position structure intact, no adjustments needed
+        Rules: stop_loss, price_target, scale_out_size, scale_out_price = null
         
     "scale" - Partially closes position down to runner quantity
         Use when: Taking partial profits while leaving runners
         Behavior: Closes (total_quantity - runners_quantity) contracts
         Config: runners_quantity set in config.ini
         Example: If quantity=3 and runners_quantity=1, closes 2 contracts
+        Rules: Include scale_out_size and scale_out_price
         
     "adjust" - Modifies stop loss and/or take profit orders
         Use when: Trailing stops, adjusting targets, tightening risk
         Behavior: Cancels existing orders, places new ones at specified levels
-        Note: Also triggered if action="hold" but new price_target/stop_loss provided
+        Rules: Include stop_loss and price_target
         
-    "hold" - No changes to position
-        Use when: Position structure intact, no adjustments needed
+    "close" - Closes entire position with market order (exit)
+        Use when: Setup invalidated, target reached, risk management
+        Rules: All numeric fields = null
         
-price_target (number, optional for hold/close, REQUIRED for adjust)
+price_target (number | null, REQUIRED for adjust)
     Purpose: New take profit level
     Behavior: System cancels old limit order and places new one
     Format: Decimal price (e.g., 6030.00)
     
-stop_loss (number, optional for hold/close, REQUIRED for adjust)
+stop_loss (number | null, REQUIRED for adjust)
     Purpose: New stop loss level
     Behavior: System cancels old stop order and places new one
     Format: Decimal price (e.g., 6005.00)
     Notes: Common use cases - trail stop, move to breakeven, tighten risk
     
+scale_out_size (number | null, REQUIRED for scale)
+    Purpose: Number of contracts to scale out (close)
+    Example: If scaling from 3 to 1 runner, scale_out_size = 2
+    
+scale_out_price (number | null, REQUIRED for scale)
+    Purpose: Target price for the scale-out order
+    Format: Decimal price (e.g., 6015.00)
+    
 reasoning (string, REQUIRED)
-    Purpose: Explanation for position management decision
+    Purpose: Explanation for position management decision (2-3 sentences)
     Usage: Logged and sent via Telegram
+    Notes: Should explain why the action matches current structure
     Examples:
         - "Target reached, taking profits"
         - "Setup invalidated, cutting loss"
         - "Trailing stop to breakeven as momentum continues"
         - "Scaling out at resistance, leaving runners for extension"
         
-key_levels (array of objects, optional)
-    Purpose: Updated key levels for continued tracking
-    Behavior: Persists across position lifecycle
-    Usage: Same format as entry response
-    Notes: Should include entry price, current targets, trailing stops
-    
-context (string, optional)
-    Purpose: Updated market observations
+context (string, REQUIRED)
+    Purpose: How price interacted with key levels and your entry
     Behavior: Saved to daily context file
+    
+thesis_intact (boolean, REQUIRED)
+    Purpose: Whether the original trade thesis is still valid
+    Values: true or false
+    Usage: Used to evaluate trade quality and decision making
+    Notes: Should be false when recommending "close" due to invalidation
+    
+next_snapshot (integer, REQUIRED)
+    Purpose: Seconds until next analysis
+    Range: Positive integer (e.g., 10, 30, 60)
+    Behavior: Overrides scheduled interval for next cycle only
+    
+suggestion (string | null, optional)
+    Purpose: Meta-feedback for improving prompt or screenshot
+    Usage: LLM can flag issues or suggest improvements
+    Examples:
+        - "Entry price not visible in screenshot"
+        - "Add unrealized P&L display to Bookmap"
+        - "Prompt could include time since entry"
+    Notes: Set to null if no suggestions; logged for review
 
 
+================================================================================
+3. RUNNER MANAGEMENT RESPONSE (runner_prompt.txt)
+================================================================================
+
+When position has been scaled and only runner contracts remain, the LLM uses
+specialized runner management logic. This prompt is automatically used when
+position size equals runners_quantity from config.ini.
+
+AVAILABLE ACTIONS:
+- "hold"   - Keep runner position as-is
+- "adjust" - Modify stop loss and/or take profit levels
+- "close"  - Close the runner position (exit completely)
+
+NOTE: No "scale" action - runners are already the scaled-down position.
+
+REQUIRED JSON RESPONSE FORMAT:
+
+{
+  "action": "hold" | "adjust" | "close",
+  "price_target": number | null,
+  "stop_loss": number | null,
+  "reasoning": "2-4 sentences focusing on structure, delta, liquidity, and whether continuation remains intact.",
+  "context": "How current price behavior relates to original thesis and whether trend continuation is still valid.",
+  "key_levels": [
+    {
+      "price": 6000.00,
+      "type": "support",
+      "reason": "Structural trailing stop reference"
+    },
+    {
+      "price": 6025.00,
+      "type": "target",
+      "reason": "Extension target zone"
+    }
+  ],
+  "suggestion": "Optional feedback to improve prompt or screenshot, or null."
+}
+
+FIELD DESCRIPTIONS:
+
+action (string, REQUIRED)
+    Values: "hold", "adjust", "close"
+    
+    "hold" - Keep runner position as-is
+        Use when: Trend structure intact, no adjustments needed
+        
+    "adjust" - Modify stop loss and/or take profit levels
+        Use when: New structure forms, trailing stop updates, target extensions
+        Rules: Include stop_loss and price_target
+        
+    "close" - Close the runner position completely
+        Use when: Continuation thesis is meaningfully invalidated
+        
+price_target (number | null, REQUIRED for adjust)
+    Purpose: Updated take profit / extension target level
+    Behavior: System updates the target order
+    Format: Decimal price (e.g., 6050.00)
+    
+stop_loss (number | null, REQUIRED for adjust)
+    Purpose: Updated trailing stop level
+    Behavior: System updates the stop order
+    Format: Decimal price (e.g., 6010.00)
+    Notes: NEVER widen stop beyond break-even; trail behind structure
+    
+reasoning (string, REQUIRED)
+    Purpose: Explanation focusing on structure, delta, liquidity, continuation (2-4 sentences)
+    Usage: Logged and sent via Telegram
+    Focus: Whether continuation thesis remains intact
+    
+context (string, REQUIRED)
+    Purpose: How current price behavior relates to original thesis
+    Behavior: Saved to daily context file
+    Focus: Trend continuation validity
+    
+key_levels (array of objects, REQUIRED)
+    Purpose: Updated key levels for runner management
+    Format: Array of {"price": number, "type": string, "reason": string}
+    Types: "support", "target", "stop_trail", "resistance", etc.
+    Usage: Should include:
+        - Current trailing stop reference
+        - Extension target zones
+        - Key structural levels
+        
+suggestion (string | null, optional)
+    Purpose: Meta-feedback for improving prompt or screenshot
+    Usage: LLM can flag issues or suggest improvements
+    Examples:
+        - "Runner entry price should be visible on chart"
+        - "Add trailing stop visualization to Bookmap"
+        - "Include time-in-trade for runner management"
+    Notes: Set to null if no suggestions; logged for review
+
+
+================================================================================
+RESPONSE FIELD COMPARISON BY PROMPT TYPE
+================================================================================
+
+Field               | No Position | Position Mgmt | Runner Mgmt
+--------------------|-------------|---------------|-------------
+action              | REQUIRED    | REQUIRED      | REQUIRED
+entry_price         | optional    | -             | -
+price_target        | REQUIRED*   | REQUIRED**    | REQUIRED**
+stop_loss           | REQUIRED*   | REQUIRED**    | REQUIRED**
+confidence          | REQUIRED    | -             | -
+reasoning           | REQUIRED    | REQUIRED      | REQUIRED
+context             | REQUIRED    | REQUIRED      | REQUIRED
+waiting_for         | optional    | -             | -
+next_snapshot       | REQUIRED    | REQUIRED      | -
+key_levels          | REQUIRED    | -             | REQUIRED
+scale_out_size      | -           | REQUIRED***   | -
+scale_out_price     | -           | REQUIRED***   | -
+thesis_intact       | -           | REQUIRED      | -
+suggestion          | optional    | optional      | optional
+
+* Required for buy/sell, null for hold
+** Required for adjust action
+*** Required for scale action
+
+
+================================================================================
 SPECIAL BEHAVIORS
------------------
+================================================================================
 
-ADJUST via HOLD:
+AUTOMATIC PROMPT SWITCHING:
+- System automatically switches to runner_prompt when position size equals runners_quantity
+- Example: 3 contracts → scale to 1 → now uses runner_prompt for management
+
+ADJUST via HOLD (position_prompt only):
 If action="hold" BUT price_target AND stop_loss are both provided,
 the system treats it as action="adjust" and modifies the orders.
 
-Example:
-{
-  "action": "hold",
-  "price_target": 6030.00,
-  "stop_loss": 6010.00,
-  "reasoning": "Trailing stop to breakeven while holding position"
-}
-This will adjust the stops/targets even though action is "hold".
+RUNNER HARD RULES:
+- NEVER widen stop beyond break-even
+- NEVER let a runner turn the entire trade negative
+- Stops MUST follow structure, not candles
+- "close" ONLY when genuinely invalidated
 
 
+================================================================================
 RESPONSE PARSING
-----------------
+================================================================================
 
 The system strips markdown code fences if present:
 - Strips ```json ... ``` wrapper
@@ -339,8 +513,9 @@ Valid response formats:
 3. Generic fence: ```\n{"action": "buy", ...}\n```
 
 
+================================================================================
 ERROR HANDLING
---------------
+================================================================================
 
 Invalid JSON:
 - System logs error and continues monitoring
@@ -360,15 +535,16 @@ Legacy actions:
 - "flatten": Not implemented, logs error (use "close" instead)
 
 
+================================================================================
 LOGGING AND NOTIFICATIONS
---------------------------
+================================================================================
 
 All LLM interactions are logged to:
-1. Daily CSV file (llm_interactions_YYYY-MM-DD.csv)
-2. System log file (app.log)
+1. Daily CSV file (logs/YYMMDD_LLM.csv)
+2. System log file (logs/YYYYMMDD.txt)
 
 Trade events are logged to:
-1. Trade log CSV (trades_log.csv)
+1. Trade log CSV (trades/YYYY_MM.csv)
 2. Supabase database (if configured)
 3. Telegram notifications (if configured)
 
@@ -383,8 +559,9 @@ Each log includes:
 - Waiting conditions
 
 
+================================================================================
 DASHBOARD DISPLAY
-------------------
+================================================================================
 
 The system dashboard shows:
 - Current action (color-coded)

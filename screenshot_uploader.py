@@ -327,7 +327,7 @@ def get_active_order_id():
     info = get_active_trade_info()
     return info['order_id'] if info else None
 
-def save_active_trade_info(order_id, entry_price, position_type, entry_timestamp=None, stop_loss=None, price_target=None, reasoning=None):
+def save_active_trade_info(order_id, entry_price, position_type, entry_timestamp=None, stop_loss=None, price_target=None, reasoning=None, size=None, stop_loss_order_id=None, take_profit_order_id=None):
     """Save the active trade info to file.
     
     Args:
@@ -338,6 +338,9 @@ def save_active_trade_info(order_id, entry_price, position_type, entry_timestamp
         stop_loss: Stop loss price (optional)
         price_target: Take profit price (optional)
         reasoning: Reasoning for entering the trade (optional)
+        size: Number of contracts (optional)
+        stop_loss_order_id: Order ID for the stop loss order (optional)
+        take_profit_order_id: Order ID for the take profit order (optional)
     """
     try:
         trades_folder = 'trades'
@@ -357,6 +360,12 @@ def save_active_trade_info(order_id, entry_price, position_type, entry_timestamp
             trade_info['price_target'] = float(price_target)
         if reasoning is not None:
             trade_info['reasoning'] = reasoning
+        if size is not None:
+            trade_info['size'] = int(size)
+        if stop_loss_order_id is not None:
+            trade_info['stop_loss_order_id'] = int(stop_loss_order_id)
+        if take_profit_order_id is not None:
+            trade_info['take_profit_order_id'] = int(take_profit_order_id)
         
         with open(trade_info_file, 'w') as f:
             json.dump(trade_info, f, indent=2)
@@ -374,8 +383,48 @@ def clear_active_trade_info():
     except Exception as e:
         logging.error(f"Error clearing active trade info: {e}")
 
+def determine_exit_type(exit_trade_order_id, stop_loss_order_id, take_profit_order_id):
+    """Determine how a position was closed by matching the exit trade's order ID.
+    
+    Args:
+        exit_trade_order_id: The orderId from the closing trade in trade history
+        stop_loss_order_id: The stored stop loss order ID
+        take_profit_order_id: The stored take profit order ID
+        
+    Returns:
+        str: "STOP LOSS HIT", "TAKE PROFIT HIT", or "CLOSED" (for LLM/manual closes)
+    """
+    if exit_trade_order_id is None:
+        return "CLOSED"
+    
+    # Convert to int for comparison (API may return strings)
+    try:
+        exit_id = int(exit_trade_order_id)
+    except (ValueError, TypeError):
+        exit_id = exit_trade_order_id
+    
+    if stop_loss_order_id is not None:
+        try:
+            sl_id = int(stop_loss_order_id)
+            if exit_id == sl_id:
+                return "STOP LOSS HIT"
+        except (ValueError, TypeError):
+            if exit_trade_order_id == stop_loss_order_id:
+                return "STOP LOSS HIT"
+    
+    if take_profit_order_id is not None:
+        try:
+            tp_id = int(take_profit_order_id)
+            if exit_id == tp_id:
+                return "TAKE PROFIT HIT"
+        except (ValueError, TypeError):
+            if exit_trade_order_id == take_profit_order_id:
+                return "TAKE PROFIT HIT"
+    
+    return "CLOSED"
+
 def log_llm_interaction(request_prompt, response_text, action=None, entry_price=None, 
-                        price_target=None, stop_loss=None, confidence=None, reasoning=None, context=None, waiting_for=None, key_levels=None):
+                        price_target=None, stop_loss=None, confidence=None, reasoning=None, context=None, waiting_for=None, key_levels=None, suggestion=None):
     """Log LLM request and response to daily CSV file.
     
     Args:
@@ -422,7 +471,8 @@ def log_llm_interaction(request_prompt, response_text, action=None, entry_price=
             'reasoning': reasoning[:500] if reasoning else '',
             'context': context[:500] if context else '',
             'waiting_for': waiting_for[:500] if waiting_for else '',
-            'key_levels': key_levels_str
+            'key_levels': key_levels_str,
+            'suggestion': suggestion[:500] if suggestion else ''
         }
         
         # Check if file exists to determine if we need to write header
@@ -1206,9 +1256,25 @@ def correct_position_state(discrepancy, api_position_type, api_position_details,
                 order_info = parse_working_orders(working_orders, contract_id)
                 current_stop_loss = order_info.get('stop_loss_price')
                 current_take_profit = order_info.get('take_profit_price')
+                current_stop_loss_order_id = order_info.get('stop_loss_order_id')
+                current_take_profit_order_id = order_info.get('take_profit_order_id')
                 
-                # Generate a unique order ID for tracking
-                order_id = f"MANUAL_{api_position_type.upper()}_{int(datetime.datetime.now().timestamp())}"
+                # Try to get a real ID from the position data
+                raw_position = api_position_details.get('rawPosition', {})
+                order_id = (
+                    raw_position.get('id') or 
+                    raw_position.get('positionId') or 
+                    raw_position.get('entryOrderId') or
+                    api_position_details.get('id') or
+                    api_position_details.get('positionId')
+                )
+                
+                # Fall back to generated ID only if no real ID is available
+                if not order_id:
+                    order_id = f"DETECTED_{api_position_type.upper()}_{int(datetime.datetime.now().timestamp())}"
+                    logging.info(f"No position ID found in API response, using generated ID: {order_id}")
+                else:
+                    logging.info(f"Using position ID from API: {order_id}")
                 
                 # Save active trade info
                 entry_timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1219,7 +1285,10 @@ def correct_position_state(discrepancy, api_position_type, api_position_details,
                     entry_timestamp=entry_timestamp,
                     stop_loss=current_stop_loss,
                     price_target=current_take_profit,
-                    reasoning="Position opened manually from broker - detected by system"
+                    reasoning="Position opened manually from broker - detected by system",
+                    size=api_quantity,
+                    stop_loss_order_id=current_stop_loss_order_id,
+                    take_profit_order_id=current_take_profit_order_id
                 )
                 
                 logging.info(f"✅ Created tracking for {api_position_type.upper()} position @ {api_entry_price}")
@@ -2213,9 +2282,12 @@ def modify_stops_and_targets(position_details, new_price_target, new_stop_loss, 
                 entry_timestamp=trade_info.get('entry_timestamp'),
                 stop_loss=new_stop_loss,
                 price_target=new_price_target,
-                reasoning=trade_info.get('reasoning')  # Keep original entry reasoning
+                reasoning=trade_info.get('reasoning'),  # Keep original entry reasoning
+                size=trade_info.get('size'),  # Preserve size
+                stop_loss_order_id=stop_loss_order_id,
+                take_profit_order_id=take_profit_order_id
             )
-            logging.info(f"Updated active_trade.json with new values: Stop={new_stop_loss}, Target={new_price_target}")
+            logging.info(f"Updated active_trade.json with new values: Stop={new_stop_loss}, Target={new_price_target}, SL Order ID={stop_loss_order_id}, TP Order ID={take_profit_order_id}")
         
         logging.info("=" * 80)
         if values_changed:
@@ -2285,7 +2357,7 @@ def show_dashboard(root=None):
         
         dashboard.title("ES Trader Dashboard")
         if is_initial_build:
-            dashboard.geometry("550x850")
+            dashboard.geometry("650x850")
         dashboard.configure(bg='#1e1e1e')
         
         # Get current data - verify position from API if trading is enabled
@@ -2319,33 +2391,46 @@ def show_dashboard(root=None):
                 session_start_text = "N/A"
             
             if 'session_rpl_label' in DASHBOARD_WIDGETS:
-                DASHBOARD_WIDGETS['session_rpl_label'].config(text=f"Session RPL: {rpl_text}", fg=rpl_color)
-            if 'session_start_label' in DASHBOARD_WIDGETS:
-                DASHBOARD_WIDGETS['session_start_label'].config(text=f"Session Start (18:00): {session_start_text}")
+                DASHBOARD_WIDGETS['session_rpl_label'].config(text=rpl_text, fg=rpl_color)
+            # Session start label hidden for cleaner UI
+            # if 'session_start_label' in DASHBOARD_WIDGETS:
+            #     DASHBOARD_WIDGETS['session_start_label'].config(text=f"Session Start (18:00): {session_start_text}")
             
             # Update position info
             if trade_info:
                 position_type = trade_info.get('position_type', 'None').upper()
                 entry_price = trade_info.get('entry_price', 'N/A')
+                stop_loss = trade_info.get('stop_loss', 'N/A')
+                price_target = trade_info.get('price_target', 'N/A')
                 order_id = trade_info.get('order_id', 'N/A')
+                size = trade_info.get('size', '')
                 pos_color = '#00ff00' if position_type == 'LONG' else '#ff4444'
                 
+                # Show position type with size in parentheses
+                position_text = f"Position: {position_type}"
+                if size:
+                    position_text += f" ({size})"
+                
                 if 'position_label' in DASHBOARD_WIDGETS:
-                    DASHBOARD_WIDGETS['position_label'].config(text=f"Position: {position_type}", fg=pos_color)
+                    DASHBOARD_WIDGETS['position_label'].config(text=position_text, fg=pos_color)
                 if 'entry_price_label' in DASHBOARD_WIDGETS:
                     DASHBOARD_WIDGETS['entry_price_label'].config(text=f"Entry Price: {entry_price}")
+                if 'stop_loss_label' in DASHBOARD_WIDGETS:
+                    DASHBOARD_WIDGETS['stop_loss_label'].config(text=f"Stop Loss: {stop_loss}")
+                if 'price_target_label' in DASHBOARD_WIDGETS:
+                    DASHBOARD_WIDGETS['price_target_label'].config(text=f"Take Profit: {price_target}")
                 if 'order_id_label' in DASHBOARD_WIDGETS:
                     DASHBOARD_WIDGETS['order_id_label'].config(text=f"Order ID: {order_id}")
                 
                 # Show position labels, hide no-position label
-                for key in ['position_label', 'entry_price_label', 'order_id_label']:
+                for key in ['position_label', 'entry_price_label', 'stop_loss_label', 'price_target_label', 'order_id_label']:
                     if key in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS[key].pack(anchor="w")
                 if 'no_position_label' in DASHBOARD_WIDGETS:
                     DASHBOARD_WIDGETS['no_position_label'].pack_forget()
             else:
                 # Hide position labels, show no-position label
-                for key in ['position_label', 'entry_price_label', 'order_id_label']:
+                for key in ['position_label', 'entry_price_label', 'stop_loss_label', 'price_target_label', 'order_id_label']:
                     if key in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS[key].pack_forget()
                 if 'no_position_label' in DASHBOARD_WIDGETS:
@@ -2465,6 +2550,24 @@ def show_dashboard(root=None):
                     if 'key_levels_text' in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS['key_levels_text'].pack_forget()
                 
+                # Update suggestion text if available (only show if not null/empty)
+                suggestion_value = llm_data.get('suggestion', '')
+                if suggestion_value and suggestion_value.strip() and suggestion_value.lower() != 'null':
+                    if 'suggestion_title' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['suggestion_title'].pack(anchor="w", pady=(10, 5))
+                    if 'suggestion_text' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['suggestion_text'].config(state=tk.NORMAL)
+                        DASHBOARD_WIDGETS['suggestion_text'].delete(1.0, tk.END)
+                        DASHBOARD_WIDGETS['suggestion_text'].insert(1.0, suggestion_value)
+                        DASHBOARD_WIDGETS['suggestion_text'].config(state=tk.DISABLED)
+                        DASHBOARD_WIDGETS['suggestion_text'].pack(fill="x", pady=5)
+                else:
+                    # Hide suggestion widgets if no data
+                    if 'suggestion_title' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['suggestion_title'].pack_forget()
+                    if 'suggestion_text' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['suggestion_text'].pack_forget()
+                
                 # Market Context temporarily hidden
                 # if 'context_text' in DASHBOARD_WIDGETS:
                 #     DASHBOARD_WIDGETS['context_text'].config(state=tk.NORMAL)
@@ -2479,7 +2582,7 @@ def show_dashboard(root=None):
                 # Hide LLM widgets, show no-data label (context temporarily hidden)
                 for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
                            'reasoning_title', 'reasoning_text', 'waiting_for_title', 'waiting_for_text',
-                           'key_levels_title', 'key_levels_text']:
+                           'key_levels_title', 'key_levels_text', 'suggestion_title', 'suggestion_text']:
                     if key in DASHBOARD_WIDGETS:
                         DASHBOARD_WIDGETS[key].pack_forget()
                 if 'no_llm_label' in DASHBOARD_WIDGETS:
@@ -2518,12 +2621,16 @@ def show_dashboard(root=None):
                                      bg='#2d2d2d', fg='#ffffff', padx=10, pady=10)
         account_frame.pack(fill="x", padx=20, pady=10)
         
-        balance_label = tk.Label(account_frame, text=f"Balance: {balance}", 
+        # Balance and RPL on same line
+        balance_rpl_frame = tk.Frame(account_frame, bg='#2d2d2d')
+        balance_rpl_frame.pack(anchor="w")
+        
+        balance_label = tk.Label(balance_rpl_frame, text=f"Balance: {balance}", 
                                 font=("Arial", 14), bg='#2d2d2d', fg='#00ff00')
-        balance_label.pack(anchor="w")
+        balance_label.pack(side="left")
         DASHBOARD_WIDGETS['balance_label'] = balance_label
         
-        # Session RPL Section (always displayed)
+        # Session RPL (displayed next to balance with 50px spacing)
         if SESSION_START_BALANCE is not None:
             rpl_color = '#00ff00' if CURRENT_RPL >= 0 else '#ff4444'
             rpl_text = f"${CURRENT_RPL:+,.2f}"
@@ -2534,15 +2641,16 @@ def show_dashboard(root=None):
             rpl_text = "$0.00"
             session_start_text = "N/A"
         
-        session_start_label = tk.Label(account_frame, text=f"Session Start (18:00): {session_start_text}",
-                                      font=("Arial", 11), bg='#2d2d2d', fg='#aaaaaa')
-        session_start_label.pack(anchor="w", pady=(5, 0))
-        DASHBOARD_WIDGETS['session_start_label'] = session_start_label
-        
-        session_rpl_label = tk.Label(account_frame, text=f"Session RPL: {rpl_text}",
+        session_rpl_label = tk.Label(balance_rpl_frame, text=rpl_text,
                                     font=("Arial", 14, "bold"), bg='#2d2d2d', fg=rpl_color)
-        session_rpl_label.pack(anchor="w", pady=(2, 0))
+        session_rpl_label.pack(side="left", padx=(20, 0))
         DASHBOARD_WIDGETS['session_rpl_label'] = session_rpl_label
+        
+        # Session start label hidden for cleaner UI
+        # session_start_label = tk.Label(account_frame, text=f"Session Start (18:00): {session_start_text}",
+        #                               font=("Arial", 11), bg='#2d2d2d', fg='#aaaaaa')
+        # session_start_label.pack(anchor="w", pady=(5, 0))
+        # DASHBOARD_WIDGETS['session_start_label'] = session_start_label
         
         # Position Section
         position_frame = tk.LabelFrame(dashboard, text="Current Position", font=("Arial", 12, "bold"),
@@ -2552,27 +2660,43 @@ def show_dashboard(root=None):
         # Create position labels (shown/hidden based on state)
         position_label = tk.Label(position_frame, text="", font=("Arial", 14, "bold"), bg='#2d2d2d')
         entry_price_label = tk.Label(position_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#ffffff')
+        stop_loss_label = tk.Label(position_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#ff6666')
+        price_target_label = tk.Label(position_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#66ff66')
         order_id_label = tk.Label(position_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#aaaaaa')
         no_position_label = tk.Label(position_frame, text="No Active Position", 
                                      font=("Arial", 14), bg='#2d2d2d', fg='#888888')
         
         DASHBOARD_WIDGETS['position_label'] = position_label
         DASHBOARD_WIDGETS['entry_price_label'] = entry_price_label
+        DASHBOARD_WIDGETS['stop_loss_label'] = stop_loss_label
+        DASHBOARD_WIDGETS['price_target_label'] = price_target_label
         DASHBOARD_WIDGETS['order_id_label'] = order_id_label
         DASHBOARD_WIDGETS['no_position_label'] = no_position_label
         
         if trade_info:
             position_type = trade_info.get('position_type', 'None').upper()
             entry_price = trade_info.get('entry_price', 'N/A')
+            stop_loss = trade_info.get('stop_loss', 'N/A')
+            price_target = trade_info.get('price_target', 'N/A')
             order_id = trade_info.get('order_id', 'N/A')
+            size = trade_info.get('size', '')
             pos_color = '#00ff00' if position_type == 'LONG' else '#ff4444'
             
-            position_label.config(text=f"Position: {position_type}", fg=pos_color)
+            # Show position type with size in parentheses
+            position_text = f"Position: {position_type}"
+            if size:
+                position_text += f" ({size})"
+            
+            position_label.config(text=position_text, fg=pos_color)
             entry_price_label.config(text=f"Entry Price: {entry_price}")
+            stop_loss_label.config(text=f"Stop Loss: {stop_loss}")
+            price_target_label.config(text=f"Take Profit: {price_target}")
             order_id_label.config(text=f"Order ID: {order_id}")
             
             position_label.pack(anchor="w")
             entry_price_label.pack(anchor="w")
+            stop_loss_label.pack(anchor="w")
+            price_target_label.pack(anchor="w")
             order_id_label.pack(anchor="w")
         else:
             no_position_label.pack(anchor="w")
@@ -2601,6 +2725,9 @@ def show_dashboard(root=None):
         key_levels_title = tk.Label(llm_frame, text="Key Levels:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
         key_levels_text = tk.Text(llm_frame, height=4, wrap=tk.WORD, font=("Arial", 10),
                                   bg='#2d2d2d', fg='#00aaff', relief=tk.FLAT)
+        suggestion_title = tk.Label(llm_frame, text="💡 Suggestion:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
+        suggestion_text = tk.Text(llm_frame, height=2, wrap=tk.WORD, font=("Arial", 10),
+                                  bg='#2d2d2d', fg='#ff66ff', relief=tk.FLAT)
         context_title = tk.Label(llm_frame, text="Market Context:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
         context_text = tk.Text(llm_frame, height=4, wrap=tk.WORD, font=("Arial", 10),
                               bg='#1e1e1e', fg='#aaaaaa', relief=tk.FLAT)
@@ -2619,6 +2746,8 @@ def show_dashboard(root=None):
         DASHBOARD_WIDGETS['waiting_for_text'] = waiting_for_text
         DASHBOARD_WIDGETS['key_levels_title'] = key_levels_title
         DASHBOARD_WIDGETS['key_levels_text'] = key_levels_text
+        DASHBOARD_WIDGETS['suggestion_title'] = suggestion_title
+        DASHBOARD_WIDGETS['suggestion_text'] = suggestion_text
         DASHBOARD_WIDGETS['context_title'] = context_title
         DASHBOARD_WIDGETS['context_text'] = context_text
         DASHBOARD_WIDGETS['no_llm_label'] = no_llm_label
@@ -2720,6 +2849,14 @@ def show_dashboard(root=None):
                             key_levels_text.pack(fill="x", pady=5)
                 except:
                     pass  # Skip if parsing fails
+            
+            # Display suggestion if present (only show if not null/empty)
+            suggestion_value = llm_data.get('suggestion', '')
+            if suggestion_value and suggestion_value.strip() and suggestion_value.lower() != 'null':
+                suggestion_title.pack(anchor="w", pady=(10, 5))
+                suggestion_text.insert(1.0, suggestion_value)
+                suggestion_text.config(state=tk.DISABLED)
+                suggestion_text.pack(fill="x", pady=5)
             
             # Market Context temporarily hidden
             # context_title.pack(anchor="w", pady=(10, 5))
@@ -3331,6 +3468,7 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                     reasoning = advice.get('reasoning')
                     new_context = advice.get('context', '')
                     key_levels = advice.get('key_levels')
+                    suggestion = advice.get('suggestion')
                     logging.info(f"Position Management Advice: Action={action}, Target={price_target}, Stop={stop_loss}, Reasoning={reasoning}, KeyLevels={len(key_levels) if key_levels else 0} levels")
                     
                     # Log LLM interaction to CSV
@@ -3345,7 +3483,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                         confidence=None,  # Not provided in position management
                         reasoning=reasoning,
                         context=daily_context,
-                        key_levels=key_levels
+                        key_levels=key_levels,
+                        suggestion=suggestion
                     )
                     logging.info(f"LLM response logged and cached at {llm_response_time.strftime('%H:%M:%S')}")
                     
@@ -3479,6 +3618,7 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 waiting_for = advice.get('waiting_for')
                 key_levels = advice.get('key_levels')
                 next_snapshot = advice.get('next_snapshot')
+                suggestion = advice.get('suggestion')
                 logging.info(f"Parsed Advice: Action={action}, Entry={entry_price}, Target={price_target}, Stop={stop_loss}, Confidence={confidence}, Reasoning={reasoning}, WaitingFor={waiting_for}, KeyLevels={len(key_levels) if key_levels else 0} levels, NextSnapshot={next_snapshot}s")
 
                 # Log LLM interaction to CSV
@@ -3494,7 +3634,8 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                     reasoning=reasoning,
                     context=daily_context,
                     waiting_for=waiting_for,
-                    key_levels=key_levels
+                    key_levels=key_levels,
+                    suggestion=suggestion
                 )
                 logging.info(f"LLM response logged and cached at {llm_response_time.strftime('%H:%M:%S')}")
                 
@@ -3670,7 +3811,9 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                                         entry_timestamp=datetime.datetime.now().isoformat(),
                                         stop_loss=actual_stop_loss,
                                         price_target=actual_price_target,
-                                        reasoning=reasoning
+                                        reasoning=reasoning,
+                                        stop_loss_order_id=stop_loss_order_id,
+                                        take_profit_order_id=take_profit_order_id
                                     )
                                     
                                     # Update dashboard with corrected values
@@ -6443,6 +6586,27 @@ schedule.every(30).minutes.do(refresh_base_context)
 logging.info("Scheduled base context refresh every 30 minutes")
 logging.info("Job scheduling uses dynamic intervals - see interval_seconds and interval_schedule in config.ini")
 
+# Global flag to control trade monitoring (smart monitoring - only when needed)
+# NOTE: These must be defined BEFORE the startup job() call below
+monitoring_enabled = True  # Start as True for initial startup check
+monitoring_lock = threading.Lock()  # Thread-safe flag access
+
+def enable_trade_monitoring(reason=""):
+    """Enable trade monitoring (start checking for position changes)."""
+    global monitoring_enabled
+    with monitoring_lock:
+        if not monitoring_enabled:
+            monitoring_enabled = True
+            logging.info(f"✅ Trade monitoring ENABLED{': ' + reason if reason else ''}")
+
+def disable_trade_monitoring(reason=""):
+    """Disable trade monitoring (stop checking for position changes)."""
+    global monitoring_enabled
+    with monitoring_lock:
+        if monitoring_enabled:
+            monitoring_enabled = False
+            logging.info(f"⛔ Trade monitoring DISABLED{': ' + reason if reason else ''}")
+
 # Run the first job immediately on startup (before entering the scheduler loop)
 # But first check if we're in a no-trade window or disabled interval to avoid unnecessary screenshots
 logging.info("Checking if startup screenshot should be taken...")
@@ -6495,26 +6659,6 @@ else:
 running = False
 scheduler_thread = None
 trade_monitor_thread = None
-
-# Global flag to control trade monitoring (smart monitoring - only when needed)
-monitoring_enabled = True  # Start as True for initial startup check
-monitoring_lock = threading.Lock()  # Thread-safe flag access
-
-def enable_trade_monitoring(reason=""):
-    """Enable trade monitoring (start checking for position changes)."""
-    global monitoring_enabled
-    with monitoring_lock:
-        if not monitoring_enabled:
-            monitoring_enabled = True
-            logging.info(f"✅ Trade monitoring ENABLED{': ' + reason if reason else ''}")
-
-def disable_trade_monitoring(reason=""):
-    """Disable trade monitoring (stop checking for position changes)."""
-    global monitoring_enabled
-    with monitoring_lock:
-        if monitoring_enabled:
-            monitoring_enabled = False
-            logging.info(f"⛔ Trade monitoring DISABLED{': ' + reason if reason else ''}")
 
 def get_current_interval():
     """Get the interval_seconds for the current time based on interval_schedule.
@@ -6798,15 +6942,46 @@ def run_trade_monitor():
                             # Calculate P&L in points (assuming ES multiplier of $50 per point)
                             pnl_points = net_pnl / 50 if net_pnl else 0
                             
+                            # Get stored SL/TP order IDs for exit type determination
+                            stop_loss_order_id = trade_info.get('stop_loss_order_id')
+                            take_profit_order_id = trade_info.get('take_profit_order_id')
+                            
+                            # Find the closing trade's order ID (look for the exit trade)
+                            exit_trade_order_id = None
+                            exit_price = None
+                            for trade in reversed(trades):
+                                trade_side = trade.get('side', 0)
+                                # Exit trade: sell closes long, buy closes short
+                                if (trade_position_type == 'long' and trade_side == 1) or \
+                                   (trade_position_type == 'short' and trade_side == 0):
+                                    exit_trade_order_id = trade.get('orderId')
+                                    exit_price = trade.get('price')
+                                    break
+                            
+                            # Determine exit type by matching order IDs
+                            exit_type = determine_exit_type(exit_trade_order_id, stop_loss_order_id, take_profit_order_id)
+                            
                             # Determine success/failure
                             is_success = net_pnl > 0
                             emoji = "✅" if is_success else "❌"
                             result_text = "PROFIT" if is_success else "LOSS"
                             
+                            # Set appropriate emoji based on exit type
+                            if exit_type == "STOP LOSS HIT":
+                                exit_emoji = "🛑"
+                            elif exit_type == "TAKE PROFIT HIT":
+                                exit_emoji = "🎯"
+                            else:
+                                exit_emoji = "📤"
+                            
                             logging.info(f"="*80)
-                            logging.info(f"TRADE CLOSED BY SL/TP - {result_text}")
+                            logging.info(f"TRADE CLOSED - {exit_type} - {result_text}")
                             logging.info(f"Position: {trade_position_type.upper()}")
                             logging.info(f"Entry Price: {entry_price}")
+                            logging.info(f"Exit Price: {exit_price}")
+                            logging.info(f"Exit Order ID: {exit_trade_order_id}")
+                            logging.info(f"Stored SL Order ID: {stop_loss_order_id}")
+                            logging.info(f"Stored TP Order ID: {take_profit_order_id}")
                             logging.info(f"Net P&L: ${net_pnl:.2f} ({pnl_points:+.2f} pts)")
                             logging.info(f"Fees: ${total_fees:.2f}")
                             logging.info(f"Total Fills: {len(trades)}")
@@ -6820,14 +6995,14 @@ def run_trade_monitor():
                             # Get current market context
                             daily_context = get_daily_context()
                             
-                            # Log CLOSE event with actual P&L
+                            # Log CLOSE event with actual P&L and exit type
                             log_trade_event(
                                 event_type="CLOSE",
                                 symbol=SYMBOL,
                                 position_type=trade_position_type,
                                 size=size,
-                                price=0,  # Exit price not available from trade results
-                                reasoning="Position closed by Stop Loss or Take Profit",
+                                price=exit_price if exit_price else 0,
+                                reasoning=f"Position closed: {exit_type}",
                                 profit_loss=net_pnl,
                                 profit_loss_points=pnl_points,
                                 balance=balance,
@@ -6836,12 +7011,19 @@ def run_trade_monitor():
                                 entry_price=entry_price
                             )
                             
-                            # Send Telegram notification
+                            # Send Telegram notification with specific exit type
                             telegram_msg = (
-                                f"{emoji} <b>TRADE CLOSED - {result_text}</b>\n"
+                                f"{exit_emoji} <b>{exit_type}</b>\n"
+                                f"{emoji} Result: {result_text}\n"
                                 f"Position: {trade_position_type.upper()}\n"
                                 f"Size: {size} contract(s)\n"
                                 f"Entry Price: {entry_price}\n"
+                            )
+                            
+                            if exit_price:
+                                telegram_msg += f"Exit Price: {exit_price}\n"
+                            
+                            telegram_msg += (
                                 f"P&L: ${net_pnl:+,.2f} ({pnl_points:+.2f} pts)\n"
                                 f"Fees: ${total_fees:.2f}\n"
                             )
@@ -6849,11 +7031,10 @@ def run_trade_monitor():
                             if balance is not None:
                                 telegram_msg += f"💰 Balance: ${balance:,.2f}\n"
                             
-                            telegram_msg += f"📝 Reason: Position closed by Stop Loss or Take Profit\n"
                             telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                             
                             send_telegram_message(telegram_msg, TELEGRAM_CONFIG)
-                            logging.info("Telegram notification sent for closed position")
+                            logging.info(f"Telegram notification sent for {exit_type}")
                             
                             # Clear active trade info
                             clear_active_trade_info()
@@ -6862,15 +7043,23 @@ def run_trade_monitor():
                             update_dashboard_data()
                             logging.info("Dashboard updated with closed position results")
                             
+                            # Trigger immediate screenshot for post-trade analysis
+                            FORCE_IMMEDIATE_ANALYSIS = True
+                            logging.info("🚨 FORCE_IMMEDIATE_ANALYSIS set - screenshot will be taken for post-trade analysis")
+                            
                             # Disable monitoring now that position is closed
                             disable_trade_monitoring("Position closed")
                         else:
                             logging.warning("Could not fetch trade results from API")
-                            # Still disable monitoring even if we couldn't fetch results
+                            # Still trigger screenshot and disable monitoring
+                            FORCE_IMMEDIATE_ANALYSIS = True
+                            logging.info("🚨 FORCE_IMMEDIATE_ANALYSIS set - screenshot will be taken despite missing trade results")
                             disable_trade_monitoring("Position closed (results fetch failed)")
                     else:
                         logging.warning("No active trade info found for closed position")
-                        # Still disable monitoring
+                        # Still trigger screenshot and disable monitoring
+                        FORCE_IMMEDIATE_ANALYSIS = True
+                        logging.info("🚨 FORCE_IMMEDIATE_ANALYSIS set - screenshot will be taken despite missing trade info")
                         disable_trade_monitoring("Position closed (no trade info found)")
                 
                 # Update last known position

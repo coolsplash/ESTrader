@@ -142,7 +142,8 @@ Return ONLY JSON:
       "type": "target",
       "reason": "Extension target zone"
     }}
-  ]
+  ],
+  "suggestion": "Optional feedback to improve prompt or screenshot, or null."
 }}
 ________________________________________
 🧱 HARD RULES (UNBREAKABLE)

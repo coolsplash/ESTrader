@@ -286,7 +286,8 @@ def save_balance_snapshot(account_id, balance, rpl=None):
         }
         
         SUPABASE_CLIENT.table('account_snapshots').insert(snapshot_data).execute()
-        logging.debug(f"Saved balance snapshot: ${balance:,.2f}, RPL: ${rpl:,.2f if rpl else 0:.2f}")
+        rpl_display = f"${rpl:,.2f}" if rpl is not None else "$0.00"
+        logging.debug(f"Saved balance snapshot: ${balance:,.2f}, RPL: {rpl_display}")
         
     except Exception as e:
         logging.error(f"Error saving balance snapshot (non-critical): {e}")
@@ -3503,13 +3504,66 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                     # Handle position management actions
                     if action == 'close':
                         logging.info(f"LLM advises to CLOSE position. Reasoning: {reasoning}")
-                        # Close the entire position by placing opposite market order
-                        close_position(position_details, topstep_config, enable_trading, auth_token, execute_trades, telegram_config, reasoning, daily_context)
+                        
+                        # Re-verify position still exists before closing (may have been closed by SL/TP)
+                        verify_position_type, _, _ = get_current_position(
+                            symbol, topstep_config, enable_trading, auth_token, return_details=True
+                        )
+                        
+                        if verify_position_type == 'none':
+                            # Position already closed (likely by SL/TP) - trigger another screenshot instead
+                            logging.info("="*80)
+                            logging.info("⚠️ Position already closed (likely by SL/TP hit)")
+                            logging.info("LLM close action skipped - position no longer exists")
+                            logging.info("Triggering immediate screenshot for fresh analysis")
+                            logging.info("="*80)
+                            
+                            # Clear tracking and trigger screenshot
+                            clear_active_trade_info()
+                            global FORCE_IMMEDIATE_ANALYSIS
+                            FORCE_IMMEDIATE_ANALYSIS = True
+                            
+                            # Send notification
+                            telegram_msg = (
+                                f"⚠️ <b>CLOSE SKIPPED</b>\n"
+                                f"LLM requested close but position was already closed\n"
+                                f"(Likely SL/TP hit during analysis)\n"
+                                f"Triggering new screenshot for fresh analysis"
+                            )
+                            send_telegram_message(telegram_msg, telegram_config)
+                        else:
+                            # Position still exists - proceed with close
+                            close_position(position_details, topstep_config, enable_trading, auth_token, execute_trades, telegram_config, reasoning, daily_context)
                     
                     elif action == 'scale':
                         logging.info(f"LLM advises to SCALE position. Reasoning: {reasoning}")
-                        # Partially close the position (scale out)
-                        execute_topstep_trade(action, None, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades, position_details, telegram_config, reasoning, None, daily_context)
+                        
+                        # Re-verify position still exists before scaling (may have been closed by SL/TP)
+                        verify_position_type, _, _ = get_current_position(
+                            symbol, topstep_config, enable_trading, auth_token, return_details=True
+                        )
+                        
+                        if verify_position_type == 'none':
+                            # Position already closed - trigger another screenshot instead
+                            logging.info("="*80)
+                            logging.info("⚠️ Position already closed (likely by SL/TP hit)")
+                            logging.info("LLM scale action skipped - position no longer exists")
+                            logging.info("Triggering immediate screenshot for fresh analysis")
+                            logging.info("="*80)
+                            
+                            clear_active_trade_info()
+                            FORCE_IMMEDIATE_ANALYSIS = True
+                            
+                            telegram_msg = (
+                                f"⚠️ <b>SCALE SKIPPED</b>\n"
+                                f"LLM requested scale but position was already closed\n"
+                                f"(Likely SL/TP hit during analysis)\n"
+                                f"Triggering new screenshot for fresh analysis"
+                            )
+                            send_telegram_message(telegram_msg, telegram_config)
+                        else:
+                            # Position still exists - proceed with scale
+                            execute_topstep_trade(action, None, price_target, stop_loss, topstep_config, enable_trading, current_position_type, auth_token, execute_trades, position_details, telegram_config, reasoning, None, daily_context)
                     
                     elif action == 'adjust' or (action == 'hold' and price_target and stop_loss):
                         logging.info(f"LLM advises to ADJUST stops/targets. New Target={price_target}, New Stop={stop_loss}. Reasoning: {reasoning}")
@@ -5807,11 +5861,38 @@ def fetch_trade_results(account_id, topstep_config, enable_trading, auth_token=N
         return None
     
     try:
-        # Default timestamps: today 00:00 to now
+        # Default timestamps: today 00:00 to now + 2 minute buffer
         if not start_timestamp:
             start_timestamp = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
         if not end_timestamp:
-            end_timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Add 2 minute buffer to end time to account for any time drift
+            end_time = datetime.datetime.now() + datetime.timedelta(minutes=2)
+            end_timestamp = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        # Normalize timestamps to consistent format (seconds precision with Z suffix)
+        # Handle timestamps that may have microseconds or missing Z suffix
+        def normalize_timestamp(ts):
+            if not ts:
+                return ts
+            # Remove microseconds if present (anything after the seconds)
+            if '.' in ts:
+                ts = ts.split('.')[0]
+            # Add Z suffix if missing
+            if not ts.endswith('Z'):
+                ts = ts + 'Z'
+            return ts
+        
+        start_timestamp = normalize_timestamp(start_timestamp)
+        end_timestamp = normalize_timestamp(end_timestamp)
+        
+        # Also add buffer to end_timestamp if it was provided (not default)
+        # Parse and add 2 minutes
+        try:
+            end_dt = datetime.datetime.strptime(end_timestamp.rstrip('Z'), "%Y-%m-%dT%H:%M:%S")
+            end_dt = end_dt + datetime.timedelta(minutes=2)
+            end_timestamp = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass  # Keep original if parsing fails
         
         base_url = topstep_config['base_url']
         trade_search_endpoint = topstep_config.get('trade_search_endpoint', '/api/Trade/search')

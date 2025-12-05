@@ -20,7 +20,7 @@ import win32con
 import win32process
 from ctypes import windll
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 import sys
 import ctypes
 import urllib.parse  # For Telegram URL encoding
@@ -2876,7 +2876,14 @@ def show_dashboard(root=None):
                                command=manual_job,
                                font=("Arial", 11), bg='#006600', fg='#ffffff',
                                activebackground='#008800', relief=tk.FLAT, padx=20, pady=5)
-        refresh_btn.pack()
+        refresh_btn.pack(side="left", padx=5)
+        
+        # Trades history button
+        trades_btn = tk.Button(btn_frame, text="Trades", 
+                              command=show_trades_window,
+                              font=("Arial", 11), bg='#0066aa', fg='#ffffff',
+                              activebackground='#0088cc', relief=tk.FLAT, padx=20, pady=5)
+        trades_btn.pack(side="left", padx=5)
         
         # Center the window only on initial build
         if is_initial_build:
@@ -2893,6 +2900,606 @@ def show_dashboard(root=None):
         
     except Exception as e:
         logging.error(f"Error showing dashboard: {e}")
+        logging.exception("Full traceback:")
+
+# ============================================================================
+# TRADES HISTORY WINDOW
+# ============================================================================
+
+TRADES_WINDOW = None
+TRADES_VIEW_MODE = "grouped"  # "grouped" or "detailed"
+
+def fetch_trades_from_supabase(start_date, end_date):
+    """Fetch trades from Supabase between start_date and end_date.
+    
+    Args:
+        start_date: datetime.date - Start of date range
+        end_date: datetime.date - End of date range (inclusive)
+        
+    Returns:
+        List of trade records or empty list on error
+    """
+    global SUPABASE_CLIENT
+    
+    if not SUPABASE_CLIENT:
+        logging.warning("Supabase client not initialized")
+        return []
+    
+    try:
+        # Format dates for query (start of start_date to end of end_date)
+        start_dt = datetime.datetime.combine(start_date, datetime.time.min).isoformat()
+        end_dt = datetime.datetime.combine(end_date, datetime.time.max).isoformat()
+        
+        logging.info(f"Fetching trades from {start_dt} to {end_dt}")
+        
+        response = SUPABASE_CLIENT.table('trades') \
+            .select('*') \
+            .gte('timestamp', start_dt) \
+            .lte('timestamp', end_dt) \
+            .order('timestamp', desc=True) \
+            .execute()
+        
+        if response.data:
+            logging.info(f"Fetched {len(response.data)} trade records")
+            return response.data
+        return []
+        
+    except Exception as e:
+        logging.error(f"Error fetching trades from Supabase: {e}")
+        return []
+
+def group_trades_by_order_id(trades):
+    """Group trades by order_id to pair ENTRY events with CLOSE events.
+    
+    Args:
+        trades: List of trade records from Supabase
+        
+    Returns:
+        List of grouped trade dictionaries with calculated P&L and duration
+    """
+    from collections import defaultdict
+    
+    # Group by order_id
+    trade_groups = defaultdict(list)
+    for trade in trades:
+        order_id = trade.get('order_id', 'unknown')
+        trade_groups[order_id].append(trade)
+    
+    grouped_trades = []
+    
+    for order_id, events in trade_groups.items():
+        # Sort events by timestamp
+        events.sort(key=lambda x: x.get('timestamp', ''))
+        
+        entry_event = None
+        close_event = None
+        
+        for event in events:
+            event_type = event.get('event_type', '').upper()
+            if event_type == 'ENTRY':
+                entry_event = event
+            elif event_type == 'CLOSE':
+                close_event = event
+        
+        if entry_event:
+            # Calculate P&L and duration
+            entry_price = float(entry_event.get('price') or 0)
+            exit_price = None
+            pnl_dollars = None
+            pnl_points = None
+            duration = None
+            
+            if close_event:
+                # Get exit price from entry_price field in CLOSE event (it stores the original entry)
+                # or calculate from the close event's price field
+                exit_price = float(close_event.get('price') or 0) if close_event.get('price') else None
+                
+                # If close event has profit_loss, use it
+                if close_event.get('profit_loss') is not None:
+                    pnl_dollars = float(close_event.get('profit_loss'))
+                if close_event.get('profit_loss_points') is not None:
+                    pnl_points = float(close_event.get('profit_loss_points'))
+                
+                # Calculate duration
+                try:
+                    entry_time = datetime.datetime.fromisoformat(entry_event.get('timestamp', '').replace('+00', '+00:00'))
+                    close_time = datetime.datetime.fromisoformat(close_event.get('timestamp', '').replace('+00', '+00:00'))
+                    duration = close_time - entry_time
+                except:
+                    pass
+            
+            # If P&L not in close event, try to calculate from entry's balance vs close's balance
+            if pnl_dollars is None and close_event:
+                entry_balance = float(entry_event.get('balance') or 0)
+                close_balance = float(close_event.get('balance') or 0)
+                if entry_balance and close_balance:
+                    pnl_dollars = close_balance - entry_balance
+            
+            grouped_trades.append({
+                'order_id': order_id,
+                'timestamp': entry_event.get('timestamp'),
+                'symbol': entry_event.get('symbol', 'ES'),
+                'position_type': entry_event.get('position_type', '').upper(),
+                'size': entry_event.get('size', 0),
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'stop_loss': entry_event.get('stop_loss'),
+                'take_profit': entry_event.get('take_profit'),
+                'pnl_dollars': pnl_dollars,
+                'pnl_points': pnl_points,
+                'duration': duration,
+                'reasoning': entry_event.get('reasoning', ''),
+                'status': 'CLOSED' if close_event else 'OPEN',
+                'close_reasoning': close_event.get('reasoning', '') if close_event else ''
+            })
+    
+    # Sort by timestamp descending
+    grouped_trades.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    
+    return grouped_trades
+
+def show_trades_window():
+    """Show a popup window with trade history from Supabase."""
+    global TRADES_WINDOW, TRADES_VIEW_MODE
+    
+    # If window already exists, bring it to front
+    if TRADES_WINDOW and TRADES_WINDOW.winfo_exists():
+        TRADES_WINDOW.lift()
+        TRADES_WINDOW.focus_force()
+        return
+    
+    try:
+        # Create new Toplevel window
+        trades_win = tk.Toplevel()
+        TRADES_WINDOW = trades_win
+        trades_win.title("Trade History")
+        trades_win.geometry("1200x700")
+        trades_win.configure(bg='#1e1e1e')
+        
+        # Store references for updates
+        trades_data = {'raw': [], 'grouped': []}
+        widgets = {}
+        
+        # === Header Frame ===
+        header_frame = tk.Frame(trades_win, bg='#1e1e1e')
+        header_frame.pack(fill="x", padx=20, pady=10)
+        
+        title_label = tk.Label(header_frame, text="TRADE HISTORY", 
+                              font=("Arial", 18, "bold"), bg='#1e1e1e', fg='#00aaff')
+        title_label.pack(side="left")
+        
+        # === Controls Frame ===
+        controls_frame = tk.Frame(trades_win, bg='#2d2d2d', padx=10, pady=10)
+        controls_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        # Date pickers
+        today = datetime.date.today()
+        
+        tk.Label(controls_frame, text="Start Date:", font=("Arial", 10), 
+                bg='#2d2d2d', fg='#ffffff').pack(side="left", padx=(0, 5))
+        
+        start_entry = tk.Entry(controls_frame, font=("Arial", 10), width=12, 
+                              bg='#3d3d3d', fg='#ffffff', insertbackground='#ffffff')
+        start_entry.insert(0, today.strftime("%Y-%m-%d"))
+        start_entry.pack(side="left", padx=(0, 15))
+        widgets['start_entry'] = start_entry
+        
+        tk.Label(controls_frame, text="End Date:", font=("Arial", 10), 
+                bg='#2d2d2d', fg='#ffffff').pack(side="left", padx=(0, 5))
+        
+        end_entry = tk.Entry(controls_frame, font=("Arial", 10), width=12,
+                            bg='#3d3d3d', fg='#ffffff', insertbackground='#ffffff')
+        end_entry.insert(0, today.strftime("%Y-%m-%d"))
+        end_entry.pack(side="left", padx=(0, 15))
+        widgets['end_entry'] = end_entry
+        
+        def do_search():
+            """Execute search with current date range."""
+            try:
+                start_str = widgets['start_entry'].get().strip()
+                end_str = widgets['end_entry'].get().strip()
+                
+                start_date = datetime.datetime.strptime(start_str, "%Y-%m-%d").date()
+                end_date = datetime.datetime.strptime(end_str, "%Y-%m-%d").date()
+                
+                # Fetch data
+                trades_data['raw'] = fetch_trades_from_supabase(start_date, end_date)
+                trades_data['grouped'] = group_trades_by_order_id(trades_data['raw'])
+                
+                # Refresh display
+                refresh_trades_display()
+                
+            except ValueError as e:
+                logging.error(f"Invalid date format: {e}")
+                # Show error in status
+                if 'status_label' in widgets:
+                    widgets['status_label'].config(text="Error: Invalid date format (use YYYY-MM-DD)")
+        
+        def refresh_trades_display():
+            """Refresh the treeview with current data and view mode."""
+            global TRADES_VIEW_MODE
+            
+            tree = widgets.get('tree')
+            if not tree:
+                return
+            
+            # Clear existing items
+            for item in tree.get_children():
+                tree.delete(item)
+            
+            # Configure columns based on view mode
+            if TRADES_VIEW_MODE == "grouped":
+                tree['columns'] = ('time', 'symbol', 'side', 'qty', 'entry', 'exit', 'pnl_dollars', 'pnl_points', 'duration', 'status')
+                tree.heading('time', text='Time')
+                tree.heading('symbol', text='Symbol')
+                tree.heading('side', text='Side')
+                tree.heading('qty', text='Qty')
+                tree.heading('entry', text='Entry')
+                tree.heading('exit', text='Exit')
+                tree.heading('pnl_dollars', text='P&L ($)')
+                tree.heading('pnl_points', text='P&L (pts)')
+                tree.heading('duration', text='Duration')
+                tree.heading('status', text='Status')
+                
+                tree.column('#0', width=0, stretch=False)
+                tree.column('time', width=150, anchor='w')
+                tree.column('symbol', width=80, anchor='center')
+                tree.column('side', width=60, anchor='center')
+                tree.column('qty', width=40, anchor='center')
+                tree.column('entry', width=80, anchor='e')
+                tree.column('exit', width=80, anchor='e')
+                tree.column('pnl_dollars', width=90, anchor='e')
+                tree.column('pnl_points', width=80, anchor='e')
+                tree.column('duration', width=100, anchor='center')
+                tree.column('status', width=70, anchor='center')
+                
+                # Insert grouped data
+                for trade in trades_data['grouped']:
+                    # Format timestamp
+                    ts = trade.get('timestamp', '')
+                    try:
+                        dt = datetime.datetime.fromisoformat(ts.replace('+00', '+00:00'))
+                        time_str = dt.strftime("%Y-%m-%d %H:%M")
+                    except:
+                        time_str = ts[:16] if ts else 'N/A'
+                    
+                    # Format P&L
+                    pnl_d = trade.get('pnl_dollars')
+                    pnl_d_str = f"${pnl_d:+,.2f}" if pnl_d is not None else '-'
+                    
+                    pnl_p = trade.get('pnl_points')
+                    pnl_p_str = f"{pnl_p:+.2f}" if pnl_p is not None else '-'
+                    
+                    # Format duration
+                    dur = trade.get('duration')
+                    if dur:
+                        total_secs = int(dur.total_seconds())
+                        hours, remainder = divmod(total_secs, 3600)
+                        minutes, seconds = divmod(remainder, 60)
+                        if hours > 0:
+                            dur_str = f"{hours}h {minutes}m"
+                        else:
+                            dur_str = f"{minutes}m {seconds}s"
+                    else:
+                        dur_str = '-'
+                    
+                    # Format prices
+                    entry_p = trade.get('entry_price')
+                    entry_str = f"{entry_p:.2f}" if entry_p else '-'
+                    
+                    exit_p = trade.get('exit_price')
+                    exit_str = f"{exit_p:.2f}" if exit_p else '-'
+                    
+                    # Determine row tag for coloring
+                    tag = ''
+                    if pnl_d is not None:
+                        tag = 'profit' if pnl_d >= 0 else 'loss'
+                    
+                    # Get display symbol
+                    symbol = trade.get('symbol', 'ES')
+                    if 'EP' in symbol:
+                        symbol = 'ES'
+                    
+                    tree.insert('', 'end', values=(
+                        time_str,
+                        symbol,
+                        trade.get('position_type', '').upper(),
+                        trade.get('size', ''),
+                        entry_str,
+                        exit_str,
+                        pnl_d_str,
+                        pnl_p_str,
+                        dur_str,
+                        trade.get('status', '')
+                    ), tags=(tag,))
+                    
+            else:  # detailed view
+                tree['columns'] = ('time', 'event', 'symbol', 'side', 'qty', 'price', 'stop', 'target', 'reasoning')
+                tree.heading('time', text='Time')
+                tree.heading('event', text='Event')
+                tree.heading('symbol', text='Symbol')
+                tree.heading('side', text='Side')
+                tree.heading('qty', text='Qty')
+                tree.heading('price', text='Price')
+                tree.heading('stop', text='Stop')
+                tree.heading('target', text='Target')
+                tree.heading('reasoning', text='Reasoning')
+                
+                tree.column('#0', width=0, stretch=False)
+                tree.column('time', width=150, anchor='w')
+                tree.column('event', width=80, anchor='center')
+                tree.column('symbol', width=70, anchor='center')
+                tree.column('side', width=55, anchor='center')
+                tree.column('qty', width=35, anchor='center')
+                tree.column('price', width=75, anchor='e')
+                tree.column('stop', width=75, anchor='e')
+                tree.column('target', width=75, anchor='e')
+                tree.column('reasoning', width=400, anchor='w')
+                
+                # Insert raw data
+                for trade in trades_data['raw']:
+                    # Format timestamp
+                    ts = trade.get('timestamp', '')
+                    try:
+                        dt = datetime.datetime.fromisoformat(ts.replace('+00', '+00:00'))
+                        time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        time_str = ts[:19] if ts else 'N/A'
+                    
+                    # Format price
+                    price = trade.get('price') or trade.get('entry_price')
+                    price_str = f"{float(price):.2f}" if price else '-'
+                    
+                    stop = trade.get('stop_loss')
+                    stop_str = f"{float(stop):.2f}" if stop else '-'
+                    
+                    target = trade.get('take_profit')
+                    target_str = f"{float(target):.2f}" if target else '-'
+                    
+                    # Truncate reasoning for display
+                    reasoning = trade.get('reasoning', '') or ''
+                    if len(reasoning) > 80:
+                        reasoning = reasoning[:77] + '...'
+                    
+                    # Get display symbol
+                    symbol = trade.get('symbol', 'ES')
+                    if 'EP' in symbol:
+                        symbol = 'ES'
+                    
+                    # Color by event type
+                    event_type = trade.get('event_type', '').upper()
+                    if event_type == 'ENTRY':
+                        tag = 'entry'
+                    elif event_type == 'CLOSE':
+                        tag = 'close'
+                    elif event_type == 'SCALE':
+                        tag = 'scale'
+                    else:
+                        tag = ''
+                    
+                    tree.insert('', 'end', values=(
+                        time_str,
+                        event_type,
+                        symbol,
+                        trade.get('position_type', '').upper(),
+                        trade.get('size', ''),
+                        price_str,
+                        stop_str,
+                        target_str,
+                        reasoning
+                    ), tags=(tag,))
+            
+            # Update summary statistics
+            update_summary_stats()
+        
+        def update_summary_stats():
+            """Update the summary statistics labels."""
+            grouped = trades_data['grouped']
+            
+            total_trades = len(grouped)
+            closed_trades = [t for t in grouped if t.get('status') == 'CLOSED']
+            
+            # Calculate P&L
+            total_pnl = sum(t.get('pnl_dollars', 0) or 0 for t in closed_trades)
+            
+            # Calculate win rate
+            winners = [t for t in closed_trades if (t.get('pnl_dollars') or 0) > 0]
+            losers = [t for t in closed_trades if (t.get('pnl_dollars') or 0) < 0]
+            win_rate = (len(winners) / len(closed_trades) * 100) if closed_trades else 0
+            
+            # Update labels
+            if 'total_trades_label' in widgets:
+                widgets['total_trades_label'].config(text=f"Total Trades: {total_trades}")
+            
+            if 'closed_trades_label' in widgets:
+                widgets['closed_trades_label'].config(text=f"Closed: {len(closed_trades)}")
+            
+            if 'total_pnl_label' in widgets:
+                pnl_color = '#00ff00' if total_pnl >= 0 else '#ff4444'
+                widgets['total_pnl_label'].config(text=f"Total P&L: ${total_pnl:+,.2f}", fg=pnl_color)
+            
+            if 'win_rate_label' in widgets:
+                wr_color = '#00ff00' if win_rate >= 50 else '#ffaa00' if win_rate >= 40 else '#ff4444'
+                widgets['win_rate_label'].config(text=f"Win Rate: {win_rate:.1f}%", fg=wr_color)
+            
+            if 'winners_label' in widgets:
+                widgets['winners_label'].config(text=f"Winners: {len(winners)}")
+            
+            if 'losers_label' in widgets:
+                widgets['losers_label'].config(text=f"Losers: {len(losers)}")
+            
+            # Status message
+            if 'status_label' in widgets:
+                widgets['status_label'].config(text=f"Loaded {len(trades_data['raw'])} events, {total_trades} trades")
+        
+        def toggle_view():
+            """Toggle between grouped and detailed view."""
+            global TRADES_VIEW_MODE
+            TRADES_VIEW_MODE = "detailed" if TRADES_VIEW_MODE == "grouped" else "grouped"
+            
+            # Update button text
+            if 'view_btn' in widgets:
+                new_text = "Show Detailed" if TRADES_VIEW_MODE == "grouped" else "Show Grouped"
+                widgets['view_btn'].config(text=new_text)
+            
+            refresh_trades_display()
+        
+        # Search button
+        search_btn = tk.Button(controls_frame, text="Search", 
+                              command=do_search,
+                              font=("Arial", 10, "bold"), bg='#006600', fg='#ffffff',
+                              activebackground='#008800', relief=tk.FLAT, padx=15, pady=2)
+        search_btn.pack(side="left", padx=(0, 20))
+        
+        # View toggle button
+        view_btn = tk.Button(controls_frame, text="Show Detailed", 
+                            command=toggle_view,
+                            font=("Arial", 10), bg='#444444', fg='#ffffff',
+                            activebackground='#666666', relief=tk.FLAT, padx=15, pady=2)
+        view_btn.pack(side="left")
+        widgets['view_btn'] = view_btn
+        
+        # Quick date buttons
+        def set_today():
+            widgets['start_entry'].delete(0, tk.END)
+            widgets['start_entry'].insert(0, today.strftime("%Y-%m-%d"))
+            widgets['end_entry'].delete(0, tk.END)
+            widgets['end_entry'].insert(0, today.strftime("%Y-%m-%d"))
+            do_search()
+        
+        def set_week():
+            week_ago = today - datetime.timedelta(days=7)
+            widgets['start_entry'].delete(0, tk.END)
+            widgets['start_entry'].insert(0, week_ago.strftime("%Y-%m-%d"))
+            widgets['end_entry'].delete(0, tk.END)
+            widgets['end_entry'].insert(0, today.strftime("%Y-%m-%d"))
+            do_search()
+        
+        def set_month():
+            month_ago = today - datetime.timedelta(days=30)
+            widgets['start_entry'].delete(0, tk.END)
+            widgets['start_entry'].insert(0, month_ago.strftime("%Y-%m-%d"))
+            widgets['end_entry'].delete(0, tk.END)
+            widgets['end_entry'].insert(0, today.strftime("%Y-%m-%d"))
+            do_search()
+        
+        tk.Button(controls_frame, text="Today", command=set_today,
+                 font=("Arial", 9), bg='#333333', fg='#aaaaaa',
+                 activebackground='#555555', relief=tk.FLAT, padx=8, pady=2).pack(side="left", padx=(20, 5))
+        
+        tk.Button(controls_frame, text="7 Days", command=set_week,
+                 font=("Arial", 9), bg='#333333', fg='#aaaaaa',
+                 activebackground='#555555', relief=tk.FLAT, padx=8, pady=2).pack(side="left", padx=5)
+        
+        tk.Button(controls_frame, text="30 Days", command=set_month,
+                 font=("Arial", 9), bg='#333333', fg='#aaaaaa',
+                 activebackground='#555555', relief=tk.FLAT, padx=8, pady=2).pack(side="left", padx=5)
+        
+        # === Treeview Frame ===
+        tree_frame = tk.Frame(trades_win, bg='#1e1e1e')
+        tree_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        
+        # Create Treeview with scrollbars
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("Trades.Treeview",
+                       background='#2d2d2d',
+                       foreground='#ffffff',
+                       fieldbackground='#2d2d2d',
+                       rowheight=25)
+        style.configure("Trades.Treeview.Heading",
+                       background='#3d3d3d',
+                       foreground='#ffffff',
+                       font=('Arial', 10, 'bold'))
+        style.map('Trades.Treeview',
+                 background=[('selected', '#0066aa')])
+        
+        tree = ttk.Treeview(tree_frame, style="Trades.Treeview", show='headings')
+        widgets['tree'] = tree
+        
+        # Scrollbars
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        
+        # Grid layout for tree and scrollbars
+        tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+        
+        # Configure row tags for coloring
+        tree.tag_configure('profit', foreground='#00ff00')
+        tree.tag_configure('loss', foreground='#ff4444')
+        tree.tag_configure('entry', foreground='#00aaff')
+        tree.tag_configure('close', foreground='#ffaa00')
+        tree.tag_configure('scale', foreground='#aa00ff')
+        
+        # === Summary Frame ===
+        summary_frame = tk.Frame(trades_win, bg='#2d2d2d', padx=15, pady=10)
+        summary_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        # Summary stats labels
+        total_trades_label = tk.Label(summary_frame, text="Total Trades: 0", 
+                                     font=("Arial", 11), bg='#2d2d2d', fg='#ffffff')
+        total_trades_label.pack(side="left", padx=(0, 20))
+        widgets['total_trades_label'] = total_trades_label
+        
+        closed_trades_label = tk.Label(summary_frame, text="Closed: 0", 
+                                      font=("Arial", 11), bg='#2d2d2d', fg='#aaaaaa')
+        closed_trades_label.pack(side="left", padx=(0, 20))
+        widgets['closed_trades_label'] = closed_trades_label
+        
+        winners_label = tk.Label(summary_frame, text="Winners: 0", 
+                                font=("Arial", 11), bg='#2d2d2d', fg='#00ff00')
+        winners_label.pack(side="left", padx=(0, 10))
+        widgets['winners_label'] = winners_label
+        
+        losers_label = tk.Label(summary_frame, text="Losers: 0", 
+                               font=("Arial", 11), bg='#2d2d2d', fg='#ff4444')
+        losers_label.pack(side="left", padx=(0, 20))
+        widgets['losers_label'] = losers_label
+        
+        win_rate_label = tk.Label(summary_frame, text="Win Rate: 0%", 
+                                 font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
+        win_rate_label.pack(side="left", padx=(0, 20))
+        widgets['win_rate_label'] = win_rate_label
+        
+        total_pnl_label = tk.Label(summary_frame, text="Total P&L: $0.00", 
+                                  font=("Arial", 12, "bold"), bg='#2d2d2d', fg='#00ff00')
+        total_pnl_label.pack(side="left", padx=(0, 20))
+        widgets['total_pnl_label'] = total_pnl_label
+        
+        # Status label (right side)
+        status_label = tk.Label(summary_frame, text="", 
+                               font=("Arial", 10), bg='#2d2d2d', fg='#888888')
+        status_label.pack(side="right")
+        widgets['status_label'] = status_label
+        
+        # Initialize with today's data
+        refresh_trades_display()  # Set up columns first
+        do_search()  # Then fetch data
+        
+        # Center the window
+        trades_win.update_idletasks()
+        width = trades_win.winfo_width()
+        height = trades_win.winfo_height()
+        x = (trades_win.winfo_screenwidth() // 2) - (width // 2)
+        y = (trades_win.winfo_screenheight() // 2) - (height // 2)
+        trades_win.geometry(f'{width}x{height}+{x}+{y}')
+        
+        # Handle window close
+        def on_close():
+            global TRADES_WINDOW
+            TRADES_WINDOW = None
+            trades_win.destroy()
+        
+        trades_win.protocol("WM_DELETE_WINDOW", on_close)
+        
+    except Exception as e:
+        logging.error(f"Error showing trades window: {e}")
         logging.exception("Full traceback:")
 
 def update_dashboard_data():

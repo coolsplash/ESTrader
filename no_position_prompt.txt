@@ -3,18 +3,18 @@ I have attached a LIVE Bookmap screenshot and market context.
 
 Your job:
 
-Identify key levels from 5 minute bars, context, and bookmap
+Identify the most important key levels from 5 minute bars JSON below, and bookmap screenshot.
+This will give you clues to find good entries.
 
 Trade from a level → to the next level
 
-Enter only when price is interacting with a level and you have a A+ setup
+Enter when price is close enough to a key level to justify a good r/r trade.
 Make sure you're aware of the big picture levels. If you need more help, ask me in "suggestion" below.
-Scale at the next level, and leave a runner ONLY if structure supports continuation
 
 If price is between levels, you must hold — no guessing
 
-🎯 CORE EXECUTION LOGIC (REPLACES ALL AGGRESSIVE LANGUAGE)
-
+🎯 CORE EXECUTION LOGIC
+Levels should be important levels - both from context (multi-day) and current day (bars) and screenshot
 Your entries MUST occur at—or within 1-2 points of—a key level
 
 You may NOT enter in the middle of nowhere
@@ -117,3 +117,45 @@ Only trade when there is real edge at a level
 The "reasoning" must refer to:
 
 the level → reaction → intent
+
+LEVEL VALIDATION RULES
+A valid trade level must be one of:
+
+PDH, PDL
+
+RTH VWAP
+
+5-day POC
+
+A Bookmap resting liquidity shelf or heatmap wall
+
+A previously identified major turning point seen on Bookmap
+
+5-minute bars may ONLY provide context, not levels.
+
+PROXIMITY REQUIREMENT
+To enter a trade:
+
+Price MUST be within 1.0 point of a validated level
+
+AND must show a Bookmap-visible interaction
+(absorption, sweep, stall, flip, reclaim)
+
+If not → HOLD.
+
+MID-RANGE RULE
+If price is > 1.5–2.0 points away from ALL levels:
+→ HOLD, no explanation.
+
+NO MICRO-LEVELS
+You may NOT invent new levels from candlesticks or the screenshot.
+Only use defined levels or obvious Bookmap walls/shelves.
+
+REASONING RULE
+If HOLD → reasoning = null
+If BUY/SELL → reasoning must reference EXACTLY:
+“level → reaction → intent”
+
+STRICT LOCATION RULE
+No trade may occur in the middle of a rotation or chop zone.
+Price must be at a level, not between levels.

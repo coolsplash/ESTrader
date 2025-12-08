@@ -119,23 +119,19 @@ def parse_equities_hours_from_html(html_content: str, date: datetime.date) -> Op
                                 'notes': 'Market closed (holiday)'
                             }
                         
-                        # Check for early close (Trading Halt or early Close time)
-                        if ('halt' in row_text.lower() or 'close @' in row_text.lower()) and 'CT' in row_text:
-                            return {
-                                'date': date.isoformat(),
-                                'type': 'early_close',
-                                'open_time': '18:00',  # Normal open
-                                'close_time': '13:00',  # Common early close time (converted from CT)
-                                'notes': 'Early close day'
-                            }
+                        # IMPORTANT: This fallback parser cannot reliably detect date-specific
+                        # early closes from the entire Equities row text. The row contains ALL
+                        # holidays for the year, so keywords like "halt" or "close @" may refer
+                        # to different dates. Default to normal trading hours - the LLM parser
+                        # should handle specific holiday detection properly.
                         
-                        # Normal trading day
+                        # Normal trading day (safe default)
                         return {
                             'date': date.isoformat(),
                             'type': 'normal',
                             'open_time': '18:00',
                             'close_time': '17:00',
-                            'notes': 'Normal trading hours'
+                            'notes': 'Normal trading hours (fallback parser)'
                         }
         
         logging.warning(f"Could not find Equities row in HTML for {date}")

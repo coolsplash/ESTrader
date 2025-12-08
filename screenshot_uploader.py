@@ -3984,6 +3984,20 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                 bars_result = get_bars_for_llm(contract_id, topstep_config, auth_token)
                 raw_bars = bars_result.get('bars', [])
                 
+                # Fallback to Yahoo Finance if TopStep returns no bars
+                if not raw_bars:
+                    logging.warning("TopStep returned no bars - falling back to Yahoo Finance")
+                    try:
+                        from yahoo_bars import get_yahoo_bars_for_llm
+                        yahoo_result = get_yahoo_bars_for_llm(num_bars=36)
+                        raw_bars = yahoo_result.get('bars', [])
+                        if raw_bars:
+                            logging.info(f"Successfully retrieved {len(raw_bars)} bars from Yahoo Finance fallback")
+                        else:
+                            logging.warning("Yahoo Finance fallback also returned no bars")
+                    except Exception as yahoo_e:
+                        logging.error(f"Yahoo Finance fallback failed: {yahoo_e}")
+                
                 # Generate structured JSON market data
                 market_data_json = generate_market_data_json(
                     raw_bars,
@@ -4209,6 +4223,20 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             contract_id = topstep_config.get('contract_id', '')
             bars_result = get_bars_for_llm(contract_id, topstep_config, auth_token)
             raw_bars = bars_result.get('bars', [])
+            
+            # Fallback to Yahoo Finance if TopStep returns no bars
+            if not raw_bars:
+                logging.warning("TopStep returned no bars - falling back to Yahoo Finance")
+                try:
+                    from yahoo_bars import get_yahoo_bars_for_llm
+                    yahoo_result = get_yahoo_bars_for_llm(num_bars=36)
+                    raw_bars = yahoo_result.get('bars', [])
+                    if raw_bars:
+                        logging.info(f"Successfully retrieved {len(raw_bars)} bars from Yahoo Finance fallback")
+                    else:
+                        logging.warning("Yahoo Finance fallback also returned no bars")
+                except Exception as yahoo_e:
+                    logging.error(f"Yahoo Finance fallback failed: {yahoo_e}")
             
             # Generate structured JSON market data
             market_data_json = generate_market_data_json(
@@ -6477,13 +6505,28 @@ def fetch_trade_results(account_id, topstep_config, enable_trading, auth_token=N
             end_timestamp = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         
         # Normalize timestamps to consistent format (seconds precision with Z suffix)
-        # Handle timestamps that may have microseconds or missing Z suffix
+        # Handle timestamps that may have microseconds, timezone offsets, or missing Z suffix
         def normalize_timestamp(ts):
             if not ts:
                 return ts
-            # Remove microseconds if present (anything after the seconds)
+            # Remove microseconds if present (anything after the seconds before timezone)
             if '.' in ts:
-                ts = ts.split('.')[0]
+                # Handle both .000Z and .000+00:00 formats
+                dot_idx = ts.index('.')
+                # Find where timezone info starts (Z or + or -)
+                tz_start = len(ts)
+                for i, c in enumerate(ts[dot_idx:]):
+                    if c in 'Z+-':
+                        tz_start = dot_idx + i
+                        break
+                ts = ts[:dot_idx] + ts[tz_start:]
+            # Remove timezone offset if present (e.g., +00:00) and replace with Z
+            if '+' in ts or ts.count('-') > 2:  # Has timezone offset
+                # Find the timezone offset (last + or the third -)
+                for i in range(len(ts) - 1, -1, -1):
+                    if ts[i] == '+' or (ts[i] == '-' and i > 10):  # Offset position
+                        ts = ts[:i] + 'Z'
+                        break
             # Add Z suffix if missing
             if not ts.endswith('Z'):
                 ts = ts + 'Z'

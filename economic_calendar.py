@@ -434,7 +434,7 @@ def load_calendar_data(data_file: str) -> Dict:
         with open(data_file, 'r') as f:
             data = json.load(f)
         
-        logging.info(f"Loaded calendar data: {len(data.get('events', []))} events")
+        logging.debug(f"Loaded calendar data: {len(data.get('events', []))} events")
         return data
         
     except json.JSONDecodeError as e:
@@ -563,7 +563,7 @@ def get_upcoming_events(data_file: str, minutes_before: int, minutes_after: int,
             logging.error(f"Error processing event {event.get('name', 'unknown')}: {e}")
             continue
     
-    logging.info(f"Found {len(upcoming)} upcoming events matching criteria")
+    logging.debug(f"Found {len(upcoming)} upcoming events matching criteria")
     return upcoming
 
 

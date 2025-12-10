@@ -18,7 +18,7 @@ import base64  # For Basic Auth
 import win32ui
 import win32con
 import win32process
-from ctypes import windll
+from ctypes import windll, wintypes
 import tkinter as tk
 from tkinter import messagebox, ttk
 import sys
@@ -43,6 +43,76 @@ try:
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
+
+
+def check_session_state():
+    """Check if the current session may have screenshot capture issues.
+    
+    Detects conditions that commonly cause partial/blank screenshots:
+    - Computer is locked
+    - Running in a disconnected RDP session
+    - No active desktop session
+    
+    Returns:
+        dict: {'is_active': bool, 'warnings': list[str]}
+    """
+    warnings = []
+    is_active = True
+    
+    try:
+        # Check if workstation is locked using OpenInputDesktop
+        # This fails if the secure desktop (lock screen) is active
+        user32 = windll.user32
+        
+        # Try to open input desktop
+        hDesktop = user32.OpenInputDesktop(0, False, 0x0001)  # DESKTOP_READOBJECTS
+        if hDesktop:
+            user32.CloseDesktop(hDesktop)
+        else:
+            # Can't open input desktop - likely locked or disconnected
+            warnings.append("Desktop may be locked or session disconnected")
+            is_active = False
+        
+        # Check for console vs RDP session
+        SM_REMOTESESSION = 0x1000
+        is_remote = user32.GetSystemMetrics(SM_REMOTESESSION)
+        if is_remote:
+            warnings.append("Running in Remote Desktop session - ensure RDP window is not minimized")
+            
+        # Check WTSQuerySessionInformation for session state (if available)
+        try:
+            wtsapi32 = windll.wtsapi32
+            WTS_CURRENT_SERVER_HANDLE = 0
+            WTS_CURRENT_SESSION = -1
+            WTSConnectState = 8
+            
+            buffer = ctypes.c_void_p()
+            bytes_returned = wintypes.DWORD()
+            
+            if wtsapi32.WTSQuerySessionInformationW(
+                WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSConnectState,
+                ctypes.byref(buffer), ctypes.byref(bytes_returned)
+            ):
+                # 0 = Active, 1 = Connected, 4 = Disconnected, 5 = Idle
+                state = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_int)).contents.value
+                wtsapi32.WTSFreeMemory(buffer)
+                
+                state_names = {0: 'Active', 1: 'Connected', 4: 'Disconnected', 5: 'Idle'}
+                state_name = state_names.get(state, f'Unknown({state})')
+                
+                if state == 4:  # Disconnected
+                    warnings.append(f"Session state is {state_name} - screenshots may fail")
+                    is_active = False
+                elif state != 0:
+                    warnings.append(f"Session state: {state_name}")
+        except Exception:
+            pass  # WTS query not critical
+            
+    except Exception as e:
+        logging.debug(f"Session state check error: {e}")
+    
+    return {'is_active': is_active, 'warnings': warnings}
+
 
 def get_eastern_utc_offset():
     """Get the current UTC offset for Eastern Time (handles EST/EDT).
@@ -1505,8 +1575,67 @@ def get_window_by_partial_title(partial_title, process_name=None):
     
     return selected['hwnd']
 
+def validate_screenshot(image, min_unique_colors=100, max_blank_ratio=0.5):
+    """Validate that a screenshot contains meaningful content.
+    
+    Detects common issues with locked screen / RDP disconnected captures:
+    - Mostly black/blank areas
+    - Very few unique colors (indicates partial render)
+    
+    Args:
+        image: PIL Image to validate
+        min_unique_colors: Minimum unique colors expected in a valid screenshot
+        max_blank_ratio: Maximum ratio of near-black pixels allowed
+        
+    Returns:
+        tuple: (is_valid, issue_description)
+    """
+    try:
+        # Sample pixels for efficiency (check every 10th pixel)
+        width, height = image.size
+        pixels = list(image.getdata())
+        sample_size = len(pixels) // 10
+        sampled_pixels = pixels[::10] if sample_size > 0 else pixels
+        
+        # Count near-black pixels (RGB sum < 30)
+        blank_pixels = sum(1 for p in sampled_pixels if sum(p[:3]) < 30)
+        blank_ratio = blank_pixels / len(sampled_pixels) if sampled_pixels else 1.0
+        
+        # Count unique colors
+        unique_colors = len(set(sampled_pixels))
+        
+        issues = []
+        
+        if blank_ratio > max_blank_ratio:
+            issues.append(f"Screenshot has {blank_ratio*100:.1f}% blank/black pixels (max {max_blank_ratio*100:.0f}%)")
+            
+        if unique_colors < min_unique_colors:
+            issues.append(f"Screenshot has only {unique_colors} unique colors (expected at least {min_unique_colors})")
+        
+        is_valid = len(issues) == 0
+        issue_desc = "; ".join(issues) if issues else None
+        
+        return is_valid, issue_desc
+        
+    except Exception as e:
+        logging.warning(f"Screenshot validation error: {e}")
+        return True, None  # Assume valid if validation fails
+
+
 def capture_screenshot(window_title=None, window_process_name=None, top_offset=0, bottom_offset=0, left_offset=0, right_offset=0, save_folder=None, enable_save_screenshots=False):
-    """Capture the full screen or a specific window (by partial title) using Win32 PrintWindow without activating, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string."""
+    """Capture the full screen or a specific window (by partial title) using Win32 PrintWindow without activating, apply offsets by cropping, save to folder if enabled, and return as base64-encoded string.
+    
+    NOTE: Screenshot capture may fail when:
+    - Computer is locked
+    - RDP session is disconnected or minimized
+    - Hardware-accelerated applications (like Bookmap with OpenGL)
+    
+    FIXES FOR RDP:
+    1. Registry fix: Add DWORD 'RemoteDesktop_SuppressWhenMinimized' = 2 to
+       HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Terminal Server Client
+    2. Use VNC instead of RDP (maintains active desktop session)
+    3. Keep RDP window visible (not minimized)
+    """
     logging.info("Capturing screenshot.")
     if window_title:
         hwnd = get_window_by_partial_title(window_title, window_process_name)
@@ -1541,6 +1670,9 @@ def capture_screenshot(window_title=None, window_process_name=None, top_offset=0
             raise ValueError("Offsets result in invalid effective width.")
 
         # Capture using Win32 PrintWindow (works without bringing to foreground)
+        screenshot = None
+        capture_method = "unknown"
+        
         try:
             # Create device contexts
             hwndDC = win32gui.GetWindowDC(hwnd)
@@ -1552,13 +1684,37 @@ def capture_screenshot(window_title=None, window_process_name=None, top_offset=0
             saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
             saveDC.SelectObject(saveBitMap)
 
-            # Use PrintWindow to capture window content
+            # Method 1: PrintWindow with PW_RENDERFULLCONTENT (flag 3)
+            # Best for most applications, forces window to redraw
             result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 3)  # 3 = PW_RENDERFULLCONTENT
+            capture_method = "PrintWindow(PW_RENDERFULLCONTENT)"
             
             if result == 0:
-                logging.warning("PrintWindow returned 0, attempting fallback to BitBlt")
-                # Fallback to BitBlt if PrintWindow fails
+                logging.warning("PrintWindow with PW_RENDERFULLCONTENT returned 0, trying PW_CLIENTONLY")
+                # Method 2: PrintWindow with PW_CLIENTONLY (flag 1)
+                # May work better for some applications
+                result = windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 1)
+                capture_method = "PrintWindow(PW_CLIENTONLY)"
+                
+            if result == 0:
+                logging.warning("PrintWindow with PW_CLIENTONLY returned 0, trying WM_PRINT message")
+                # Method 3: Send WM_PRINT message directly to window
+                # Some applications respond better to this
+                WM_PRINT = 0x0317
+                PRF_CLIENT = 0x00000004
+                PRF_NONCLIENT = 0x00000002
+                PRF_CHILDREN = 0x00000010
+                PRF_OWNED = 0x00000020
+                windll.user32.SendMessageW(hwnd, WM_PRINT, saveDC.GetSafeHdc(), 
+                                          PRF_CLIENT | PRF_NONCLIENT | PRF_CHILDREN | PRF_OWNED)
+                capture_method = "WM_PRINT"
+            
+            if result == 0:
+                logging.warning("WM_PRINT also failed, attempting fallback to BitBlt")
+                # Method 4: BitBlt fallback (copies from screen)
+                # Only works if window is visible on screen
                 saveDC.BitBlt((0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY)
+                capture_method = "BitBlt"
 
             # Convert to PIL Image
             bmpinfo = saveBitMap.GetInfo()
@@ -1575,7 +1731,33 @@ def capture_screenshot(window_title=None, window_process_name=None, top_offset=0
             mfcDC.DeleteDC()
             win32gui.ReleaseDC(hwnd, hwndDC)
 
-            logging.info("Screenshot captured using PrintWindow")
+            logging.info(f"Screenshot captured using {capture_method}")
+            
+            # Validate screenshot content
+            is_valid, issue = validate_screenshot(screenshot)
+            if not is_valid:
+                logging.warning(f"SCREENSHOT QUALITY ISSUE: {issue}")
+                
+                # Check session state for additional diagnostics
+                session_state = check_session_state()
+                if session_state['warnings']:
+                    for warning in session_state['warnings']:
+                        logging.warning(f"SESSION STATE: {warning}")
+                
+                logging.warning("=" * 60)
+                logging.warning("SCREENSHOT CAPTURE ISSUE DETECTED")
+                logging.warning("This commonly occurs when:")
+                logging.warning("  - Computer is locked")
+                logging.warning("  - RDP session is disconnected or minimized")
+                logging.warning("  - Hardware-accelerated app content not rendering")
+                logging.warning("")
+                logging.warning("SOLUTIONS:")
+                logging.warning("  1. REGISTRY FIX (for RDP): Run as admin:")
+                logging.warning("     reg add \"HKLM\\Software\\Microsoft\\Terminal Server Client\" /v RemoteDesktop_SuppressWhenMinimized /t REG_DWORD /d 2 /f")
+                logging.warning("  2. USE VNC instead of RDP (maintains active desktop)")
+                logging.warning("  3. Keep RDP window visible (not minimized)")
+                logging.warning("  4. Ensure computer is not locked")
+                logging.warning("=" * 60)
 
             # Restore minimized state if it was originally minimized
             if was_minimized:
@@ -1586,7 +1768,7 @@ def capture_screenshot(window_title=None, window_process_name=None, top_offset=0
             # Make sure to restore minimized state even on error
             if was_minimized:
                 win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-            logging.error(f"Error capturing window with PrintWindow: {e}")
+            logging.error(f"Error capturing window with {capture_method}: {e}")
             raise ValueError(f"Failed to capture window: {e}")
 
         # Apply crop for offsets
@@ -3552,7 +3734,58 @@ def update_countdown():
     global DASHBOARD_WINDOW, DASHBOARD_WIDGETS, LAST_JOB_TIME, INTERVAL_SCHEDULE
     if DASHBOARD_WINDOW and DASHBOARD_WINDOW.winfo_exists() and 'countdown_label' in DASHBOARD_WIDGETS:
         try:
-            if LAST_JOB_TIME is not None:
+            # First check if we're in an economic event window (highest priority display)
+            in_event_window, active_events = is_in_economic_event_window()
+            
+            if in_event_window and active_events:
+                # Get the most imminent event
+                # Sort by minutes_until (negative means event is in progress)
+                sorted_events = sorted(active_events, key=lambda x: abs(x.get('minutes_until', 0)))
+                event = sorted_events[0]
+                event_name = event.get('name', 'Economic Event')
+                minutes_until = event.get('minutes_until', 0)
+                severity = event.get('severity', 'High')
+                
+                # Truncate event name if too long
+                if len(event_name) > 20:
+                    event_name = event_name[:17] + "..."
+                
+                # Get the window end time from cache for accurate countdown
+                window_end = _ECONOMIC_EVENT_CACHE.get('window_end_time')
+                
+                if window_end:
+                    # Calculate time until trading resumes
+                    time_until_resume = (window_end - datetime.datetime.now()).total_seconds()
+                    if time_until_resume > 0:
+                        mins_remaining = int(time_until_resume / 60)
+                        resume_str = window_end.strftime('%H:%M')
+                        if mins_remaining > 0:
+                            status_text = f"📅 {event_name} | Resume: {resume_str} ({mins_remaining}m)"
+                        else:
+                            secs_remaining = int(time_until_resume)
+                            status_text = f"📅 {event_name} | Resume: {resume_str} ({secs_remaining}s)"
+                    else:
+                        status_text = f"📅 {event_name} | Resuming..."
+                else:
+                    # Fallback if no window_end calculated
+                    if minutes_until >= 0:
+                        status_text = f"📅 Event: {event_name} in {int(minutes_until)} min"
+                    else:
+                        status_text = f"📅 Event: {event_name} - hold"
+                
+                # Color based on severity
+                if severity == 'High':
+                    color = '#ff6666'  # Red
+                elif severity == 'Medium':
+                    color = '#ffaa00'  # Orange
+                else:
+                    color = '#ffff00'  # Yellow
+                
+                DASHBOARD_WIDGETS['countdown_label'].config(
+                    text=status_text,
+                    fg=color
+                )
+            elif LAST_JOB_TIME is not None:
                 current_interval = get_current_interval()
                 
                 # Check if in disabled interval and show next active time
@@ -3599,6 +3832,187 @@ def update_countdown():
             logging.debug(f"Error updating countdown: {e}")
     else:
         logging.debug("Dashboard window or countdown widget not available")
+
+
+def refresh_economic_calendar():
+    """Manually refresh the economic calendar by fetching fresh events from MarketWatch.
+    
+    This fetches new economic events, classifies them with LLM for severity,
+    and saves them to the cache file. The cache is also automatically refreshed
+    weekly at startup if the data is stale.
+    """
+    try:
+        logging.info("=" * 80)
+        logging.info("MANUALLY REFRESHING ECONOMIC CALENDAR")
+        logging.info("=" * 80)
+        
+        if not CONFIG.has_section('EconomicCalendar') or not CONFIG.getboolean('EconomicCalendar', 'enable_economic_calendar', fallback=False):
+            logging.warning("Economic calendar integration is disabled in config")
+            logging.info("Enable it by setting enable_economic_calendar = true in [EconomicCalendar] section")
+            return
+        
+        calendar_file = CONFIG.get('EconomicCalendar', 'data_file', fallback='market_data/economic_calendar.json')
+        classification_prompt = CONFIG.get('EconomicCalendar', 'classification_prompt', fallback='Analyze these economic calendar events and classify each by market impact severity (High/Medium/Low) for ES futures trading. For each event, provide expected market reaction and affected instruments. Return JSON format.')
+        
+        # Fetch events from MarketWatch
+        logging.info("Fetching events from MarketWatch...")
+        raw_events = economic_calendar.fetch_marketwatch_calendar()
+        
+        if not raw_events:
+            logging.error("No events fetched from MarketWatch")
+            logging.error("=" * 80)
+            return
+        
+        logging.info(f"Fetched {len(raw_events)} events from MarketWatch")
+        
+        # Classify events with LLM
+        logging.info("Classifying events with LLM...")
+        openai_config = {
+            'api_key': OPENAI_API_KEY,
+            'api_url': OPENAI_API_URL
+        }
+        classified_events = economic_calendar.classify_events_with_llm(raw_events, openai_config, classification_prompt)
+        
+        # Save to file
+        if economic_calendar.save_calendar_data(classified_events, calendar_file):
+            logging.info("=" * 80)
+            logging.info("ECONOMIC CALENDAR REFRESHED SUCCESSFULLY")
+            logging.info("=" * 80)
+            logging.info(f"Saved {len(classified_events)} events to {calendar_file}")
+            logging.info("=" * 80)
+            logging.info("ECONOMIC EVENTS FOR THIS WEEK:")
+            logging.info("=" * 80)
+            
+            # Sort by datetime and display
+            sorted_events = sorted(classified_events, key=lambda x: x.get('datetime', ''))
+            for event in sorted_events[:15]:  # Show first 15 events
+                event_time = event.get('datetime', 'Unknown time')
+                event_name = event.get('name', 'Unknown')
+                severity = event.get('severity', 'Unknown')
+                logging.info(f"  {event_time}: {event_name} [{severity}]")
+            
+            if len(classified_events) > 15:
+                logging.info(f"  ... and {len(classified_events) - 15} more events")
+            logging.info("=" * 80)
+        else:
+            logging.error("Failed to save economic calendar data")
+            logging.error("=" * 80)
+        
+    except Exception as e:
+        logging.error(f"Error refreshing economic calendar: {e}")
+        logging.exception("Full traceback:")
+
+
+# Cache for economic event window check (avoid checking frequently)
+_ECONOMIC_EVENT_CACHE = {
+    'last_check': None,
+    'in_window': False,
+    'events': [],
+    'window_end_time': None,  # When trading resumes (event_time + minutes_after)
+    'cache_seconds': 60,  # Only check every 60 seconds
+    'last_logged_state': None  # Track state to only log changes
+}
+
+
+def is_in_economic_event_window():
+    """Check if we are currently within an economic event window where trading should hold.
+    
+    Uses caching to avoid checking the calendar file frequently.
+    Cache refreshes every 60 seconds. Only logs when state changes.
+    
+    Returns:
+        tuple: (is_in_window: bool, active_events: list)
+            - is_in_window: True if we should hold back trading
+            - active_events: List of active events if in window, empty list otherwise
+    """
+    global _ECONOMIC_EVENT_CACHE
+    
+    try:
+        now = datetime.datetime.now()
+        
+        # If we know the window end time, check if we've passed it
+        if _ECONOMIC_EVENT_CACHE['window_end_time'] is not None:
+            if now >= _ECONOMIC_EVENT_CACHE['window_end_time']:
+                # Window has ended - clear the cache and log state change
+                if _ECONOMIC_EVENT_CACHE['last_logged_state'] != 'clear':
+                    logging.info("📅 Economic event window ended - trading resumed")
+                    _ECONOMIC_EVENT_CACHE['last_logged_state'] = 'clear'
+                _ECONOMIC_EVENT_CACHE['in_window'] = False
+                _ECONOMIC_EVENT_CACHE['events'] = []
+                _ECONOMIC_EVENT_CACHE['window_end_time'] = None
+                _ECONOMIC_EVENT_CACHE['last_check'] = now
+                return False, []
+        
+        # Check if we can use cached result
+        if _ECONOMIC_EVENT_CACHE['last_check'] is not None:
+            elapsed = (now - _ECONOMIC_EVENT_CACHE['last_check']).total_seconds()
+            if elapsed < _ECONOMIC_EVENT_CACHE['cache_seconds']:
+                # Use cached result
+                return _ECONOMIC_EVENT_CACHE['in_window'], _ECONOMIC_EVENT_CACHE['events']
+        
+        # Need to refresh cache
+        if not CONFIG.has_section('EconomicCalendar') or not CONFIG.getboolean('EconomicCalendar', 'enable_economic_calendar', fallback=False):
+            _ECONOMIC_EVENT_CACHE['last_check'] = now
+            _ECONOMIC_EVENT_CACHE['in_window'] = False
+            _ECONOMIC_EVENT_CACHE['events'] = []
+            return False, []
+        
+        calendar_file = CONFIG.get('EconomicCalendar', 'data_file', fallback='market_data/economic_calendar.json')
+        minutes_before = CONFIG.getint('EconomicCalendar', 'minutes_before_event', fallback=15)
+        minutes_after = CONFIG.getint('EconomicCalendar', 'minutes_after_event', fallback=15)
+        severity_threshold_str = CONFIG.get('EconomicCalendar', 'severity_threshold', fallback='High,Medium')
+        severity_filter = [s.strip() for s in severity_threshold_str.split(',')]
+        
+        # Get upcoming events within the window
+        upcoming_events = economic_calendar.get_upcoming_events(
+            calendar_file,
+            minutes_before,
+            minutes_after,
+            severity_filter
+        )
+        
+        # Update cache
+        _ECONOMIC_EVENT_CACHE['last_check'] = now
+        
+        # If we have any events in the window, we should hold back
+        if upcoming_events:
+            # Calculate when the window ends (latest event_time + minutes_after)
+            latest_end = None
+            for event in upcoming_events:
+                try:
+                    event_dt = datetime.datetime.fromisoformat(event['datetime'])
+                    event_end = event_dt + datetime.timedelta(minutes=minutes_after)
+                    if latest_end is None or event_end > latest_end:
+                        latest_end = event_end
+                except:
+                    pass
+            
+            _ECONOMIC_EVENT_CACHE['window_end_time'] = latest_end
+            _ECONOMIC_EVENT_CACHE['in_window'] = True
+            _ECONOMIC_EVENT_CACHE['events'] = upcoming_events
+            
+            # Log only if state changed to in_window
+            if _ECONOMIC_EVENT_CACHE['last_logged_state'] != 'in_window':
+                event_names = [e.get('name', 'Unknown')[:30] for e in upcoming_events[:2]]
+                end_str = latest_end.strftime('%H:%M') if latest_end else 'unknown'
+                logging.info(f"📅 Economic event window active: {', '.join(event_names)} - trading held until {end_str}")
+                _ECONOMIC_EVENT_CACHE['last_logged_state'] = 'in_window'
+            
+            return True, upcoming_events
+        
+        # No events - clear state
+        if _ECONOMIC_EVENT_CACHE['last_logged_state'] == 'in_window':
+            logging.info("📅 Economic event window ended - trading resumed")
+        _ECONOMIC_EVENT_CACHE['last_logged_state'] = 'clear'
+        _ECONOMIC_EVENT_CACHE['in_window'] = False
+        _ECONOMIC_EVENT_CACHE['events'] = []
+        _ECONOMIC_EVENT_CACHE['window_end_time'] = None
+        return False, []
+        
+    except Exception as e:
+        logging.error(f"Error checking economic event window: {e}")
+        return False, []
+
 
 def job(window_title, window_process_name, top_offset, bottom_offset, left_offset, right_offset, save_folder, begin_time, end_time, symbol, position_type, no_position_prompt, long_position_prompt, short_position_prompt, runner_prompt, model, topstep_config, enable_llm, enable_trading, openai_api_url, openai_api_key, enable_save_screenshots, auth_token=None, execute_trades=False, telegram_config=None, no_new_trades_windows='', force_close_time='23:59'):
     """The main job to run periodically."""
@@ -4205,6 +4619,25 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
         # No position - check if we can still enter new trades (reuse in_no_trades_window from above)
         if in_no_trades_window:
             logging.info(f"In no-new-trades window '{current_window}' - Skipping entry analysis")
+            return
+        
+        # Check if we're in an economic event window (hold back from new trades)
+        in_economic_window, active_economic_events = is_in_economic_event_window()
+        if in_economic_window:
+            event_names = [e.get('name', 'Unknown') for e in active_economic_events[:3]]
+            events_str = ', '.join(event_names)
+            if len(active_economic_events) > 3:
+                events_str += f" (+{len(active_economic_events) - 3} more)"
+            logging.info(f"📅 In economic event window - holding back from new trades")
+            logging.info(f"   Active events: {events_str}")
+            for event in active_economic_events:
+                mins = event.get('minutes_until', 0)
+                severity = event.get('severity', 'Unknown')
+                name = event.get('name', 'Unknown')
+                if mins >= 0:
+                    logging.info(f"   - {name} [{severity}] in {mins:.0f} minutes")
+                else:
+                    logging.info(f"   - {name} [{severity}] was {abs(mins):.0f} minutes ago")
             return
         
         # No position - look for new entry opportunities
@@ -6142,13 +6575,63 @@ def generate_market_data_json(bars, yahoo_context_text, position_type, position_
         logging.exception("Full traceback:")
         return "{}"
 
+def get_last_bar_close_time():
+    """Calculate the timestamp of when the last 5-minute bar should have closed.
+    
+    5-minute bars close at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
+    
+    Returns:
+        datetime: UTC timestamp of when the last 5-minute bar closed
+    """
+    now_utc = datetime.datetime.utcnow()
+    # Round down to nearest 5 minutes
+    minute = now_utc.minute
+    bar_minute = (minute // 5) * 5
+    bar_close = now_utc.replace(minute=bar_minute, second=0, microsecond=0)
+    return bar_close
+
+
+def should_fetch_bars():
+    """Determine if we should fetch new bars based on 5-minute bar timing.
+    
+    We only want to fetch bars:
+    1. Once per 5-minute bar close
+    2. About 10 seconds after the bar closes (to let data settle)
+    
+    Returns:
+        tuple: (should_fetch: bool, reason: str, last_bar_close: datetime)
+    """
+    global LAST_BAR_FETCH_TIME
+    
+    now_utc = datetime.datetime.utcnow()
+    last_bar_close = get_last_bar_close_time()
+    seconds_since_bar_close = (now_utc - last_bar_close).total_seconds()
+    
+    # Check if we've already fetched for this bar
+    if LAST_BAR_FETCH_TIME:
+        # If last fetch was after this bar closed, we already have the data
+        if LAST_BAR_FETCH_TIME >= last_bar_close:
+            return False, f"Already fetched for bar closing at {last_bar_close.strftime('%H:%M')}", last_bar_close
+    
+    # Only fetch if we're 10+ seconds past the bar close (let data settle)
+    if seconds_since_bar_close < 10:
+        return False, f"Only {seconds_since_bar_close:.0f}s since bar close - waiting for data to settle", last_bar_close
+    
+    # We're past the 10-second wait and haven't fetched this bar yet
+    return True, f"Fetching new bars ({seconds_since_bar_close:.0f}s after bar close at {last_bar_close.strftime('%H:%M')})", last_bar_close
+
+
+# Global to track when we last fetched bars (aligned to bar close times)
+LAST_BAR_FETCH_TIME = None
+
+
 def get_bars_for_llm(contract_id, topstep_config, auth_token, num_bars=36):
     """Main function to get bars for LLM with smart daily caching.
     
     This function:
-    1. Checks cache for today's bars
-    2. Fetches missing bars from API (all day on first run, incremental after)
-    3. Appends new bars to cache
+    1. Checks if we should fetch new bars (only once per 5-minute bar close)
+    2. Uses cached bars if we've already fetched for the current bar
+    3. Fetches new bars ~10 seconds after each bar close
     4. Returns both raw bars and formatted bar data for LLM context
     
     Args:
@@ -6161,6 +6644,8 @@ def get_bars_for_llm(contract_id, topstep_config, auth_token, num_bars=36):
         dict: {'bars': list of raw bar dicts, 'formatted': formatted text for LLM}
               Returns {'bars': [], 'formatted': ''} if disabled or error
     """
+    global LAST_BAR_FETCH_TIME
+    
     try:
         # Check if bar data is enabled
         enable_bar_data = config.getboolean('TopstepXBars', 'enable_bar_data', fallback=True)
@@ -6208,6 +6693,9 @@ def get_bars_for_llm(contract_id, topstep_config, auth_token, num_bars=36):
         market_open_et = today.replace(hour=open_hour, minute=open_min, second=0, microsecond=0)
         market_open_utc = eastern_to_utc(market_open_et)
         
+        # Check if we should fetch new bars (aligned to 5-minute bar closes)
+        should_fetch, fetch_reason, last_bar_close = should_fetch_bars()
+        
         if cache_data is None:
             # First fetch of the day - get all bars from market open
             logging.info("First bar fetch of the day - fetching all bars from market open")
@@ -6224,43 +6712,42 @@ def get_bars_for_llm(contract_id, topstep_config, auth_token, num_bars=36):
             
             end_time = current_utc
             existing_bars = []
+        elif not should_fetch:
+            # Not time to fetch yet - use cached bars
+            logging.debug(f"📊 Bar fetch skipped: {fetch_reason}")
+            # Merge yesterday's bars with cached bars if in early morning
+            all_cached_bars = yesterday_bars.copy() if yesterday_bars else []
+            all_cached_bars.extend(cache_data.get('bars', []))
+            
+            # Check if we have enough bars before returning
+            if len(all_cached_bars) < num_bars:
+                logging.warning(f"Cached bars ({len(all_cached_bars)}) < required ({num_bars}) - fetching historical data")
+                # Fetch enough historical bars to fill the gap
+                minutes_back = num_bars * 5 + 60  # Extra buffer
+                hist_start = current_utc - datetime.timedelta(minutes=minutes_back)
+                hist_bars = fetch_topstepx_bars(
+                    contract_id,
+                    hist_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                    current_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                    topstep_config,
+                    auth_token
+                )
+                if hist_bars:
+                    # Merge and deduplicate
+                    existing_ts = {bar['t'] for bar in all_cached_bars}
+                    for bar in hist_bars:
+                        if bar['t'] not in existing_ts:
+                            all_cached_bars.append(bar)
+                    all_cached_bars.sort(key=lambda x: x['t'])
+                    logging.info(f"After historical backfill: {len(all_cached_bars)} total bars")
+            
+            return {'bars': all_cached_bars, 'formatted': format_bars_for_context(all_cached_bars, num_bars)}
         else:
-            # Incremental fetch - only get new bars since last fetch
+            # Time to fetch new bars - incremental fetch since last cache
+            logging.info(f"📊 {fetch_reason}")
             try:
                 last_fetched_str = cache_data.get('last_fetched')
                 last_fetched = datetime.datetime.fromisoformat(last_fetched_str.replace('Z', '+00:00'))
-                
-                # Only fetch if more than 5 minutes have passed
-                time_diff = (current_utc - last_fetched.replace(tzinfo=None)).total_seconds()
-                if time_diff < 300:  # Less than 5 minutes
-                    logging.debug(f"Using cached bars - only {time_diff:.0f}s since last fetch")
-                    # Merge yesterday's bars with cached bars if in early morning
-                    all_cached_bars = yesterday_bars.copy() if yesterday_bars else []
-                    all_cached_bars.extend(cache_data.get('bars', []))
-                    
-                    # Check if we have enough bars before returning
-                    if len(all_cached_bars) < num_bars:
-                        logging.warning(f"Cached bars ({len(all_cached_bars)}) < required ({num_bars}) - fetching historical data")
-                        # Fetch enough historical bars to fill the gap
-                        minutes_back = num_bars * 5 + 60  # Extra buffer
-                        hist_start = current_utc - datetime.timedelta(minutes=minutes_back)
-                        hist_bars = fetch_topstepx_bars(
-                            contract_id,
-                            hist_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                            current_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                            topstep_config,
-                            auth_token
-                        )
-                        if hist_bars:
-                            # Merge and deduplicate
-                            existing_ts = {bar['t'] for bar in all_cached_bars}
-                            for bar in hist_bars:
-                                if bar['t'] not in existing_ts:
-                                    all_cached_bars.append(bar)
-                            all_cached_bars.sort(key=lambda x: x['t'])
-                            logging.info(f"After historical backfill: {len(all_cached_bars)} total bars")
-                    
-                    return {'bars': all_cached_bars, 'formatted': format_bars_for_context(all_cached_bars, num_bars)}
                 
                 logging.info(f"Incremental fetch - getting bars since {last_fetched_str}")
                 start_time = last_fetched.replace(tzinfo=None)
@@ -6360,6 +6847,10 @@ def get_bars_for_llm(contract_id, topstep_config, auth_token, num_bars=36):
         # Save updated cache for today (not including yesterday's bars)
         today_bars = [bar for bar in all_bars if bar['t'] >= midnight_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")]
         save_bars_to_cache(date_str, contract_id, today_bars)
+        
+        # Update the last bar fetch time to the bar close we just fetched
+        LAST_BAR_FETCH_TIME = last_bar_close
+        logging.info(f"📊 Updated LAST_BAR_FETCH_TIME to {last_bar_close.strftime('%H:%M')} UTC")
         
         # Format and return (including yesterday's bars if present)
         return {'bars': all_bars, 'formatted': format_bars_for_context(all_bars, num_bars)}
@@ -7864,6 +8355,7 @@ def create_tray_icon():
         item('Stop', stop_scheduler),
         item('Reload Config', lambda icon, item: reload_config()),
         item('Refresh Market Context', lambda icon, item: refresh_market_context()),
+        item('Refresh Economic Calendar', lambda icon, item: refresh_economic_calendar()),
         item('Clear Active Trade', lambda icon, item: clear_trade_and_disable_monitoring()),
         item('Reconcile Closed Trades', lambda icon, item: manual_reconcile_trades()),
         item('Reset Session RPL', lambda icon, item: reset_session_rpl()),
@@ -7968,6 +8460,7 @@ def create_tray_icon():
         item('Stop', stop_scheduler),
         item('Reload Config', lambda icon, item: reload_config()),
         item('Refresh Market Context', lambda icon, item: refresh_market_context()),
+        item('Refresh Economic Calendar', lambda icon, item: refresh_economic_calendar()),
         item('Clear Active Trade', lambda icon, item: clear_trade_and_disable_monitoring()),
         item('Reconcile Closed Trades', lambda icon, item: manual_reconcile_trades()),
         item('Reset Session RPL', lambda icon, item: reset_session_rpl()),

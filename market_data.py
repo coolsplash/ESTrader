@@ -1152,14 +1152,14 @@ class MarketDataAnalyzer:
             self.logger.error(f"Error saving intraday data: {e}")
     
     def generate_market_context(self, force_refresh=False):
-        """Generate formatted market context for LLM prompts.
+        """Generate market context for LLM prompts with key_levels and extended_analysis JSON.
         
         Args:
             force_refresh: If True, fetch fresh data. If False, use cached data if available today.
                           Note: Caching is now handled by screenshot_uploader.py, not here.
             
         Returns:
-            str: Formatted market context string
+            str: Market context string with embedded JSON data
         """
         try:
             # Fetch ES data
@@ -1176,199 +1176,53 @@ class MarketDataAnalyzer:
             if vix_data is not None and not vix_data.empty:
                 self.save_data(self.vix_ticker, vix_data)
             
-            # Focus on recent days for volume profile
-            focus_data = es_data.tail(self.focus_days)
-            
-            # Calculate metrics (ensure we get scalar values, not Series)
+            # Calculate current metrics
             current_price = float(es_data['Close'].iloc[-1])
             open_price = float(es_data['Open'].iloc[-1])
-            daily_change = current_price - open_price
-            daily_change_pct = (daily_change / open_price) * 100
-            
-            # High/Low for the day
             daily_high = float(es_data['High'].iloc[-1])
             daily_low = float(es_data['Low'].iloc[-1])
             
-            # Gap detection (compare today's open to previous close)
-            gap_info = ""
-            if len(es_data) >= 2:
-                prev_close = float(es_data['Close'].iloc[-2])
-                gap_size = open_price - prev_close
-                gap_pct = (gap_size / prev_close) * 100
-                
-                if abs(gap_size) >= 5:  # Significant gap threshold (5 points)
-                    gap_direction = "GAP UP" if gap_size > 0 else "GAP DOWN"
-                    gap_info = f"{gap_direction}: {abs(gap_size):.2f} pts ({abs(gap_pct):.2f}%) from previous close {prev_close:.2f}"
-                elif abs(gap_size) >= 2:  # Minor gap
-                    gap_direction = "Minor gap up" if gap_size > 0 else "Minor gap down"
-                    gap_info = f"{gap_direction}: {abs(gap_size):.2f} pts ({abs(gap_pct):.2f}%)"
-            
-            # VWAP (using focus period)
-            vwap = float(self.calculate_vwap(focus_data))
-            vwap_bias = "bullish" if current_price > vwap else "bearish"
-            vwap_diff = current_price - vwap
-            
-            # Volume Profile
-            volume_profile = self.calculate_volume_profile(focus_data, self.volume_nodes)
-            poc_price = volume_profile[0][0] if volume_profile else current_price  # Point of Control
-            
-            # VIX analysis
-            vix_info = ""
+            # VIX
+            current_vix = None
             if vix_data is not None and not vix_data.empty:
                 current_vix = float(vix_data['Close'].iloc[-1])
-                prev_vix = float(vix_data['Close'].iloc[-2]) if len(vix_data) > 1 else current_vix
-                vix_change = current_vix - prev_vix
-                vix_change_pct = (vix_change / prev_vix) * 100
-                
-                if current_vix < 15:
-                    vix_env = "Low volatility (complacent)"
-                elif current_vix < 20:
-                    vix_env = "Normal volatility"
-                elif current_vix < 30:
-                    vix_env = "Elevated volatility"
-                else:
-                    vix_env = "High volatility (fear)"
-                
-                vix_info = f"VIX: {current_vix:.2f} ({vix_change_pct:+.1f}%) - {vix_env}"
             
-            # Recent trend (5-day)
-            if len(focus_data) >= 5:
-                five_day_start_price = float(focus_data['Close'].iloc[0])
-                five_day_change = current_price - five_day_start_price
-                five_day_pct = (five_day_change / five_day_start_price) * 100
-                trend = "uptrend" if five_day_change > 0 else "downtrend"
-            else:
-                five_day_pct = 0
-                trend = "neutral"
+            # Initialize context data
+            key_levels = []
+            extended = {}
             
-            # Format context
-            context = f"""Market Context ({datetime.now().strftime('%b %d, %Y')}):
-ES: Open {open_price:.2f}, Current {current_price:.2f} ({daily_change:+.2f}, {daily_change_pct:+.2f}%), Range {daily_low:.2f}-{daily_high:.2f}"""
-            
-            # Add gap info if present
-            if gap_info:
-                context += f"\n{gap_info}"
-            
-            context += f"""
-5-Day Trend: {trend.upper()} ({five_day_pct:+.2f}%)
-VWAP ({self.focus_days}-day): {vwap:.2f} | Price is {abs(vwap_diff):.2f} pts {vwap_bias.upper()} of VWAP
-{vix_info}
-
-Volume Profile (Top {self.volume_nodes} levels from past {self.focus_days} days):"""
-
-            # Add volume profile levels
-            for i, (price, volume) in enumerate(volume_profile, 1):
-                context += f"\n  {i}. {price:.2f} pts"
-                if i == 1:
-                    context += " (POC - Point of Control)"
-            
-            # Intraday Volume Profile
+            # Intraday analysis
             if self.enable_intraday:
-                # Fetch intraday data using configured days
                 intraday_data = self.fetch_intraday_data(self.es_ticker, days=self.intraday_days, interval=self.intraday_interval)
                 if intraday_data is not None and not intraday_data.empty:
                     # Save intraday data
                     self.save_intraday_data(self.es_ticker, intraday_data, self.intraday_interval)
                     
-                    # Calculate intraday VWAP (across all fetched days)
-                    intraday_vwap = float(self.calculate_vwap(intraday_data))
-                    intraday_vwap_diff = current_price - intraday_vwap
-                    intraday_vwap_bias = "bullish" if current_price > intraday_vwap else "bearish"
-                    
-                    # Calculate intraday volume profile (across all fetched days)
-                    intraday_volume_profile = self.calculate_volume_profile(intraday_data, self.intraday_volume_nodes)
-                    
-                    context += f"\n\nIntraday {self.intraday_interval} Volume Profile ({self.intraday_days} days, {len(intraday_data)} bars):"
-                    context += f"\nIntraday VWAP: {intraday_vwap:.2f} | Price is {abs(intraday_vwap_diff):.2f} pts {intraday_vwap_bias.upper()}"
-                    context += f"\nTop {self.intraday_volume_nodes} High Volume Zones:"
-                    
-                    for i, (price, volume) in enumerate(intraday_volume_profile, 1):
-                        volume_pct = (volume / intraday_data['Volume'].sum()) * 100
-                        context += f"\n  {i}. {price:.2f} pts ({volume_pct:.1f}% of volume)"
-                        if i == 1:
-                            context += " (Intraday POC)"
-                    
-                    # Analyze structure zones from intraday data
+                    # Analyze structure zones
                     key_levels = self.analyze_structure_zones(intraday_data)
                     
                     if key_levels:
-                        # Add liquidity summaries to key levels
+                        # Add liquidity summaries
                         key_levels = self.calculate_zone_liquidity(key_levels, intraday_data)
-                        
                         # Save to JSON
                         self.save_key_levels(key_levels)
-                        
-                        # Add to context
-                        context += f"\n\nKey Structure Zones ({len(key_levels)} macro levels):"
-                        for i, level in enumerate(key_levels, 1):
-                            context += f"\n  {i}. {level['level']:.2f} pts ({level['zone_low']:.2f}-{level['zone_high']:.2f}) - {level['type']} ({level['total_volume_percent']:.1f}% vol)"
-                            context += f"\n     Reason: {level['reason']}"
-                            if 'liquidity' in level:
-                                liq = level['liquidity']
-                                context += f"\n     Liquidity: {liq['touches']} touches, {liq['time_at_level_mins']}min at level, {liq['avg_reaction_pts']:.1f}pt avg reaction"
                     
                     # Generate extended analysis
                     extended = self.generate_extended_analysis(intraday_data)
-                    
                     # Save extended analysis
                     self.save_extended_analysis(extended)
-                    
-                    # ATR (RTH only)
-                    if extended.get('atr_14'):
-                        context += f"\n\n5m ATR(14) RTH: {extended['atr_14']:.2f} pts"
-                    
-                    # Range Extremes
-                    if extended.get('range_extremes'):
-                        re = extended['range_extremes']
-                        context += f"\n\n5-Day Range Extremes:"
-                        context += f"\n  High: {re['range_high']:.2f} | Low: {re['range_low']:.2f} | Range: {re['total_range']:.2f} pts | Mid: {re['mid_point']:.2f}"
-                        if re.get('swing_highs'):
-                            swing_high_str = ', '.join([f"{sh['price']:.2f}" for sh in re['swing_highs']])
-                            context += f"\n  Swing Highs: {swing_high_str}"
-                        if re.get('swing_lows'):
-                            swing_low_str = ', '.join([f"{sl['price']:.2f}" for sl in re['swing_lows']])
-                            context += f"\n  Swing Lows: {swing_low_str}"
-                    
-                    # Overnight Session
-                    if extended.get('overnight_session') and extended['overnight_session'].get('on_high'):
-                        on = extended['overnight_session']
-                        context += f"\n\nOvernight/Globex Session ({on['date']}):"
-                        context += f"\n  ON High: {on['on_high']:.2f} | ON Low: {on['on_low']:.2f} | Range: {on['globex_range']:.2f} pts"
-                        if on.get('on_poc'):
-                            context += f" | ON POC: {on['on_poc']:.2f}"
-                        if on.get('rth_open'):
-                            context += f"\n  RTH Open: {on['rth_open']:.2f}"
-                    
-                    # Daily Profiles (last 5 days)
-                    if extended.get('daily_profiles'):
-                        context += f"\n\nDaily Session Profiles (POC/VAH/VAL):"
-                        for dp in extended['daily_profiles']:
-                            context += f"\n  {dp['date']}: POC {dp['poc']:.2f} | VAH {dp['vah']:.2f} | VAL {dp['val']:.2f} | Range {dp['low']:.2f}-{dp['high']:.2f}"
-                    
-                    # Inferred Delta Profile
-                    if extended.get('inferred_delta_profile') and extended['inferred_delta_profile'].get('cumulative_delta') is not None:
-                        delta = extended['inferred_delta_profile']
-                        delta_bias = "BUYING" if delta['cumulative_delta'] > 0 else "SELLING"
-                        context += f"\n\nInferred Delta Profile (from price action, not order flow):"
-                        context += f"\n  Cumulative Delta: {delta['cumulative_delta']:+.0f} ({delta_bias} pressure)"
-                        if delta.get('top_buying_levels'):
-                            buying_str = ', '.join([f"{p:.2f}" for p, d in delta['top_buying_levels']])
-                            context += f"\n  Top Buying Levels: {buying_str}"
-                        if delta.get('top_selling_levels'):
-                            selling_str = ', '.join([f"{p:.2f}" for p, d in delta['top_selling_levels']])
-                            context += f"\n  Top Selling Levels: {selling_str}"
-                    
-                    # TPO Profile
-                    if extended.get('tpo_profile') and extended['tpo_profile'].get('tpo_poc'):
-                        tpo = extended['tpo_profile']
-                        context += f"\n\nTPO Profile:"
-                        context += f"\n  TPO POC: {tpo['tpo_poc']:.2f} | TPO VAH: {tpo['tpo_vah']:.2f} | TPO VAL: {tpo['tpo_val']:.2f}"
-                        if tpo.get('single_print_zones') and len(tpo['single_print_zones']) > 0:
-                            single_prints_str = ', '.join([f"{p:.2f}" for p in tpo['single_print_zones'][:5]])
-                            context += f"\n  Single Prints (fast move): {single_prints_str}"
             
-            # Add daily key levels
-            context += f"\n\nDaily Key Levels: Support {daily_low:.2f}, Resistance {daily_high:.2f}"
+            # Build context with JSON data
+            vix_str = f"{current_vix:.2f}" if current_vix else "N/A"
+            context = f"""Market Context ({datetime.now().strftime('%b %d, %Y %H:%M')}):
+ES: Current {current_price:.2f}, Open {open_price:.2f}, Range {daily_low:.2f}-{daily_high:.2f}
+VIX: {vix_str}
+
+=== KEY LEVELS ===
+{json.dumps(key_levels, indent=2)}
+
+=== EXTENDED ANALYSIS ===
+{json.dumps(extended, indent=2, default=str)}"""
             
             self.logger.info("Generated market context successfully")
             return context

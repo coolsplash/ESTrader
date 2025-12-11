@@ -102,3 +102,4 @@ No speculation.
 No invented structure.
 But do NOT require the exact tick touch — interactions often happen 1–3 points early.
 Levels don't always touch exactly. They are often zones.
+If you see an A+ 2.5R+ move, with a max risk of 4 points, and it's not in the rules, take it and explain your reasoning.

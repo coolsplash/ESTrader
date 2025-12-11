@@ -6446,11 +6446,11 @@ def calculate_overnight_metrics(bars):
         return {'onh': None, 'onl': None, 'globex_vwap': None}
 
 def generate_market_data_json(bars, yahoo_context_text, position_type, position_details=None, working_orders=None, contract_id='', num_bars=36, upcoming_events=None):
-    """Generate structured JSON market data combining Yahoo Finance and TopstepX bars.
+    """Generate structured JSON market data with key_levels, extended_analysis, and 5m bars.
     
     Args:
         bars: List of bar dicts from TopstepX
-        yahoo_context_text: Yahoo Finance context string
+        yahoo_context_text: Yahoo Finance context string (unused - kept for compatibility)
         position_type: Current position type ('none', 'long', 'short')
         position_details: Position details dict
         working_orders: Working orders dict
@@ -6459,14 +6459,37 @@ def generate_market_data_json(bars, yahoo_context_text, position_type, position_
         upcoming_events: List of upcoming economic events (default None)
     
     Returns:
-        str: JSON string with structured market data
+        str: JSON string with key_levels, extended_analysis, and 5m bars
     """
     try:
-        # Parse Yahoo Finance context
-        yahoo_metrics = parse_yahoo_context(yahoo_context_text)
+        # Get current time in Eastern Time
+        current_utc = datetime.datetime.utcnow()
+        current_et = utc_to_eastern(current_utc)
+        current_time_str = current_et.strftime("%Y-%m-%d %H:%M:%S ET")
         
-        # Calculate overnight metrics from bars
-        overnight_metrics = calculate_overnight_metrics(bars) if bars else {'onh': None, 'onl': None, 'globex_vwap': None}
+        # Load key_levels from market_data JSON file
+        today_str = datetime.datetime.now().strftime('%Y%m%d')
+        key_levels_file = os.path.join('market_data', f'key_levels_{today_str}.json')
+        key_levels = []
+        if os.path.exists(key_levels_file):
+            try:
+                with open(key_levels_file, 'r') as f:
+                    key_levels_data = json.load(f)
+                    key_levels = key_levels_data.get('key_levels', [])
+            except Exception as e:
+                logging.warning(f"Error loading key_levels JSON: {e}")
+        
+        # Load extended_analysis from market_data JSON file
+        extended_analysis_file = os.path.join('market_data', f'extended_analysis_{today_str}.json')
+        extended_analysis = {}
+        if os.path.exists(extended_analysis_file):
+            try:
+                with open(extended_analysis_file, 'r') as f:
+                    extended_analysis = json.load(f)
+                    # Remove generated_at from extended analysis (redundant with CurrentTime)
+                    extended_analysis.pop('generated_at', None)
+            except Exception as e:
+                logging.warning(f"Error loading extended_analysis JSON: {e}")
         
         # Format 5-minute bars (last num_bars)
         recent_bars = bars[-num_bars:] if bars and len(bars) > num_bars else (bars if bars else [])
@@ -6489,24 +6512,12 @@ def generate_market_data_json(bars, yahoo_context_text, position_type, position_
             except:
                 continue
         
-        # Build MarketContext
-        market_context = {
-            "PrevClose": yahoo_metrics['prev_close'],
-            "Open": yahoo_metrics['open'],
-            "GapDirection": yahoo_metrics['gap_direction'],
-            "GapSizePts": yahoo_metrics['gap_size'],
-            "ONH": overnight_metrics['onh'],
-            "ONL": overnight_metrics['onl'],
-            "DayTrend5D": yahoo_metrics['day_trend']
-        }
-        
-        # Build KeyLevels (removed ONH/ONL as they're already in MarketContext)
-        key_levels = {
-            "PDH": yahoo_metrics['pdh'],
-            "PDL": yahoo_metrics['pdl'],
-            "RTH_VWAP": yahoo_metrics['vwap'],
-            "Globex_VWAP": overnight_metrics['globex_vwap'],
-            "5DayPOC": yahoo_metrics['poc']
+        # Build complete structure
+        market_data = {
+            "CurrentTime": current_time_str,
+            "FiveMinuteBars": five_min_bars,
+            "KeyLevels": key_levels,
+            "ExtendedAnalysis": extended_analysis
         }
         
         # Build Position (only include if actively in a trade)
@@ -6515,19 +6526,6 @@ def generate_market_data_json(bars, yahoo_context_text, position_type, position_
             position_status = "long"
         elif position_type == 'short':
             position_status = "short"
-        
-        # Get current time in Eastern Time
-        current_utc = datetime.datetime.utcnow()
-        current_et = utc_to_eastern(current_utc)
-        current_time_str = current_et.strftime("%Y-%m-%d %H:%M:%S ET")
-        
-        # Build complete structure
-        market_data = {
-            "CurrentTime": current_time_str,
-            "FiveMinuteBars": five_min_bars,
-            "MarketContext": market_context,
-            "KeyLevels": key_levels
-        }
         
         # Only include Position if in an active trade
         if position_status in ['long', 'short']:

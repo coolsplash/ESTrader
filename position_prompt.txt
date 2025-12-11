@@ -114,7 +114,7 @@ Close when the trade thesis is actually broken, not when a wick or noise occurs.
 Some trades were put on a bit early, but the overall thesis may still be in tact as levels often wick 1-4 points beyond level.
 INVALIDATION FOR LONGS:
 
-Lower low forms (structural)
+Break + acceptance BELOW the sweep zone AND failure to reclaim on retest.
 
 Level reclaim against long holds on retest
 
@@ -124,7 +124,7 @@ Failed retest of your long level
 
 INVALIDATION FOR SHORTS:
 
-Higher high forms (structural)
+Break + acceptance ABOVE the sweep zone AND failure to reclaim on retest.
 
 Support reclaim holds
 

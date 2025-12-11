@@ -914,11 +914,18 @@ def save_daily_context(new_context, old_context):
         logging.error(f"Error saving LLM context: {e}")
         logging.exception("Full traceback:")
 
-def reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token):
+def reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token, telegram_config=None, screenshot_config=None):
     """Check Supabase for ENTRY events without matching CLOSE events and reconcile them.
     
     This function queries Supabase for open trades (ENTRY without CLOSE) and checks if they
     are still open in the API. If not, fetches trade history to log the closure.
+    
+    Args:
+        topstep_config: TopstepX configuration
+        enable_trading: Whether trading is enabled
+        auth_token: Authentication token
+        telegram_config: Optional Telegram config for notifications
+        screenshot_config: Optional dict with screenshot params
     """
     if not SUPABASE_CLIENT or not enable_trading or not auth_token:
         return
@@ -1011,17 +1018,64 @@ def reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token):
                     
                     logging.info("✅ Supabase trade closure reconciled and logged")
                     
+                    # Update dashboard immediately
+                    try:
+                        update_dashboard_data()
+                        logging.info("Dashboard updated after Supabase trade closure")
+                    except Exception as e:
+                        logging.debug(f"Dashboard update skipped: {e}")
+                    
+                    # Capture screenshot of the trade result
+                    if screenshot_config:
+                        try:
+                            capture_screenshot(
+                                window_title=screenshot_config.get('window_title'),
+                                window_process_name=screenshot_config.get('window_process_name'),
+                                top_offset=screenshot_config.get('top_offset', 0),
+                                bottom_offset=screenshot_config.get('bottom_offset', 0),
+                                left_offset=screenshot_config.get('left_offset', 0),
+                                right_offset=screenshot_config.get('right_offset', 0),
+                                save_folder=screenshot_config.get('save_folder'),
+                                enable_save_screenshots=screenshot_config.get('enable_save_screenshots', False)
+                            )
+                            logging.info("Screenshot captured after Supabase trade closure")
+                        except Exception as e:
+                            logging.warning(f"Could not capture screenshot after Supabase trade closure: {e}")
+                    
+                    # Send Telegram notification with trade results
+                    if telegram_config:
+                        pnl_emoji = "🟢" if pnl_dollars >= 0 else "🔴"
+                        
+                        telegram_msg = f"📊 <b>POSITION CLOSED</b>\n\n"
+                        telegram_msg += f"Position: {tracked_position.upper()}\n"
+                        telegram_msg += f"Entry: {entry_price:.2f}\n" if entry_price else ""
+                        telegram_msg += f"Exit: {exit_price:.2f}\n" if exit_price else ""
+                        telegram_msg += f"Size: {exit_quantity} contract(s)\n\n"
+                        telegram_msg += f"{pnl_emoji} <b>P&L: ${pnl_dollars:+,.2f} ({pnl_points:+.2f} pts)</b>\n\n"
+                        telegram_msg += f"💰 Account Balance: ${balance:,.2f}\n" if balance else ""
+                        telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        
+                        send_telegram_message(telegram_msg, telegram_config)
+                        logging.info("Telegram notification sent for Supabase reconciled trade closure")
+                    
     except Exception as e:
         logging.error(f"Error in Supabase reconciliation: {e}")
         logging.exception("Full traceback:")
 
-def reconcile_closed_trades(topstep_config, enable_trading, auth_token):
+def reconcile_closed_trades(topstep_config, enable_trading, auth_token, telegram_config=None, screenshot_config=None):
     """Reconcile trades that were closed via stop loss or take profit but not logged.
     
     Checks if we have an active trade in our tracking, verifies it still exists in API,
     and if closed, fetches trade history to log the closure details.
     
     Also queries Supabase for any ENTRY events without matching CLOSE events and reconciles them.
+    
+    Args:
+        topstep_config: TopstepX configuration
+        enable_trading: Whether trading is enabled
+        auth_token: Authentication token
+        telegram_config: Optional Telegram config for notifications
+        screenshot_config: Optional dict with screenshot params (window_title, window_process_name, etc.)
     """
     if not enable_trading or not auth_token:
         return
@@ -1102,6 +1156,12 @@ def reconcile_closed_trades(topstep_config, enable_trading, auth_token):
                     
                     logging.info(f"🔄 RECONCILED CLOSE: {tracked_position} @ {exit_price}, P&L: ${pnl_dollars:+,.2f} ({pnl_points:+.2f} pts)")
                     
+                    # Determine exit type (stop loss hit, take profit hit, or manual close)
+                    stop_loss_order_id = trade_info.get('stop_loss_order_id')
+                    take_profit_order_id = trade_info.get('take_profit_order_id')
+                    exit_trade_order_id = exit_trade.get('orderId') or exit_trade.get('order_id')
+                    exit_type = determine_exit_type(exit_trade_order_id, stop_loss_order_id, take_profit_order_id)
+                    
                     # Log the CLOSE event (updates both CSV and Supabase)
                     log_trade_event(
                         event_type='CLOSE',
@@ -1111,7 +1171,7 @@ def reconcile_closed_trades(topstep_config, enable_trading, auth_token):
                         price=exit_price,
                         stop_loss=None,
                         take_profit=None,
-                        reasoning="Position closed (detected via reconciliation - likely stop loss or take profit filled)",
+                        reasoning=f"Position closed ({exit_type})",
                         confidence=None,
                         profit_loss=pnl_dollars,
                         profit_loss_points=pnl_points,
@@ -1122,6 +1182,48 @@ def reconcile_closed_trades(topstep_config, enable_trading, auth_token):
                     )
                     
                     logging.info("✅ Trade closure reconciled and logged to CSV and Supabase")
+                    
+                    # Update dashboard immediately
+                    try:
+                        update_dashboard_data()
+                        logging.info("Dashboard updated after trade closure")
+                    except Exception as e:
+                        logging.debug(f"Dashboard update skipped: {e}")
+                    
+                    # Capture screenshot of the trade result
+                    screenshot_base64 = None
+                    if screenshot_config:
+                        try:
+                            screenshot_base64 = capture_screenshot(
+                                window_title=screenshot_config.get('window_title'),
+                                window_process_name=screenshot_config.get('window_process_name'),
+                                top_offset=screenshot_config.get('top_offset', 0),
+                                bottom_offset=screenshot_config.get('bottom_offset', 0),
+                                left_offset=screenshot_config.get('left_offset', 0),
+                                right_offset=screenshot_config.get('right_offset', 0),
+                                save_folder=screenshot_config.get('save_folder'),
+                                enable_save_screenshots=screenshot_config.get('enable_save_screenshots', False)
+                            )
+                            logging.info("Screenshot captured after trade closure")
+                        except Exception as e:
+                            logging.warning(f"Could not capture screenshot after trade closure: {e}")
+                    
+                    # Send Telegram notification with trade results
+                    if telegram_config:
+                        pnl_emoji = "🟢" if pnl_dollars >= 0 else "🔴"
+                        exit_emoji = "🎯" if "TAKE PROFIT" in exit_type else ("🛑" if "STOP LOSS" in exit_type else "📊")
+                        
+                        telegram_msg = f"{exit_emoji} <b>POSITION CLOSED: {exit_type}</b>\n\n"
+                        telegram_msg += f"Position: {tracked_position.upper()}\n"
+                        telegram_msg += f"Entry: {entry_price:.2f}\n" if entry_price else ""
+                        telegram_msg += f"Exit: {exit_price:.2f}\n" if exit_price else ""
+                        telegram_msg += f"Size: {exit_quantity} contract(s)\n\n"
+                        telegram_msg += f"{pnl_emoji} <b>P&L: ${pnl_dollars:+,.2f} ({pnl_points:+.2f} pts)</b>\n\n"
+                        telegram_msg += f"💰 Account Balance: ${balance:,.2f}\n" if balance else ""
+                        telegram_msg += f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        
+                        send_telegram_message(telegram_msg, telegram_config)
+                        logging.info("Telegram notification sent for closed trade")
                 else:
                     logging.warning("Position closed but no exit trade found in history - clearing tracking")
                     clear_active_trade_info()
@@ -1261,7 +1363,7 @@ def check_position_discrepancy(api_position_type, api_position_details):
         return None
 
 def correct_position_state(discrepancy, api_position_type, api_position_details, working_orders, 
-                           topstep_config, enable_trading, auth_token):
+                           topstep_config, enable_trading, auth_token, telegram_config=None, screenshot_config=None):
     """Update all system state to match TRUE position from API.
     
     This function corrects the system's internal state when a discrepancy is detected between
@@ -1275,6 +1377,8 @@ def correct_position_state(discrepancy, api_position_type, api_position_details,
         topstep_config: TopstepX configuration dict
         enable_trading: Whether trading is enabled
         auth_token: Authentication token for API calls
+        telegram_config: Optional Telegram config for notifications
+        screenshot_config: Optional dict with screenshot params
     
     Returns:
         bool: True if state was successfully corrected, False otherwise
@@ -1297,7 +1401,7 @@ def correct_position_state(discrepancy, api_position_type, api_position_details,
         if discrepancy_type == 'full_close':
             # Position was closed - run existing reconciliation to log the closure
             logging.info("Running reconcile_closed_trades() to fetch and log exit details...")
-            reconcile_closed_trades(topstep_config, enable_trading, auth_token)
+            reconcile_closed_trades(topstep_config, enable_trading, auth_token, telegram_config, screenshot_config)
             
             # Clear local tracking (reconcile_closed_trades should do this, but double-check)
             trade_info = get_active_trade_info()
@@ -2650,20 +2754,29 @@ def show_dashboard(root=None):
                 
                 target_value = actual_target if actual_target else llm_data.get('price_target')
                 if target_value:
-                    target_label = f"Target: {target_value}"
+                    target_text = f"Target: {target_value}"
                     if actual_target:
-                        target_label += " ✓"
-                    price_info.append(target_label)
+                        target_text += " ✓"
+                    if 'target_label_llm' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['target_label_llm'].config(text=target_text)
+                        DASHBOARD_WIDGETS['target_label_llm'].pack(anchor="w")
+                else:
+                    if 'target_label_llm' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['target_label_llm'].config(text="")
+                        DASHBOARD_WIDGETS['target_label_llm'].pack_forget()
                 
                 stop_value = actual_stop if actual_stop else llm_data.get('stop_loss')
                 if stop_value:
-                    stop_label = f"Stop: {stop_value}"
+                    stop_text = f"Stop: {stop_value}"
                     if actual_stop:
-                        stop_label += " ✓"
-                    price_info.append(stop_label)
-                
-                if 'prices_label' in DASHBOARD_WIDGETS:
-                    DASHBOARD_WIDGETS['prices_label'].config(text=" | ".join(price_info) if price_info else "")
+                        stop_text += " ✓"
+                    if 'stop_label_llm' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['stop_label_llm'].config(text=stop_text)
+                        DASHBOARD_WIDGETS['stop_label_llm'].pack(anchor="w")
+                else:
+                    if 'stop_label_llm' in DASHBOARD_WIDGETS:
+                        DASHBOARD_WIDGETS['stop_label_llm'].config(text="")
+                        DASHBOARD_WIDGETS['stop_label_llm'].pack_forget()
                 
                 if 'confidence_label' in DASHBOARD_WIDGETS:
                     conf_text = f"Confidence: {llm_data['confidence']}" if llm_data.get('confidence') else ""
@@ -2763,7 +2876,7 @@ def show_dashboard(root=None):
                     DASHBOARD_WIDGETS['no_llm_label'].pack_forget()
             else:
                 # Hide LLM widgets, show no-data label (context temporarily hidden)
-                for key in ['action_label', 'time_frame', 'prices_label', 'confidence_label', 
+                for key in ['action_label', 'time_frame', 'target_label_llm', 'stop_label_llm', 'confidence_label', 
                            'reasoning_title', 'reasoning_text', 'waiting_for_title', 'waiting_for_text',
                            'key_levels_title', 'key_levels_text', 'suggestion_title', 'suggestion_text']:
                     if key in DASHBOARD_WIDGETS:
@@ -2897,7 +3010,8 @@ def show_dashboard(root=None):
         timestamp_label = tk.Label(time_frame, text="", font=("Arial", 10), bg='#2d2d2d', fg='#aaaaaa')
         countdown_label = tk.Label(time_frame, text="", font=("Arial", 10), bg='#2d2d2d', fg='#00ff00')
         
-        prices_label = tk.Label(llm_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#00aaff')
+        target_label_llm = tk.Label(llm_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#00ff00')
+        stop_label_llm = tk.Label(llm_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#ff4444')
         confidence_label = tk.Label(llm_frame, text="", font=("Arial", 11), bg='#2d2d2d', fg='#ffaa00')
         reasoning_title = tk.Label(llm_frame, text="Reasoning:", font=("Arial", 11, "bold"), bg='#2d2d2d', fg='#ffffff')
         reasoning_text = tk.Text(llm_frame, height=6, wrap=tk.WORD, font=("Arial", 10),
@@ -2921,7 +3035,8 @@ def show_dashboard(root=None):
         DASHBOARD_WIDGETS['time_frame'] = time_frame
         DASHBOARD_WIDGETS['timestamp_label'] = timestamp_label
         DASHBOARD_WIDGETS['countdown_label'] = countdown_label
-        DASHBOARD_WIDGETS['prices_label'] = prices_label
+        DASHBOARD_WIDGETS['target_label_llm'] = target_label_llm
+        DASHBOARD_WIDGETS['stop_label_llm'] = stop_label_llm
         DASHBOARD_WIDGETS['confidence_label'] = confidence_label
         DASHBOARD_WIDGETS['reasoning_title'] = reasoning_title
         DASHBOARD_WIDGETS['reasoning_text'] = reasoning_text
@@ -2953,11 +3068,7 @@ def show_dashboard(root=None):
             countdown_label.pack(side="left", padx=10)
             time_frame.pack(anchor="w")
             
-            # Prices
-            price_info = []
-            if llm_data.get('entry_price'):
-                price_info.append(f"Entry: {llm_data['entry_price']}")
-            
+            # Prices - Entry shown separately, Target (green) and Stop (red)
             actual_stop = None
             actual_target = None
             if trade_info:
@@ -2970,21 +3081,19 @@ def show_dashboard(root=None):
             
             target_value = actual_target if actual_target else llm_data.get('price_target')
             if target_value:
-                target_label = f"Target: {target_value}"
+                target_text = f"Target: {target_value}"
                 if actual_target:
-                    target_label += " ✓"
-                price_info.append(target_label)
+                    target_text += " ✓"
+                target_label_llm.config(text=target_text)
+                target_label_llm.pack(anchor="w")
             
             stop_value = actual_stop if actual_stop else llm_data.get('stop_loss')
             if stop_value:
-                stop_label = f"Stop: {stop_value}"
+                stop_text = f"Stop: {stop_value}"
                 if actual_stop:
-                    stop_label += " ✓"
-                price_info.append(stop_label)
-            
-            if price_info:
-                prices_label.config(text=" | ".join(price_info))
-                prices_label.pack(anchor="w", pady=5)
+                    stop_text += " ✓"
+                stop_label_llm.config(text=stop_text)
+                stop_label_llm.pack(anchor="w")
             
             if llm_data.get('confidence'):
                 confidence_label.config(text=f"Confidence: {llm_data['confidence']}")
@@ -4185,6 +4294,18 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             if discrepancy:
                 logging.info("⚠️ DISCREPANCY DETECTED in main job - correcting state")
                 
+                # Build screenshot config for notifications
+                screenshot_config = {
+                    'window_title': window_title,
+                    'window_process_name': window_process_name,
+                    'top_offset': top_offset,
+                    'bottom_offset': bottom_offset,
+                    'left_offset': left_offset,
+                    'right_offset': right_offset,
+                    'save_folder': save_folder,
+                    'enable_save_screenshots': enable_save_screenshots
+                }
+                
                 # Handle untracked position (opened manually from broker)
                 if discrepancy.get('type') == 'untracked_position':
                     logging.info("📊 Detected untracked position opened from broker - updating system state")
@@ -4197,7 +4318,9 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                         working_orders,
                         topstep_config,
                         enable_trading,
-                        auth_token
+                        auth_token,
+                        telegram_config,
+                        screenshot_config
                     )
                     
                     if success:
@@ -4213,7 +4336,9 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                         working_orders,
                         topstep_config,
                         enable_trading,
-                        auth_token
+                        auth_token,
+                        telegram_config,
+                        screenshot_config
                     )
             
             # Reconcile trades (check for positions closed by stop/target)
@@ -4228,8 +4353,19 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
                     logging.debug(f"Skipping reconciliation - just handled by trade monitor {time_since_reconciliation:.1f}s ago")
             
             if should_reconcile:
-                reconcile_closed_trades(topstep_config, enable_trading, auth_token)
-                reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token)
+                # Build screenshot config for notifications
+                screenshot_config_for_reconcile = {
+                    'window_title': window_title,
+                    'window_process_name': window_process_name,
+                    'top_offset': top_offset,
+                    'bottom_offset': bottom_offset,
+                    'left_offset': left_offset,
+                    'right_offset': right_offset,
+                    'save_folder': save_folder,
+                    'enable_save_screenshots': enable_save_screenshots
+                }
+                reconcile_closed_trades(topstep_config, enable_trading, auth_token, telegram_config, screenshot_config_for_reconcile)
+                reconcile_supabase_open_trades(topstep_config, enable_trading, auth_token, telegram_config, screenshot_config_for_reconcile)
             else:
                 logging.debug("Using position state from recent reconciliation")
             
@@ -4383,6 +4519,48 @@ def job(window_title, window_process_name, top_offset, bottom_offset, left_offse
             logging.info(f"Position details: Size={position_details.get('size')}, "
                         f"Avg Price={position_details.get('average_price')}, "
                         f"Unrealized P&L={position_details.get('unrealized_pnl')}")
+            
+            # Sync active_trade.json with actual API values (entry price, stop, target)
+            trade_info = get_active_trade_info()
+            if trade_info:
+                api_entry_price = position_details.get('average_price')
+                stored_entry_price = trade_info.get('entry_price')
+                
+                # Parse working orders for actual stop/target
+                contract_id_for_orders = topstep_config.get('contract_id', '')
+                order_info = parse_working_orders(working_orders, contract_id_for_orders)
+                actual_stop = order_info.get('stop_loss_price')
+                actual_target = order_info.get('take_profit_price')
+                
+                # Update if entry price differs or stop/target changed
+                needs_update = False
+                if api_entry_price and stored_entry_price and abs(float(api_entry_price) - float(stored_entry_price)) > 0.01:
+                    logging.info(f"Syncing entry price: stored={stored_entry_price}, actual={api_entry_price}")
+                    needs_update = True
+                
+                stored_stop = trade_info.get('stop_loss')
+                stored_target = trade_info.get('price_target')
+                if actual_stop and (not stored_stop or abs(float(actual_stop) - float(stored_stop)) > 0.01):
+                    logging.info(f"Syncing stop loss: stored={stored_stop}, actual={actual_stop}")
+                    needs_update = True
+                if actual_target and (not stored_target or abs(float(actual_target) - float(stored_target)) > 0.01):
+                    logging.info(f"Syncing take profit: stored={stored_target}, actual={actual_target}")
+                    needs_update = True
+                
+                if needs_update:
+                    save_active_trade_info(
+                        order_id=trade_info.get('order_id'),
+                        entry_price=api_entry_price if api_entry_price else stored_entry_price,
+                        position_type=current_position_type,
+                        entry_timestamp=trade_info.get('entry_timestamp'),
+                        stop_loss=actual_stop if actual_stop else stored_stop,
+                        price_target=actual_target if actual_target else stored_target,
+                        reasoning=trade_info.get('reasoning'),
+                        size=position_details.get('size') or trade_info.get('size'),
+                        stop_loss_order_id=order_info.get('stop_loss_order_id'),
+                        take_profit_order_id=order_info.get('take_profit_order_id')
+                    )
+                    logging.info("Synced active_trade.json with actual API values")
             
             # Take screenshot for position management
             try:
@@ -8095,6 +8273,18 @@ def run_trade_monitor():
                 if discrepancy:
                     logging.info("⚠️ DISCREPANCY DETECTED in trade monitor - correcting state")
                     
+                    # Build screenshot config for notifications
+                    screenshot_config = {
+                        'window_title': WINDOW_TITLE,
+                        'window_process_name': WINDOW_PROCESS_NAME,
+                        'top_offset': TOP_OFFSET,
+                        'bottom_offset': BOTTOM_OFFSET,
+                        'left_offset': LEFT_OFFSET,
+                        'right_offset': RIGHT_OFFSET,
+                        'save_folder': SAVE_FOLDER,
+                        'enable_save_screenshots': ENABLE_SAVE_SCREENSHOTS
+                    }
+                    
                     # Correct the system state to match API reality
                     success = correct_position_state(
                         discrepancy,
@@ -8103,7 +8293,9 @@ def run_trade_monitor():
                         working_orders,
                         TOPSTEP_CONFIG,
                         ENABLE_TRADING,
-                        AUTH_TOKEN
+                        AUTH_TOKEN,
+                        TELEGRAM_CONFIG,
+                        screenshot_config
                     )
                     
                     if success:
@@ -8441,8 +8633,19 @@ def manual_reconcile_trades():
     """Manually trigger trade reconciliation (for tray menu)."""
     logging.info("=== MANUAL TRADE RECONCILIATION TRIGGERED ===")
     try:
-        reconcile_closed_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
-        reconcile_supabase_open_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN)
+        # Build screenshot config for notifications
+        screenshot_config = {
+            'window_title': WINDOW_TITLE,
+            'window_process_name': WINDOW_PROCESS_NAME,
+            'top_offset': TOP_OFFSET,
+            'bottom_offset': BOTTOM_OFFSET,
+            'left_offset': LEFT_OFFSET,
+            'right_offset': RIGHT_OFFSET,
+            'save_folder': SAVE_FOLDER,
+            'enable_save_screenshots': ENABLE_SAVE_SCREENSHOTS
+        }
+        reconcile_closed_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN, TELEGRAM_CONFIG, screenshot_config)
+        reconcile_supabase_open_trades(TOPSTEP_CONFIG, ENABLE_TRADING, AUTH_TOKEN, TELEGRAM_CONFIG, screenshot_config)
         logging.info("=== MANUAL RECONCILIATION COMPLETE ===")
     except Exception as e:
         logging.error(f"Error during manual reconciliation: {e}")
